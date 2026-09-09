@@ -1,3 +1,6 @@
 packages:
   - "apps/*"
   - "packages/*"
+
+# Pinned toolchain: stay on packageManager's pnpm and don't nag in CI/Docker output.
+updateNotifier: false

@@ -220,7 +220,7 @@ Upgrade by backing up, selecting a pinned release tag in the Compose image ancho
 
 `ci.yml` performs frozen pnpm install, formatting, real lint, typecheck, integration/unit tests, production builds, Chromium Playwright, Docker build and Compose health checks. Test SMTP and GPU services are loopback-only and use fabricated data.
 
-`docker.yml` uses QEMU/Buildx to build `linux/amd64` and `linux/arm64` from the same Dockerfile and publishes `ghcr.io/<owner>/<repo>`. Main/default-branch updates publish `latest` and `sha-…`; `v1.2.3` pushes publish `v1`, `v1.2`, and `v1.2.3`. PR builds do not push. Automatic metadata `latest` on release tags is disabled. Enable Actions package-write permissions and grant deployment hosts GHCR read access for private images. This repository does not claim an image is published until the workflow succeeds.
+`docker.yml` uses Buildx to build native `linux/amd64` from the same Dockerfile and publishes `ghcr.io/<owner>/<repo>`. There is deliberately no arm64/QEMU leg: emulation made every publish take 12+ minutes for hardware this stack does not deploy to. Main/default-branch updates publish `latest` and `sha-…`; `v1.2.3` pushes publish `v1`, `v1.2`, and `v1.2.3`. PR builds do not push. Automatic metadata `latest` on release tags is disabled. Enable Actions package-write permissions and grant deployment hosts GHCR read access for private images. This repository does not claim an image is published until the workflow succeeds.
 
 ## FRP
 
