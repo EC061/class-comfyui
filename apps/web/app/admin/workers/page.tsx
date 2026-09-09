@@ -1,134 +1,139 @@
 "use client";
 import { useEffect, useState } from "react";
-
-export default function WorkersPage() {
-  const [workers, setWorkers] = useState<
-    Array<{
-      id: string;
-      name: string;
-      baseUrl: string;
-      gpuName: string;
-      vramMb: number;
-      enabled: boolean;
-      healthStatus: string;
-      maxConcurrentJobs: number;
-      tags: string[];
-    }>
-  >([]);
-  const [form, setForm] = useState({
-    name: "a6000-01",
-    baseUrl: "http://10.0.0.21:8188",
-    gpuName: "RTX A6000",
-    vramMb: 49152,
-    maxConcurrentJobs: 1,
-  });
-  const [msg, setMsg] = useState<string | null>(null);
-
+const initial = {
+  name: "a6000-01",
+  baseUrl: "http://10.0.0.21:8188",
+  gpuName: "RTX A6000",
+  vramMb: 49152,
+  maxConcurrentJobs: 1,
+  architecture: "amd64",
+  tags: "a6000,48gb",
+};
+export default function Workers() {
+  const [workers, setWorkers] = useState<any[]>([]),
+    [form, setForm] = useState(initial),
+    [editing, setEditing] = useState<string | null>(null),
+    [msg, setMsg] = useState("");
   async function load() {
     const r = await fetch("/api/workers");
-    if (r.ok) setWorkers((await r.json()).workers ?? []);
+    if (r.ok) setWorkers((await r.json()).workers);
   }
   useEffect(() => {
-    load();
+    void load();
+    const t = setInterval(load, 3000);
+    return () => clearInterval(t);
   }, []);
-
-  async function create(e: React.FormEvent) {
+  async function save(e: React.FormEvent) {
     e.preventDefault();
-    const r = await fetch("/api/workers", {
-      method: "POST",
+    const r = await fetch("/api/workers" + (editing ? "/" + editing : ""), {
+      method: editing ? "PATCH" : "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(form),
+      body: JSON.stringify({
+        ...form,
+        tags: form.tags
+          .split(",")
+          .map((v) => v.trim())
+          .filter(Boolean),
+      }),
     });
     const j = await r.json();
-    if (!r.ok) setMsg(j.error);
-    else {
-      setMsg("Worker registered");
-      load();
+    setMsg(r.ok ? (editing ? "Worker updated" : "Worker registered") : j.error);
+    if (r.ok) {
+      setEditing(null);
+      void load();
     }
   }
-
-  async function toggle(w: { id: string; enabled: boolean }) {
-    await fetch(`/api/workers/${w.id}`, {
+  async function toggle(w: any) {
+    const r = await fetch("/api/workers/" + w.id, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled: !w.enabled }),
     });
-    load();
+    if (!r.ok) setMsg((await r.json()).error);
+    void load();
   }
-
   return (
     <div className="grid gap-4">
       <div className="card">
         <h1 className="text-xl font-bold">Workers</h1>
-        <p className="text-xs text-slate-500">Worker base URLs are admin-only and never exposed to students.</p>
-        <table className="data mt-2">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>GPU</th>
-              <th>VRAM</th>
-              <th>Status</th>
-              <th>Concurrency</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {workers.map((w) => (
-              <tr key={w.id}>
-                <td>{w.name}</td>
-                <td>{w.gpuName}</td>
-                <td>{w.vramMb}</td>
-                <td>{w.enabled ? w.healthStatus : "DISABLED"}</td>
-                <td>{w.maxConcurrentJobs}</td>
-                <td>
-                  <button className="btn-secondary" onClick={() => toggle(w)}>
-                    {w.enabled ? "Disable" : "Enable"}
-                  </button>
-                </td>
+        <div className="overflow-x-auto">
+          <table className="data">
+            <thead>
+              <tr>
+                <th>Name / ID</th>
+                <th>GPU / tags</th>
+                <th>VRAM</th>
+                <th>Health</th>
+                <th>Capacity</th>
+                <th>Actions</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {workers.map((w) => (
+                <tr key={w.id}>
+                  <td>
+                    {w.name}
+                    <p className="font-mono text-xs">{w.id}</p>
+                  </td>
+                  <td>
+                    {w.gpuName}
+                    <p>{w.tags.join(", ")}</p>
+                  </td>
+                  <td>{w.vramMb} MB</td>
+                  <td>
+                    {w.healthStatus}
+                    <p className="text-xs">{w.lastHealthCheck}</p>
+                  </td>
+                  <td>{w.maxConcurrentJobs}</td>
+                  <td>
+                    <button className="btn-secondary" onClick={() => toggle(w)}>
+                      {w.enabled ? "Disable" : "Enable"}
+                    </button>
+                    <button
+                      className="btn-secondary"
+                      onClick={() => {
+                        setEditing(w.id);
+                        setForm({
+                          name: w.name,
+                          baseUrl: w.baseUrl,
+                          gpuName: w.gpuName,
+                          vramMb: w.vramMb,
+                          maxConcurrentJobs: w.maxConcurrentJobs,
+                          architecture: w.architecture,
+                          tags: w.tags.join(","),
+                        });
+                      }}
+                    >
+                      Edit
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
       <div className="card">
-        <h2 className="font-bold">Register worker</h2>
-        <form onSubmit={create} className="mt-2 grid grid-cols-2 gap-2">
-          <div>
-            <label className="label">name</label>
-            <input className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
-          </div>
-          <div>
-            <label className="label">baseUrl (server-side only)</label>
-            <input
-              className="input"
-              value={form.baseUrl}
-              onChange={(e) => setForm({ ...form, baseUrl: e.target.value })}
-            />
-          </div>
-          <div>
-            <label className="label">gpuName</label>
-            <input
-              className="input"
-              value={form.gpuName}
-              onChange={(e) => setForm({ ...form, gpuName: e.target.value })}
-            />
-          </div>
-          <div>
-            <label className="label">vramMb</label>
-            <input
-              className="input"
-              type="number"
-              value={form.vramMb}
-              onChange={(e) => setForm({ ...form, vramMb: Number(e.target.value) })}
-            />
-          </div>
-          <div className="col-span-2">
-            <button className="btn" type="submit">
-              Register
-            </button>
-          </div>
+        <h2 className="font-bold">{editing ? "Edit worker" : "Register worker"}</h2>
+        <form onSubmit={save} className="mt-3 grid grid-cols-2 gap-2">
+          {Object.entries(form).map(([k, v]) => (
+            <label key={k}>
+              {k}
+              <input
+                className="input"
+                type={typeof v === "number" ? "number" : "text"}
+                value={v}
+                onChange={(e) =>
+                  setForm({ ...form, [k]: typeof v === "number" ? Number(e.target.value) : e.target.value })
+                }
+              />
+            </label>
+          ))}
+          <button type="submit" className="btn">
+            {editing ? "Save" : "Register"}
+          </button>
         </form>
-        {msg && <p className="mt-2 text-sm">{msg}</p>}
+        {msg && <p role="status">{msg}</p>}
       </div>
     </div>
   );

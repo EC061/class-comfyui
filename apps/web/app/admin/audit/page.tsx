@@ -20,7 +20,6 @@ export default function AuditPage() {
   }
   useEffect(() => {
     load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   return (
     <div className="card">
@@ -45,8 +44,24 @@ export default function AuditPage() {
           {events.map((e) => (
             <tr key={e.id}>
               <td>{e.type}</td>
-              <td className="font-mono text-xs">{e.classId?.slice(0, 8) ?? "—"}</td>
-              <td className="font-mono text-xs">{e.targetId?.slice(0, 8)}</td>
+              <td className="font-mono text-xs">
+                {e.classId ? (
+                  <a className="underline" href={`/admin/classes/${e.classId}`}>
+                    {e.classId.slice(0, 8)}
+                  </a>
+                ) : (
+                  "—"
+                )}
+              </td>
+              <td className="font-mono text-xs">
+                {e.type.startsWith("JOB_") ? (
+                  <a className="underline" href={`/jobs/${e.targetId}`}>
+                    {e.targetId.slice(0, 8)}
+                  </a>
+                ) : (
+                  e.targetId.slice(0, 8)
+                )}
+              </td>
               <td>{e.createdAt}</td>
             </tr>
           ))}

@@ -11,3 +11,13 @@ dist
 data
 /data
 coverage
+
+/data/
+/test-results/
+/playwright-report/
+*.sqlite*
+# Real deployment config (secrets/hostnames). Copy from docker-compose.example.yml.
+# The example stays tracked; the real file is local-only so `git pull`
+# never overwrites the deployed node's configuration.
+/docker-compose.yml
+!docker-compose.example.yml

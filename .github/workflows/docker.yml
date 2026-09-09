@@ -1,7 +1,7 @@
 name: docker
 on:
   push:
-    branches: ["main"]
+    branches: ["**"]
     tags: ["v*.*.*"]
   pull_request:
 
@@ -30,13 +30,14 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
+          flavor: latest=false
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
       - name: Build and push
         uses: docker/build-push-action@v6
         with:

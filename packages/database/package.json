@@ -5,18 +5,14 @@
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
-    "generate": "drizzle-kit generate",
+    "build": "esbuild src/migrate.ts src/seed.ts src/backup.ts --bundle --platform=node --format=cjs --outdir=dist --out-extension:.js=.cjs",
     "migrate": "tsx src/migrate.ts",
     "seed": "tsx src/seed.ts",
-    "build": "tsc -p tsconfig.build.json"
+    "backup": "tsx src/backup.ts"
   },
-  "dependencies": {
-    "drizzle-orm": "^0.36.4",
-    "pg": "^8.13.0"
-  },
+  "dependencies": {},
   "devDependencies": {
-    "@types/pg": "^8.11.0",
-    "drizzle-kit": "^0.28.1",
-    "tsx": "^4.19.1"
+    "tsx": "^4.19.1",
+    "esbuild": "^0.28.2"
   }
 }

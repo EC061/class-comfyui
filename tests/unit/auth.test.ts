@@ -6,8 +6,6 @@ import {
   signWorkspaceToken,
   verifyWorkspaceToken,
   checkAdminCode,
-  rateLimitCheck,
-  resetRateLimits,
 } from "@class-comfyui/auth";
 
 describe("auth primitives", () => {
@@ -36,11 +34,5 @@ describe("auth primitives", () => {
     expect(checkAdminCode("correct-horse", "correct-horse")).toBe(true);
     expect(checkAdminCode("wrong", "correct-horse")).toBe(false);
     expect(checkAdminCode("", "correct-horse")).toBe(false);
-  });
-
-  it("rate limiting blocks after limit", () => {
-    resetRateLimits();
-    for (let i = 0; i < 5; i++) expect(rateLimitCheck("k1", 5, 60_000).allowed).toBe(true);
-    expect(rateLimitCheck("k1", 5, 60_000).allowed).toBe(false);
   });
 });

@@ -47,7 +47,7 @@ export function stripIdentityHeaders(headers: Record<string, unknown>): Record<s
 
 /** Sanitize a path segment for audit storage (no traversal, safe charset). */
 export function sanitizePathSegment(input: string): string {
-  let cleaned = input
+  const cleaned = input
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, "-")

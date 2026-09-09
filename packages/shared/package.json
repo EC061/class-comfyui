@@ -5,7 +5,7 @@
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
-    "build": "echo ok"
+    "build": "tsc --noEmit -p ../../tsconfig.json"
   },
   "dependencies": {
     "zod": "^3.23.8"

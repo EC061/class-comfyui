@@ -9,9 +9,7 @@ const nextConfig = {
     "@class-comfyui/shared",
     "@class-comfyui/database",
   ],
-  experimental: {
-    serverActions: { bodySizeLimit: "5mb" },
-  },
+  experimental: { serverActions: { bodySizeLimit: "5mb" } },
   async headers() {
     return [
       {
@@ -19,11 +17,10 @@ const nextConfig = {
         headers: [
           { key: "X-Content-Type-Options", value: "nosniff" },
           { key: "X-Frame-Options", value: "DENY" },
-          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          { key: "Referrer-Policy", value: "no-referrer" },
         ],
       },
     ];
   },
 };
-
 export default nextConfig;

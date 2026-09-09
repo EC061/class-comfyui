@@ -1,9 +1,11 @@
 "use client";
-import { useEffect, useState } from "react";
+import { use, useEffect, useState } from "react";
+import { Jobs } from "@/components/jobs";
 
 type Tab = "Overview" | "Roster" | "Signup" | "Jobs" | "Outputs" | "Activity" | "Settings";
 
-export default function ClassDetail({ params }: { params: { id: string } }) {
+export default function ClassDetail({ params: asyncParams }: { params: Promise<{ id: string }> }) {
+  const params = use(asyncParams);
   const [tab, setTab] = useState<Tab>("Overview");
   const [cls, setCls] = useState<{
     id: string;
@@ -13,6 +15,7 @@ export default function ClassDetail({ params }: { params: { id: string } }) {
     slug: string;
     active: boolean;
     signupEnabled: boolean;
+    description: string;
   } | null>(null);
   const [enrollments, setEnrollments] = useState<
     Array<{
@@ -23,6 +26,10 @@ export default function ClassDetail({ params }: { params: { id: string } }) {
       lastName: string;
       status: string;
       userId: string | null;
+      lastLogin?: string;
+      jobs?: number;
+      outputs?: number;
+      accountStatus?: string;
     }>
   >([]);
 
@@ -36,7 +43,6 @@ export default function ClassDetail({ params }: { params: { id: string } }) {
   }
   useEffect(() => {
     load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   if (!cls) return <p>Loading…</p>;
@@ -88,10 +94,18 @@ function RosterTab({
     lastName: string;
     status: string;
     userId: string | null;
+    lastLogin?: string;
+    jobs?: number;
+    outputs?: number;
+    accountStatus?: string;
   }>;
   reload: () => void;
 }) {
   const [csv, setCsv] = useState("");
+  const [importId, setImportId] = useState<string | null>(null);
+  const [missing, setMissing] = useState<Array<{ id: string; rosterEmail: string }>>([]);
+  const [archiveIds, setArchiveIds] = useState<string[]>([]);
+  const [rowPreview, setRowPreview] = useState<any[]>([]);
   const [preview, setPreview] = useState<{
     newCount: number;
     unchangedCount: number;
@@ -113,6 +127,10 @@ function RosterTab({
     if (!r.ok) setMsg(j.error);
     else {
       setPreview(j.preview);
+      setImportId(j.importId);
+      setMissing(j.preview.missing || []);
+      setRowPreview(j.preview.rows || []);
+      setArchiveIds([]);
       setMsg(null);
     }
   }
@@ -120,11 +138,14 @@ function RosterTab({
     const r = await fetch("/api/roster/import", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ classId, csv }),
+      body: JSON.stringify({ importId, archiveIds }),
     });
     const j = await r.json();
     setMsg(r.ok ? `Imported: ${j.created} new, ${j.updated} updated` : j.error);
-    if (r.ok) reload();
+    if (r.ok) {
+      reload();
+      setImportId(null);
+    }
   }
 
   return (
@@ -134,17 +155,41 @@ function RosterTab({
         <p className="text-xs text-slate-600">
           CSV headers: OrgDefinedId, Last Name, First Name, Email, End-of-Line Indicator
         </p>
+        <input
+          aria-label="Roster CSV file"
+          type="file"
+          accept=".csv,text/csv"
+          className="my-2"
+          onChange={async (e) => {
+            const f = e.target.files?.[0];
+            if (f) {
+              if (f.size > 5_000_000) {
+                setMsg("CSV exceeds 5 MB");
+                return;
+              }
+              setCsv(await f.text());
+              setImportId(null);
+            }
+          }}
+        />
         <textarea
           className="input mt-2 h-32 font-mono"
           value={csv}
-          onChange={(e) => setCsv(e.target.value)}
+          onChange={(e) => {
+            setCsv(e.target.value);
+            setImportId(null);
+          }}
           placeholder="OrgDefinedId,Last Name,First Name,Email,End-of-Line Indicator"
         />
         <div className="mt-2 flex gap-2">
           <button className="btn-secondary" onClick={doPreview}>
             Preview
           </button>
-          <button className="btn" onClick={doImport}>
+          <button
+            className="btn disabled:opacity-50"
+            disabled={!importId || !!preview?.invalidCount || !!preview?.duplicateCount}
+            onClick={doImport}
+          >
             Confirm import
           </button>
         </div>
@@ -155,7 +200,39 @@ function RosterTab({
             {preview.missingCount}
           </p>
         )}
-        {msg && <p className="mt-2 text-sm">{msg}</p>}
+        {rowPreview.length > 0 && (
+          <details className="mt-2">
+            <summary>Review rows</summary>
+            <pre className="max-h-64 overflow-auto text-xs">{JSON.stringify(rowPreview, null, 2)}</pre>
+          </details>
+        )}
+        {missing.length > 0 && (
+          <div className="mt-3">
+            <p>Missing from this file. Select only enrollments you intend to archive:</p>
+            {missing.map((e) => (
+              <label key={e.id} className="block">
+                <input
+                  type="checkbox"
+                  checked={archiveIds.includes(e.id)}
+                  onChange={(v) =>
+                    setArchiveIds(v.target.checked ? [...archiveIds, e.id] : archiveIds.filter((id) => id !== e.id))
+                  }
+                />{" "}
+                {e.rosterEmail}
+              </label>
+            ))}
+          </div>
+        )}
+        {msg && (
+          <p role="status" className="mt-2 text-sm">
+            {msg}
+          </p>
+        )}
+        {msg?.startsWith("Imported:") && (
+          <p className="mt-2 font-medium">
+            Roster imported successfully. Open the Signup tab to generate the student signup link.
+          </p>
+        )}
       </div>
       <div className="card overflow-x-auto">
         <table className="data">
@@ -166,6 +243,9 @@ function RosterTab({
               <th>Student ID</th>
               <th>Account</th>
               <th>Enrollment</th>
+              <th>Last login</th>
+              <th>Jobs / outputs</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -178,6 +258,28 @@ function RosterTab({
                 <td>{e.orgDefinedId}</td>
                 <td>{e.userId ? "registered" : "pending"}</td>
                 <td>{e.status}</td>
+                <td>{e.lastLogin || "Never"}</td>
+                <td>
+                  <a className="underline" href={`/admin/jobs?classId=${classId}&userId=${e.userId || "unregistered"}`}>
+                    {e.jobs || 0} / {e.outputs || 0}
+                  </a>
+                </td>
+                <td>
+                  <button
+                    className="btn-secondary"
+                    onClick={async () => {
+                      const r = await fetch(`/api/admin/classes/${classId}/enrollments`, {
+                        method: "PATCH",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ id: e.id, status: e.status === "ARCHIVED" ? "INVITED" : "ARCHIVED" }),
+                      });
+                      if (!r.ok) setMsg((await r.json()).error);
+                      else reload();
+                    }}
+                  >
+                    {e.status === "ARCHIVED" ? "Reactivate" : "Archive"}
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>
@@ -193,6 +295,7 @@ function SignupTab({ classId }: { classId: string }) {
     version: number;
     registered: number;
     remaining: number;
+    tokenCreatedAt?: string;
   } | null>(null);
   const [url, setUrl] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
@@ -203,7 +306,6 @@ function SignupTab({ classId }: { classId: string }) {
   }
   useEffect(() => {
     load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function regen() {
@@ -233,7 +335,7 @@ function SignupTab({ classId }: { classId: string }) {
       body: JSON.stringify({ signupUrl: url }),
     });
     const j = await r.json();
-    setMsg(r.ok ? `Emailed ${j.sent} unregistered students` : j.error);
+    setMsg(r.ok ? `Emailed ${j.sent} students; ${j.failed || 0} failed` : j.error);
   }
 
   return (
@@ -264,6 +366,9 @@ function SignupTab({ classId }: { classId: string }) {
         </div>
       ) : (
         <div className="mt-2 flex gap-2">
+          <button className="btn-secondary" onClick={() => toggle(false)}>
+            Disable signup
+          </button>
           <button className="btn" onClick={regen}>
             Generate student signup link
           </button>
@@ -274,7 +379,8 @@ function SignupTab({ classId }: { classId: string }) {
       )}
       {info && (
         <p className="mt-2 text-sm">
-          Registered: {info.registered} · Remaining: {info.remaining} · Version: {info.version}
+          Created / regenerated: {info.tokenCreatedAt || "Not generated"} · Registered: {info.registered} · Remaining:{" "}
+          {info.remaining} · Version: {info.version}
         </p>
       )}
       {msg && <p className="mt-2 text-sm">{msg}</p>}
@@ -286,45 +392,7 @@ function SignupTab({ classId }: { classId: string }) {
 }
 
 function JobsTab({ classId, outputsOnly }: { classId: string; outputsOnly?: boolean }) {
-  const [jobs, setJobs] = useState<
-    Array<{
-      id: string;
-      status: string;
-      submittedAt: string;
-      workerName: string | null;
-      outputs?: Array<{ fileName: string }>;
-    }>
-  >([]);
-  useEffect(() => {
-    fetch(`/api/jobs?classId=${classId}`).then(async (r) => {
-      if (r.ok) setJobs((await r.json()).jobs ?? []);
-    });
-  }, [classId]);
-  return (
-    <div className="card">
-      <h2 className="font-bold">{outputsOnly ? "Outputs" : "Jobs"}</h2>
-      <table className="data mt-2">
-        <thead>
-          <tr>
-            <th>Job</th>
-            <th>Status</th>
-            <th>Worker</th>
-            <th>Submitted</th>
-          </tr>
-        </thead>
-        <tbody>
-          {jobs.map((j) => (
-            <tr key={j.id}>
-              <td className="font-mono text-xs">{j.id.slice(0, 8)}</td>
-              <td>{j.status}</td>
-              <td>{j.workerName ?? "—"}</td>
-              <td>{j.submittedAt}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
+  return <Jobs classId={classId} outputsOnly={outputsOnly} />;
 }
 
 function ActivityTab({ classId }: { classId: string }) {
@@ -348,23 +416,73 @@ function ActivityTab({ classId }: { classId: string }) {
   );
 }
 
-function SettingsTab({ cls, reload }: { cls: { id: string; name: string; active: boolean }; reload: () => void }) {
-  async function setActive(active: boolean) {
-    await fetch(`/api/admin/classes/${cls.id}`, {
+function SettingsTab({
+  cls,
+  reload,
+}: {
+  cls: { id: string; name: string; active: boolean; courseCode?: string; term?: string; description?: string };
+  reload: () => void;
+}) {
+  const [name, setName] = useState(cls.name),
+    [courseCode, setCourseCode] = useState(cls.courseCode || ""),
+    [term, setTerm] = useState(cls.term || ""),
+    [description, setDescription] = useState(cls.description || ""),
+    [message, setMessage] = useState("");
+  async function save(e: React.FormEvent) {
+    e.preventDefault();
+    const r = await fetch("/api/admin/classes/" + cls.id, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ active }),
+      body: JSON.stringify({ name, ...(courseCode ? { courseCode } : {}), ...(term ? { term } : {}), description }),
     });
+    setMessage(r.ok ? "Class updated" : (await r.json()).error);
+    reload();
+  }
+  async function toggle() {
+    const r = await fetch("/api/admin/classes/" + cls.id, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ active: !cls.active }),
+    });
+    if (!r.ok) setMessage((await r.json()).error);
     reload();
   }
   return (
     <div className="card">
-      <h2 className="font-bold">Settings</h2>
-      <div className="mt-2 flex gap-2">
-        <button className="btn-secondary" onClick={() => setActive(!cls.active)}>
-          {cls.active ? "Archive class" : "Reactivate class"}
-        </button>
-      </div>
+      <h2 className="font-bold">Class settings</h2>
+      <form onSubmit={save} className="my-3 grid gap-2">
+        <label>
+          Name
+          <input className="input" value={name} onChange={(e) => setName(e.target.value)} />
+        </label>
+        <label>
+          Course code
+          <input
+            className="input"
+            placeholder="Leave blank to keep current value"
+            value={courseCode}
+            onChange={(e) => setCourseCode(e.target.value)}
+          />
+        </label>
+        <label>
+          Term
+          <input
+            className="input"
+            placeholder="Leave blank to keep current value"
+            value={term}
+            onChange={(e) => setTerm(e.target.value)}
+          />
+        </label>
+        <label>
+          Description
+          <textarea className="input" value={description} onChange={(e) => setDescription(e.target.value)} />
+        </label>
+        <button className="btn">Save class</button>
+      </form>
+      <button className="btn-secondary" onClick={toggle}>
+        {cls.active ? "Archive class" : "Reactivate class"}
+      </button>
+      <p role="status">{message}</p>
     </div>
   );
 }

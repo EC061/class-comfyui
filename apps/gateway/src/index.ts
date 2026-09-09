@@ -1,474 +1,666 @@
 import express from "express";
-import { createServer } from "node:http";
+import multer from "multer";
+import { createServer, type IncomingMessage } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { getEnv, comfyCanonicalOrigin } from "@class-comfyui/config";
-import { verifyWorkspaceToken } from "@class-comfyui/auth";
-import { stripIdentityHeaders, sanitizePathSegment } from "@class-comfyui/shared";
-
-// ---- Types ----
-interface WorkerInfo {
-  id: string;
-  name: string;
-  baseUrl: string;
-  enabled: boolean;
-  tags: string[];
-  maxConcurrentJobs: number;
-  healthStatus: "ONLINE" | "BUSY" | "OFFLINE" | "DISABLED";
-  load: number;
+import { z } from "zod";
+import { getEnv, validateStartup, isAllowedBrowserOrigin } from "@class-comfyui/config";
+import { getDb, activeMembership, audit, type Job, type Session, type Worker } from "@class-comfyui/database";
+import { verifyWorkspaceToken, hashSessionToken, newSessionToken } from "@class-comfyui/auth";
+import { Scheduler } from "./scheduler";
+import { workerFetch } from "./storage";
+import { installUserData, saveUserData } from "./userdata";
+const cookieName = "comfy_gateway";
+function cookie(header: string | undefined) {
+  return header
+    ?.split(";")
+    .map((v) => v.trim())
+    .find((v) => v.startsWith(cookieName + "="))
+    ?.slice(cookieName.length + 1);
 }
-
-interface GatewaySession {
-  id: string;
-  userId: string;
-  classId: string;
-  enrollmentId: string;
-  expiresAt: number;
-  workerId: string | null; // affinity
-}
-
-interface JobRecord {
-  id: string;
-  classId: string;
-  userId: string;
-  workerId: string | null;
-  comfyPromptId: string;
-  status: string;
-  submittedAt: string;
-  promptJson: unknown;
-}
-
-// ---- State (single-instance; Postgres is source of truth for workers/jobs when configured) ----
-const workers = new Map<string, WorkerInfo>();
-const sessions = new Map<string, GatewaySession>();
-const consumedJtis = new Map<string, number>();
-const jobs = new Map<string, JobRecord>();
-const userActive = new Map<string, number>();
-const userQueued = new Map<string, number[]>();
-
-const env = getEnv();
-const GATEWAY_COOKIE = "comfy_gateway";
-const isSecure = (() => {
-  try {
-    return new URL(env.COMFY_PUBLIC_URL).protocol === "https:";
-  } catch {
-    return false;
-  }
-})();
-
-function parseCookies(header: string | undefined): Record<string, string> {
-  const out: Record<string, string> = {};
-  if (!header) return out;
-  for (const part of header.split(";")) {
-    const i = part.indexOf("=");
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
-  }
-  return out;
-}
-
-function sessionCookieValue(id: string): string {
-  return `${GATEWAY_COOKIE}=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400${isSecure ? "; Secure" : ""}`;
-}
-
-function getSession(req: express.Request): GatewaySession | null {
-  const cookies = parseCookies(req.headers.cookie);
-  const id = cookies[GATEWAY_COOKIE];
-  if (!id) return null;
-  const s = sessions.get(id);
-  if (!s || s.expiresAt <= Date.now()) {
-    if (id) sessions.delete(id);
-    return null;
-  }
+function session(req: IncomingMessage): Session | undefined {
+  const raw = cookie(req.headers.cookie);
+  if (!raw) return;
+  const db = getDb(),
+    s = db.get("gateway_sessions", hashSessionToken(raw, getEnv().AUTH_SECRET));
+  if (
+    !s ||
+    s.expiresAt <= Date.now() ||
+    !s.classId ||
+    !s.enrollmentId ||
+    !activeMembership(db, s.userId, s.classId, s.enrollmentId)
+  )
+    return;
   return s;
 }
-
-// Seed a mock worker entry if DB has none (dev). Production registers via web UI -> Postgres;
-// gateway loads workers from Postgres when DATABASE_URL is real (see loadWorkers()).
-function seedWorkers() {
-  if (workers.size === 0) {
-    workers.set("mock", {
-      id: "mock",
-      name: "mock-4090",
-      baseUrl: process.env.MOCK_COMFY_URL ?? "http://127.0.0.1:8188",
-      enabled: true,
-      tags: ["4090", "24gb"],
-      maxConcurrentJobs: 1,
-      healthStatus: "OFFLINE",
-      load: 0,
+function sameOrigin(req: IncomingMessage) {
+  return isAllowedBrowserOrigin({
+    publicUrl: getEnv().COMFY_PUBLIC_URL,
+    originHeader: req.headers.origin,
+    hostHeader: req.headers.host,
+    fetchSite: req.headers["sec-fetch-site"] as string | undefined,
+    referer: req.headers.referer,
+  });
+}
+const clients = new Map<WebSocket, Session>();
+function notify(job: Job, event: Record<string, any>) {
+  for (const [client, s] of clients) {
+    if (s.userId !== job.userId || s.classId !== job.classId) continue;
+    if (client.readyState === WebSocket.OPEN && activeMembership(getDb(), s.userId, s.classId!, s.enrollmentId))
+      client.send(JSON.stringify(event));
+  }
+}
+const coreNodes = [
+  "CheckpointLoaderSimple",
+  "CLIPTextEncode",
+  "CLIPSetLastLayer",
+  "EmptyLatentImage",
+  "KSampler",
+  "KSamplerAdvanced",
+  "VAEDecode",
+  "VAEEncode",
+  "VAELoader",
+  "SaveImage",
+  "PreviewImage",
+  "LoadImage",
+  "ImageScale",
+  "ImageScaleBy",
+  "ImageInvert",
+  "ImageBatch",
+  "ImagePadForOutpaint",
+  "LatentUpscale",
+  "LatentUpscaleBy",
+  "LatentComposite",
+  "LatentBlend",
+  "RepeatLatentBatch",
+  "LoraLoader",
+  "LoraLoaderModelOnly",
+  "ConditioningCombine",
+  "ConditioningConcat",
+  "ConditioningAverage",
+  "ConditioningSetArea",
+  "ConditioningSetMask",
+  "ControlNetLoader",
+  "ControlNetApply",
+  "ControlNetApplyAdvanced",
+  "CLIPVisionLoader",
+  "CLIPVisionEncode",
+  "UNETLoader",
+  "DualCLIPLoader",
+  "CLIPLoader",
+  "FluxGuidance",
+  "ModelSamplingFlux",
+  "EmptySD3LatentImage",
+  "SaveAnimatedWEBP",
+];
+function approvedNodes() {
+  return new Set(
+    (process.env.COMFY_ALLOWED_NODES || coreNodes.join(","))
+      .split(",")
+      .map((v) => v.trim())
+      .filter(Boolean)
+  );
+}
+function metadataWorker(): Worker | undefined {
+  return getDb()
+    .list("workers")
+    .filter((w) => w.enabled && (["ONLINE", "BUSY"].includes(w.healthStatus) || w.nodeDefinitions))
+    .sort(
+      (a, b) => Number(b.healthStatus === "ONLINE") - Number(a.healthStatus === "ONLINE") || a.id.localeCompare(b.id)
+    )[0];
+}
+async function objectInfo(worker: Worker, s: Session) {
+  let info: Record<string, any>;
+  try {
+    const r = await workerFetch(worker, "/object_info", {}, 3000);
+    if (!r.ok) throw new Error("Worker metadata unavailable");
+    info = (await r.json()) as Record<string, any>;
+    getDb().transaction(() => {
+      const current = getDb().get("workers", worker.id);
+      if (current) {
+        current.nodeDefinitions = info;
+        getDb().put("workers", current);
+      }
     });
-  }
-}
-
-async function loadWorkersFromDb() {
-  const url = process.env.DATABASE_URL ?? "";
-  if (!url || url.includes("CHANGE_ME")) return;
-  try {
-    const pg = await import("pg");
-    const pool = new pg.default.Pool({ connectionString: url, max: 2 });
-    const { rows } = await pool.query(
-      "SELECT id, name, base_url, enabled, tags, max_concurrent_jobs, health_status FROM workers"
-    );
-    for (const r of rows) {
-      const existing = workers.get(String(r.id));
-      workers.set(String(r.id), {
-        id: String(r.id),
-        name: r.name,
-        baseUrl: r.base_url,
-        enabled: r.enabled,
-        tags: Array.isArray(r.tags) ? r.tags : [],
-        maxConcurrentJobs: r.max_concurrent_jobs ?? 1,
-        healthStatus: existing?.healthStatus ?? ((r.health_status as WorkerInfo["healthStatus"]) || "OFFLINE"),
-        load: existing?.load ?? 0,
-      });
-    }
-    await pool.end();
-  } catch (e) {
-    console.warn("[gateway] worker DB load failed, using in-memory:", (e as Error).message);
-  }
-}
-
-export function selectWorker(requiredTags: string[] = []): WorkerInfo | null {
-  const eligible = [...workers.values()].filter(
-    (w) =>
-      w.enabled &&
-      (w.healthStatus === "ONLINE" || w.healthStatus === "BUSY") &&
-      w.load < w.maxConcurrentJobs &&
-      requiredTags.every((t) => w.tags.includes(t))
-  );
-  if (eligible.length === 0) return null;
-  eligible.sort((a, b) => a.load - b.load || (a.id < b.id ? -1 : 1));
-  return eligible[0];
-}
-
-async function healthCheckLoop() {
-  for (const w of workers.values()) {
-    if (!w.enabled) {
-      w.healthStatus = "DISABLED";
-      continue;
-    }
-    try {
-      const ctl = new AbortController();
-      const t = setTimeout(() => ctl.abort(), 5000);
-      const r = await fetch(`${w.baseUrl.replace(/\/$/, "")}/system_stats`, { signal: ctl.signal });
-      clearTimeout(t);
-      if (r.ok) {
-        w.healthStatus = w.load > 0 ? "BUSY" : "ONLINE";
-      } else {
-        w.healthStatus = "OFFLINE";
-      }
-    } catch {
-      w.healthStatus = "OFFLINE";
-    }
-  }
-}
-
-function expectedComfyOrigin(): string {
-  try {
-    return comfyCanonicalOrigin(env.COMFY_PUBLIC_URL);
   } catch {
-    return "";
+    if (!worker.nodeDefinitions) throw new Error("Worker metadata unavailable");
+    info = structuredClone(worker.nodeDefinitions);
   }
+  const allowed = approvedNodes();
+  for (const name of Object.keys(info)) if (!allowed.has(name)) delete info[name];
+  const inputs = getDb()
+    .list("uploads", "user_id=? AND class_id=?", [s.userId, s.classId!])
+    .map((u) => u.filename);
+  if (info.LoadImage?.input?.required?.image) info.LoadImage.input.required.image = [inputs, { image_upload: true }];
+  return info;
 }
-
-function enforceGatewayOrigin(req: express.Request, res: express.Response): boolean {
-  const method = req.method.toUpperCase();
-  if (method === "GET" || method === "HEAD" || method === "OPTIONS") return true;
-  const origin = req.headers.origin;
-  const expected = expectedComfyOrigin();
-  if (origin && origin !== expected) {
-    res.status(403).json({ error: `Origin check failed. Expected ${expected}.` });
-    return false;
-  }
-  return true;
+function ownJobs(s: Session) {
+  return getDb().list("jobs", "user_id=? AND class_id=?", [s.userId, s.classId!]);
 }
-
-async function archiveOutputs(job: JobRecord, worker: WorkerInfo, classSlug: string, orgId: string) {
-  const base = process.env.AUDIT_DATA_DIR ?? "/data/audit";
-  const d = new Date();
-  const dir = path.join(
-    base,
-    sanitizePathSegment(classSlug || "unknown-class"),
-    sanitizePathSegment(orgId || job.userId),
-    String(d.getFullYear()),
-    String(d.getMonth() + 1).padStart(2, "0"),
-    String(d.getDate()).padStart(2, "0"),
-    sanitizePathSegment(job.id)
-  );
-  fs.mkdirSync(path.join(dir, "outputs"), { recursive: true });
-  fs.writeFileSync(path.join(dir, "api_prompt.json"), JSON.stringify(job.promptJson ?? {}, null, 2));
-  fs.writeFileSync(
-    path.join(dir, "job.json"),
-    JSON.stringify({ ...job, worker: worker.name, archivedAt: new Date().toISOString() }, null, 2)
-  );
-  // Fetch history, then stream each output via /view without buffering whole files in memory.
-  try {
-    const h = await fetch(`${worker.baseUrl.replace(/\/$/, "")}/history/${job.comfyPromptId}`);
-    if (!h.ok) {
-      fs.writeFileSync(path.join(dir, "archive_error.json"), JSON.stringify({ error: `history ${h.status}` }));
-      return { ok: false as const, dir };
-    }
-    const hist = (await h.json()) as Record<
-      string,
-      { outputs?: Record<string, { images?: Array<{ filename: string; subfolder: string; type: string }> }> }
-    >;
-    const entry = hist[job.comfyPromptId];
-    const images = Object.values(entry?.outputs ?? {}).flatMap((o) => o.images ?? []);
-    const manifest: Array<Record<string, unknown>> = [];
-    for (const img of images) {
-      const q = new URLSearchParams({
-        filename: img.filename,
-        subfolder: img.subfolder ?? "",
-        type: img.type ?? "output",
-      });
-      const resp = await fetch(`${worker.baseUrl.replace(/\/$/, "")}/view?${q.toString()}`);
-      if (!resp.ok || !resp.body) continue;
-      const safeName = path.basename(img.filename).replace(/[^a-zA-Z0-9._-]+/g, "_");
-      const dest = path.join(dir, "outputs", safeName);
-      const fileStream = fs.createWriteStream(dest);
-      const hash = createHash("sha256");
-      let size = 0;
-      const reader = resp.body.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        size += value.byteLength;
-        hash.update(value);
-        fileStream.write(Buffer.from(value));
-      }
-      fileStream.end();
-      await new Promise<void>((resolve) => fileStream.on("finish", () => resolve()));
-      manifest.push({ fileName: safeName, sizeBytes: size, sha256: hash.digest("hex"), workerFileName: img.filename });
-    }
-    fs.writeFileSync(path.join(dir, "outputs_manifest.json"), JSON.stringify(manifest, null, 2));
-    return { ok: true as const, dir, count: manifest.length };
-  } catch (e) {
-    fs.writeFileSync(path.join(dir, "archive_error.json"), JSON.stringify({ error: String(e) }));
-    return { ok: false as const, dir };
-  }
+function queue(s: Session) {
+  const jobs = ownJobs(s),
+    shape = (j: Job) => [Date.parse(j.submittedAt), j.id, j.promptJson, {}, []];
+  return {
+    queue_running: jobs.filter((j) => ["DISPATCHING", "RUNNING"].includes(j.status)).map(shape),
+    queue_pending: jobs.filter((j) => j.status === "QUEUED").map(shape),
+  };
 }
-
-export function createApp(): express.Express {
+function allowedFile(base: string, file: string) {
+  const resolved = path.resolve(file);
+  return resolved.startsWith(path.resolve(base) + path.sep) ? resolved : undefined;
+}
+export function createApp() {
   const app = express();
   app.disable("x-powered-by");
-  app.set("trust proxy", 1);
-  app.use(express.json({ limit: "10mb" }));
-
-  // Strip forged identity headers: never trust browser-provided identity.
-  app.use((req, _res, next) => {
-    const cleaned = stripIdentityHeaders(req.headers as unknown as Record<string, unknown>);
-    for (const k of Object.keys(req.headers)) delete req.headers[k];
-    Object.assign(req.headers, cleaned);
+  app.use((req, res, next) => {
+    res.set({
+      "Cache-Control": "private, no-store",
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
+      "X-Frame-Options": "DENY",
+    });
+    for (const h of ["comfy-user", "x-user-id", "x-admin", "x-class-id", "x-role"]) delete req.headers[h];
+    if (!["GET", "HEAD", "OPTIONS"].includes(req.method) && !sameOrigin(req)) {
+      res.status(403).json({ error: "Origin check failed" });
+      return;
+    }
+    if (req.url.startsWith("/api/")) req.url = req.url.slice(4);
     next();
   });
-
-  app.get("/health", (_req, res) => res.json({ ok: true, service: "gateway", time: new Date().toISOString() }));
-
-  // One-time workspace token exchange: sets gateway HttpOwn session cookie.
+  app.get("/health", (_req, res) => {
+    getDb().sql.prepare("SELECT 1").get();
+    res.json({ ok: true, service: "gateway", database: "sqlite-wal" });
+  });
   app.get("/auth/exchange", (req, res) => {
-    const token = String(req.query.token ?? "");
-    if (!token) return res.status(400).send("Missing token");
-    const claims = verifyWorkspaceToken(token, env.WORKSPACE_JWT_SECRET);
-    if (!claims) return res.status(401).send("Invalid or expired token");
-    if (consumedJtis.has(claims.jti)) return res.status(401).send("Token already used");
-    consumedJtis.set(claims.jti, claims.exp * 1000);
-    const sid = randomUUID();
-    sessions.set(sid, {
-      id: sid,
-      userId: claims.sub,
-      classId: claims.classId,
-      enrollmentId: claims.enrollmentId,
-      expiresAt: Date.now() + 24 * 3600 * 1000,
-      workerId: null,
+    const token = String(req.query.token || ""),
+      env = getEnv(),
+      claims = verifyWorkspaceToken(token, env.WORKSPACE_JWT_SECRET);
+    if (!claims) {
+      res.status(401).send("Invalid or expired workspace link");
+      return;
+    }
+    const raw = getDb().transaction(() => {
+      const db = getDb(),
+        ticket = db.get("workspace_tickets", claims.jti);
+      if (
+        !ticket ||
+        ticket.consumedAt ||
+        ticket.expiresAt <= Date.now() ||
+        ticket.userId !== claims.sub ||
+        ticket.classId !== claims.classId ||
+        ticket.enrollmentId !== claims.enrollmentId ||
+        !activeMembership(db, claims.sub, claims.classId, claims.enrollmentId)
+      )
+        return null;
+      ticket.consumedAt = Date.now();
+      db.put("workspace_tickets", ticket);
+      const raw = newSessionToken();
+      db.put("gateway_sessions", {
+        id: hashSessionToken(raw, getEnv().AUTH_SECRET),
+        userId: claims.sub,
+        classId: claims.classId,
+        enrollmentId: claims.enrollmentId,
+        expiresAt: Date.now() + env.SESSION_TTL_HOURS * 3600000,
+      });
+      return raw;
     });
-    res.setHeader("Set-Cookie", sessionCookieValue(sid));
-    // Redirect to ComfyUI root (served via proxy below)
-    res.redirect(302, "/");
-  });
-
-  // Intercept prompt submission: auth, quota, job record, scheduling, forward, archive.
-  app.post("/prompt", async (req, res) => {
-    if (!enforceGatewayOrigin(req, res)) return;
-    const sess = getSession(req);
-    if (!sess) return res.status(401).json({ error: "Gateway session required" });
-    const prompt = req.body?.prompt ?? req.body;
-    if (!prompt || typeof prompt !== "object") return res.status(400).json({ error: "Invalid prompt" });
-
-    const active = userActive.get(sess.userId) ?? 0;
-    const queued = userQueued.get(sess.userId)?.length ?? 0;
-    const maxActive = Number(process.env.MAX_ACTIVE_JOBS_PER_USER ?? 1);
-    const maxQueued = Number(process.env.MAX_QUEUED_JOBS_PER_USER ?? 3);
-    if (active >= maxActive) return res.status(429).json({ error: "Active job limit reached" });
-    if (queued >= maxQueued) return res.status(429).json({ error: "Queued job limit reached" });
-
-    // Worker affinity: reuse session worker if healthy, else select least-loaded.
-    let worker = sess.workerId ? (workers.get(sess.workerId) ?? null) : null;
-    if (!worker || !worker.enabled || worker.healthStatus === "OFFLINE" || worker.healthStatus === "DISABLED") {
-      worker = selectWorker();
+    if (!raw) {
+      res.status(401).send("Workspace link used, expired, or access revoked");
+      return;
     }
-    if (!worker) return res.status(503).json({ error: "No GPU worker available" });
-    sess.workerId = worker.id;
-
-    const jobId = randomUUID();
-    const job: JobRecord = {
-      id: jobId,
-      classId: sess.classId,
-      userId: sess.userId,
-      workerId: worker.id,
-      comfyPromptId: "",
-      status: "DISPATCHING",
-      submittedAt: new Date().toISOString(),
-      promptJson: prompt,
-    };
-    jobs.set(jobId, job);
-    userActive.set(sess.userId, active + 1);
-    worker.load += 1;
-    worker.healthStatus = "BUSY";
-
-    try {
-      const r = await fetch(`${worker.baseUrl.replace(/\/$/, "")}/prompt`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
-      });
-      if (!r.ok) throw new Error(`worker ${r.status}`);
-      const j = (await r.json()) as { prompt_id?: string; promptId?: string };
-      job.comfyPromptId = j.prompt_id ?? j.promptId ?? randomUUID();
-      job.status = "RUNNING";
-      // Best-effort: poll history briefly, then archive asynchronously.
-      setImmediate(async () => {
-        try {
-          for (let i = 0; i < 120; i++) {
-            await new Promise((r2) => setTimeout(r2, 2000));
-            try {
-              const h = await fetch(`${worker!.baseUrl.replace(/\/$/, "")}/history/${job.comfyPromptId}`);
-              if (h.ok) {
-                const hist = (await h.json()) as Record<string, unknown>;
-                if (hist[job.comfyPromptId]) break;
-              }
-            } catch {
-              /* keep polling */
-            }
-          }
-          job.status = "COMPLETED";
-          await archiveOutputs(job, worker!, "class", sess.userId);
-        } catch (e) {
-          job.status = "FAILED";
-        } finally {
-          worker!.load = Math.max(0, worker!.load - 1);
-          userActive.set(sess.userId, Math.max(0, (userActive.get(sess.userId) ?? 1) - 1));
-        }
-      });
-      return res.json({ prompt_id: job.comfyPromptId, jobId });
-    } catch (e) {
-      worker.load = Math.max(0, worker.load - 1);
-      userActive.set(sess.userId, Math.max(0, (userActive.get(sess.userId) ?? 1) - 1));
-      job.status = "FAILED";
-      return res.status(502).json({ error: "Worker failed to accept prompt" });
-    }
+    res.setHeader(
+      "Set-Cookie",
+      `${cookieName}=${raw}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${env.SESSION_TTL_HOURS * 3600}${env.COMFY_PUBLIC_URL.startsWith("https:") ? "; Secure" : ""}`
+    );
+    res.redirect(303, "/");
   });
-
-  // Transparent proxy for other ComfyUI routes (GET assets, /history, /view, /queue, /object_info...)
-  app.use(async (req, res) => {
-    if (req.path.startsWith("/auth/") || req.path === "/health") return res.status(404).end();
-    const sess = getSession(req);
-    if (!sess)
-      return res.status(401).json({ error: "Gateway session required. Open ComfyUI from your class dashboard." });
-    let worker = sess.workerId ? (workers.get(sess.workerId) ?? null) : selectWorker();
-    if (!worker) return res.status(503).json({ error: "No GPU worker available" });
-    sess.workerId = worker.id;
-    const target = `${worker.baseUrl.replace(/\/$/, "")}${req.originalUrl}`;
+  app.use((req, res, next) => {
+    const s = session(req);
+    if (!s) {
+      res.status(401).send("Open ComfyUI from your class dashboard to sign in.");
+      return;
+    }
+    res.locals.session = s;
+    next();
+  });
+  app.use(
+    express.json({
+      limit: "5mb",
+      strict: false,
+      type: (req) =>
+        !req.url?.startsWith("/userdata/") && !String(req.headers["content-type"] || "").startsWith("multipart/"),
+    })
+  );
+  app.post("/prompt", async (req, res, next) => {
     try {
-      const headers: Record<string, string> = {};
-      if (req.headers["content-type"]) headers["content-type"] = String(req.headers["content-type"]);
-      const init: RequestInit = { method: req.method, headers };
-      if (!["GET", "HEAD"].includes(req.method)) init.body = JSON.stringify(req.body ?? {});
-      const r = await fetch(target, init);
-      res.status(r.status);
-      r.headers.forEach((v, k) => {
-        if (!["content-encoding", "transfer-encoding"].includes(k.toLowerCase())) res.setHeader(k, v);
-      });
-      if (!r.body) return res.end();
-      // Stream without buffering whole files in memory
-      const reader = r.body.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        res.write(Buffer.from(value));
+      const s = res.locals.session as Session,
+        db = getDb(),
+        env = getEnv();
+      if (!db.rateLimit("prompt:" + s.userId, 30, 60000)) {
+        res.status(429).json({ error: "Submission rate limit" });
+        return;
       }
-      res.end();
-    } catch {
-      worker.healthStatus = "OFFLINE";
-      return res.status(502).json({ error: "Worker unreachable" });
+      const input = z
+        .object({
+          prompt: z
+            .record(
+              z.string(),
+              z.object({
+                class_type: z.string(),
+                inputs: z.record(z.string(), z.unknown()),
+                _meta: z.unknown().optional(),
+              })
+            )
+            .refine((v) => Object.keys(v).length > 0 && Object.keys(v).length <= 1000),
+          extra_data: z.record(z.string(), z.unknown()).default({}),
+          required_tags: z.array(z.string().max(50)).max(20).default([]),
+        })
+        .parse(req.body);
+      const worker = metadataWorker();
+      if (!worker) {
+        res.status(503).json({ error: "No online worker available to validate the workflow" });
+        return;
+      }
+      const info = await objectInfo(worker, s),
+        allowed = approvedNodes(),
+        jobId = randomUUID(),
+        uploads = new Set(
+          db.list("uploads", "user_id=? AND class_id=?", [s.userId, s.classId!]).map((u) => u.filename)
+        );
+      const submittedPromptJson = structuredClone(input.prompt);
+      for (const node of Object.values(input.prompt)) {
+        if (!allowed.has(node.class_type) || !info[node.class_type]) {
+          res.status(400).json({ error: `Node ${node.class_type} is not approved or available` });
+          return;
+        }
+        if (
+          node.class_type === "LoadImage" &&
+          (typeof node.inputs.image !== "string" || !uploads.has(node.inputs.image))
+        ) {
+          res.status(403).json({ error: "Use an image uploaded in this workspace" });
+          return;
+        }
+        if ("filename_prefix" in node.inputs || node.class_type.startsWith("Save"))
+          node.inputs.filename_prefix = `lab/${jobId}/output`;
+        // Model selectors must use worker-advertised choices, not arbitrary paths.
+        const required = info[node.class_type]?.input?.required || {};
+        for (const [key, value] of Object.entries(node.inputs)) {
+          const options = required[key]?.[0];
+          if (Array.isArray(options) && typeof value === "string" && !options.includes(value)) {
+            res.status(400).json({ error: `Invalid selection for ${node.class_type}.${key}` });
+            return;
+          }
+        }
+      }
+      const job = db.transaction(() => {
+        const member = activeMembership(db, s.userId, s.classId!, s.enrollmentId);
+        if (!member) return null;
+        if (db.list("jobs", "user_id=? AND status='QUEUED'", [s.userId]).length >= env.MAX_QUEUED_JOBS_PER_USER)
+          return null;
+        const j: Job = {
+          id: jobId,
+          userId: s.userId,
+          classId: s.classId!,
+          enrollmentId: member.id,
+          orgDefinedId: member.orgDefinedId,
+          workerId: null,
+          comfyPromptId: null,
+          status: "QUEUED",
+          archiveStatus: "PENDING",
+          submittedAt: new Date().toISOString(),
+          startedAt: null,
+          completedAt: null,
+          runtimeMs: null,
+          promptJson: input.prompt,
+          submittedPromptJson,
+          workflowJson: (input.extra_data.extra_pnginfo as any)?.workflow ?? null,
+          extraData: {},
+          requiredTags: input.required_tags,
+          error: null,
+          archiveError: null,
+          history: null,
+          cancelRequested: false,
+          leaseOwner: null,
+        };
+        db.put("jobs", j);
+        audit("JOB_QUEUED", { actorId: s.userId, classId: s.classId!, targetId: j.id });
+        return j;
+      });
+      if (!job) {
+        res.status(429).json({ error: "Queue full or enrollment revoked" });
+        return;
+      }
+      res.json({ prompt_id: job.id, number: Date.parse(job.submittedAt), node_errors: {} });
+    } catch (e) {
+      next(e);
     }
   });
-
+  app.get("/prompt", (_req, res) => {
+    const s = res.locals.session as Session;
+    res.json({ exec_info: { queue_remaining: queue(s).queue_pending.length + queue(s).queue_running.length } });
+  });
+  app.get("/queue", (_req, res) => res.json(queue(res.locals.session)));
+  app.post("/queue", (req, res) => {
+    const s = res.locals.session as Session;
+    getDb().transaction(() => {
+      for (const j of ownJobs(s)) {
+        if (j.status !== "QUEUED") continue;
+        if (req.body.clear === true || (Array.isArray(req.body.delete) && req.body.delete.includes(j.id))) {
+          j.status = "CANCELLED";
+          j.completedAt = new Date().toISOString();
+          getDb().put("jobs", j);
+        }
+      }
+    });
+    res.json({ ok: true });
+  });
+  app.post("/interrupt", (_req, res) => {
+    getDb().transaction(() => {
+      for (const j of ownJobs(res.locals.session)) {
+        if (["RUNNING", "DISPATCHING"].includes(j.status)) {
+          j.cancelRequested = true;
+          getDb().put("jobs", j);
+        }
+      }
+    });
+    res.json({ ok: true });
+  });
+  app.get(["/history", "/history/:id"], (req, res) => {
+    let jobs = ownJobs(res.locals.session).filter((j) => j.history && j.archiveStatus === "COMPLETE");
+    if (req.params.id) jobs = jobs.filter((j) => j.id === req.params.id);
+    res.json(
+      Object.fromEntries(
+        jobs
+          .sort((a, b) => b.submittedAt.localeCompare(a.submittedAt))
+          .slice(0, 200)
+          .map((j) => [j.id, j.history])
+      )
+    );
+  });
+  app.get("/view", (req, res) => {
+    const s = res.locals.session as Session,
+      db = getDb(),
+      name = String(req.query.filename || "");
+    let file: string | undefined,
+      mime = "application/octet-stream";
+    const upload = db.list("uploads", "user_id=? AND class_id=? AND filename=?", [s.userId, s.classId!, name])[0];
+    if (upload) {
+      file = allowedFile(getEnv().UPLOAD_DATA_DIR, upload.storagePath);
+      mime = upload.mimeType;
+    } else {
+      const output = db.list("outputs", "json_extract(data,'$.fileName')=?", [name])[0];
+      const job = output ? db.get("jobs", output.jobId) : undefined;
+      if (output && job && job.userId === s.userId && job.classId === s.classId && job.archiveStatus === "COMPLETE") {
+        file = allowedFile(getEnv().AUDIT_DATA_DIR, output.storagePath);
+        mime = output.mimeType;
+      }
+    }
+    if (!file || !fs.existsSync(file)) {
+      res.status(404).json({ error: "File not found" });
+      return;
+    }
+    if (!/^(image\/(png|jpeg|webp|gif|avif)|video\/(mp4|webm)|audio\/(wav|mpeg|ogg|flac))$/.test(mime))
+      res.setHeader("Content-Disposition", "attachment");
+    res.type(mime).sendFile(file);
+  });
+  const upload = multer({
+    dest: path.join(getEnv().UPLOAD_DATA_DIR, ".incoming"),
+    limits: { fileSize: getEnv().MAX_UPLOAD_MB * 1024 * 1024, files: 1, fields: 4, fieldSize: 1024 },
+  });
+  app.post("/upload/image", upload.single("image"), async (req, res, next) => {
+    try {
+      if (!req.file) {
+        res.status(400).json({ error: "Image required" });
+        return;
+      }
+      const s = res.locals.session as Session,
+        env = getEnv(),
+        mime = req.file.mimetype;
+      const exts: Record<string, string> = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+      };
+      if (!exts[mime]) {
+        await fsp.rm(req.file.path, { force: true });
+        res.status(400).json({ error: "PNG, JPEG, WebP and GIF uploads are supported" });
+        return;
+      }
+      const id = randomUUID(),
+        filename = id + exts[mime],
+        dest = path.resolve(env.UPLOAD_DATA_DIR, s.userId, s.classId!, filename);
+      await fsp.mkdir(path.dirname(dest), { recursive: true, mode: 0o700 });
+      const accepted = getDb().transaction(() => {
+        const db = getDb();
+        if (!activeMembership(db, s.userId, s.classId!, s.enrollmentId)) return false;
+        const used = db.list("uploads", "user_id=?", [s.userId]).reduce((n, u) => {
+          try {
+            return n + fs.statSync(u.storagePath).size;
+          } catch {
+            return n;
+          }
+        }, 0);
+        if (used + req.file!.size > env.MAX_USER_STORAGE_MB * 1024 * 1024) return false;
+        fs.renameSync(req.file!.path, dest);
+        db.put("uploads", {
+          id,
+          userId: s.userId,
+          classId: s.classId!,
+          filename,
+          storagePath: dest,
+          mimeType: mime,
+          createdAt: new Date().toISOString(),
+        });
+        return true;
+      });
+      if (!accepted) {
+        await fsp.rm(req.file.path, { force: true });
+        res.status(413).json({ error: "Storage quota exceeded or access revoked" });
+        return;
+      }
+      res.json({ name: filename, subfolder: "", type: "input" });
+    } catch (e) {
+      if (req.file) await fsp.rm(req.file.path, { force: true });
+      next(e);
+    }
+  });
+  app.get(["/object_info", "/object_info/:name"], async (req, res, next) => {
+    try {
+      const worker = metadataWorker();
+      if (!worker) {
+        res.status(503).json({ error: "No worker available" });
+        return;
+      }
+      const info = await objectInfo(worker, res.locals.session);
+      res.json(req.params.name ? { [req.params.name]: info[req.params.name] } : info);
+    } catch (e) {
+      next(e);
+    }
+  });
+  app.get("/system_stats", (_req, res) =>
+    res.json({ system: { comfyui_version: "managed", python_version: "managed", embedded_python: false }, devices: [] })
+  );
+  app.get("/users", (_req, res) => res.json({ storage: "server", migrated: true }));
+  app.get("/settings", (_req, res) => {
+    const s = res.locals.session as Session;
+    res.json(
+      JSON.parse(
+        getDb().list("user_data", "user_id=? AND class_id=? AND path=?", [s.userId, s.classId!, "__settings__"])[0]
+          ?.content || "{}"
+      )
+    );
+  });
+  app.get("/settings/:id", (req, res) => {
+    const s = res.locals.session as Session;
+    const all = JSON.parse(
+      getDb().list("user_data", "user_id=? AND class_id=? AND path=?", [s.userId, s.classId!, "__settings__"])[0]
+        ?.content || "{}"
+    );
+    res.json(Object.hasOwn(all, req.params.id) ? all[req.params.id] : null);
+  });
+  app.post("/settings", (req, res) => {
+    saveUserData(res.locals.session, "__settings__", JSON.stringify(req.body));
+    res.json({});
+  });
+  app.post("/settings/:id", (req, res) => {
+    const s = res.locals.session as Session;
+    getDb().transaction(() => {
+      const all = JSON.parse(
+        getDb().list("user_data", "user_id=? AND class_id=? AND path=?", [s.userId, s.classId!, "__settings__"])[0]
+          ?.content || "{}"
+      );
+      all[req.params.id] = req.body;
+      saveUserData(s, "__settings__", JSON.stringify(all));
+    });
+    res.json({});
+  });
+  installUserData(app);
+  // Public frontend assets and read-only model catalogs only. Worker-global APIs,
+  // custom extension APIs, filesystem routes, manager/install and arbitrary mutations
+  // are deliberately not proxied. Add vetted APIs explicitly with owner checks.
+  app.get("*", async (req, res, next) => {
+    try {
+      const asset =
+        req.path === "/" ||
+        req.path === "/index.html" ||
+        /^\/(assets|scripts|extensions|locales|i18n)\/[a-zA-Z0-9_./@-]+\.(js|css|json|svg|png|woff2?|ttf|ico)$/.test(
+          req.path
+        ) ||
+        /^\/(favicon\.ico|robots\.txt)$/.test(req.path);
+      const catalog =
+        ["/models", "/embeddings", "/extensions", "/features"].includes(req.path) ||
+        /^\/models\/[a-zA-Z0-9_-]+$/.test(req.path);
+      if ((!asset && !catalog) || req.path.split("/").includes("..")) {
+        res.status(404).json({ error: "Unsupported or private worker endpoint" });
+        return;
+      }
+      const worker = metadataWorker();
+      if (!worker) {
+        res.status(503).send("No healthy worker available");
+        return;
+      }
+      const response = await workerFetch(worker, req.path);
+      res.status(response.status);
+      if (response.headers.has("content-type")) res.setHeader("Content-Type", response.headers.get("content-type")!);
+      if (!response.body) {
+        res.end();
+        return;
+      }
+      await pipeline(Readable.fromWeb(response.body as any), res);
+    } catch (e) {
+      next(e);
+    }
+  });
+  app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    if (res.headersSent) {
+      res.end();
+      return;
+    }
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ error: "Invalid request" });
+      return;
+    }
+    if (error instanceof multer.MulterError) {
+      res.status(413).json({ error: "Upload exceeds limits" });
+      return;
+    }
+    console.error("[gateway] request failed", error instanceof Error ? error.name : "Error");
+    res.status(502).json({ error: "Gateway request failed" });
+  });
   return app;
 }
-
-// WebSocket proxy for /ws (ComfyUI live status)
 export function attachWs(server: ReturnType<typeof createServer>) {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
   server.on("upgrade", (req, socket, head) => {
-    const url = new URL(req.url ?? "/ws", "http://localhost");
-    if (!url.pathname.startsWith("/ws")) {
+    if (new URL(req.url || "/", "http://localhost").pathname !== "/ws" || !sameOrigin(req)) {
+      socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    const s = session(req);
+    if (!s) {
+      socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    if ([...clients.values()].filter((v) => v.userId === s.userId).length >= 10) {
       socket.destroy();
       return;
     }
-    const cookies = parseCookies(req.headers.cookie);
-    const sess = cookies[GATEWAY_COOKIE] ? sessions.get(cookies[GATEWAY_COOKIE]) : null;
-    if (!sess || sess.expiresAt <= Date.now()) {
-      socket.destroy();
-      return;
-    }
-    const worker = (sess.workerId && workers.get(sess.workerId)) || selectWorker();
-    if (!worker) {
-      socket.destroy();
-      return;
-    }
-    const target = worker.baseUrl.replace(/^http/, "ws").replace(/\/$/, "") + (req.url ?? "/ws");
-    const upstream = new WebSocket(target);
     wss.handleUpgrade(req, socket, head, (client) => {
-      const relay = (a: WebSocket, b: WebSocket) => {
-        a.on("message", (m) => {
-          if (b.readyState === WebSocket.OPEN) b.send(m as Buffer);
-        });
-        a.on("close", () => {
-          try {
-            b.close();
-          } catch {
-            /* noop */
-          }
-        });
-      };
-      upstream.on("open", () => {
-        relay(client, upstream);
-        relay(upstream, client);
-      });
-      upstream.on("error", () => {
-        try {
-          client.close();
-        } catch {
-          /* noop */
-        }
-      });
+      clients.set(client, s);
+      client.on("error", () => {});
+      client.on("close", () => clients.delete(client));
+      client.send(
+        JSON.stringify({
+          type: "status",
+          data: {
+            sid: randomUUID(),
+            status: {
+              exec_info: {
+                queue_remaining: ownJobs(s).filter((j) => ["QUEUED", "RUNNING", "DISPATCHING"].includes(j.status))
+                  .length,
+              },
+            },
+          },
+        })
+      );
     });
   });
-}
-
-if (process.env.GATEWAY_RUN !== "0") {
-  seedWorkers();
-  loadWorkersFromDb().finally(() => {
-    setInterval(() => {
-      healthCheckLoop().catch(() => undefined);
-    }, 15_000);
-    healthCheckLoop().catch(() => undefined);
-    const app = createApp();
-    const server = createServer(app);
-    attachWs(server);
-    const port = Number(process.env.GATEWAY_PORT ?? 8081);
-    server.listen(port, () => console.log(`[gateway] listening on :${port}`));
+  const timer = setInterval(() => {
+    for (const [client, s] of clients) {
+      if (
+        s.expiresAt <= Date.now() ||
+        !getDb().get("gateway_sessions", s.id) ||
+        !activeMembership(getDb(), s.userId, s.classId!, s.enrollmentId)
+      ) {
+        client.close(1008, "Session expired or access revoked");
+        clients.delete(client);
+      } else if (client.readyState === WebSocket.OPEN) {
+        client.send(
+          JSON.stringify({
+            type: "status",
+            data: {
+              status: {
+                exec_info: {
+                  queue_remaining: ownJobs(s).filter((j) => ["QUEUED", "RUNNING", "DISPATCHING"].includes(j.status))
+                    .length,
+                },
+              },
+            },
+          })
+        );
+      }
+    }
+  }, 1000);
+  timer.unref();
+  server.on("close", () => {
+    clearInterval(timer);
+    for (const client of clients.keys()) client.close();
+    wss.close();
   });
+  return wss;
 }
+export function startGateway() {
+  validateStartup();
+  getDb();
+  const app = createApp(),
+    server = createServer(app);
+  attachWs(server);
+  const scheduler = new Scheduler(notify);
+  server.listen(getEnv().GATEWAY_PORT, "0.0.0.0", () => console.log("Gateway ready"));
+  scheduler.start();
+  const stop = () => {
+    void scheduler.stop();
+    server.close();
+    setTimeout(() => process.exit(0), 2000).unref();
+  };
+  process.once("SIGTERM", stop);
+  process.once("SIGINT", stop);
+  return { server, scheduler };
+}
+if (process.env.GATEWAY_RUN !== "0") startGateway();

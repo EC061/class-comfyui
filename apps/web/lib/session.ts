@@ -1,61 +1,47 @@
-import { cookies } from "next/headers";
-import { randomUUID } from "node:crypto";
-import { hashToken, newSessionToken } from "@class-comfyui/auth";
 import { getEnv, isHttpsPublicUrl } from "@class-comfyui/config";
-import { store } from "./store";
-
+import { hashSessionToken, newSessionToken } from "@class-comfyui/auth";
+import { getDb } from "@class-comfyui/database";
 export const SESSION_COOKIE = "comfy_session";
-
-export function createSession(userId: string): { raw: string; expiresAt: number } {
-  const env = getEnv();
-  const raw = newSessionToken();
-  const ttlMs = env.SESSION_TTL_HOURS * 3600 * 1000;
-  const expiresAt = Date.now() + ttlMs;
-  store.sessions.set(hashToken(raw), { userId, tokenHash: hashToken(raw), expiresAt });
+export function cookieToken(header: string | null, name = SESSION_COOKIE) {
+  return (
+    header
+      ?.split(";")
+      .map((v) => v.trim())
+      .find((v) => v.startsWith(name + "="))
+      ?.slice(name.length + 1) ?? null
+  );
+}
+export function createSession(userId: string) {
+  const raw = newSessionToken(),
+    expiresAt = Date.now() + getEnv().SESSION_TTL_HOURS * 3600000;
+  getDb().put("sessions", { id: hashSessionToken(raw, getEnv().AUTH_SECRET), userId, expiresAt });
   return { raw, expiresAt };
 }
-
-export function sessionCookieValue(raw: string, expiresAt: number): string {
-  const env = getEnv();
-  const secure = isHttpsPublicUrl(env.PUBLIC_URL);
-  const exp = new Date(expiresAt).toUTCString();
-  return `${SESSION_COOKIE}=${raw}; Path=/; HttpOnly; SameSite=Lax; Expires=${exp}${secure ? "; Secure" : ""}`;
+export function sessionCookieValue(raw: string, expiresAt: number) {
+  return `${SESSION_COOKIE}=${raw}; Path=/; HttpOnly; SameSite=Lax; Expires=${new Date(expiresAt).toUTCString()}${isHttpsPublicUrl(getEnv().PUBLIC_URL) ? "; Secure" : ""}`;
 }
-
-export function clearSessionCookie(): string {
-  const env = getEnv();
-  const secure = isHttpsPublicUrl(env.PUBLIC_URL);
-  return `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Expires=Thu, 01 Jan 1970 00:00:00 GMT${secure ? "; Secure" : ""}`;
+export function clearSessionCookie() {
+  return sessionCookieValue("", 0);
 }
-
-export function getSessionUserIdFromCookie(cookieHeader: string | null): string | null {
-  if (!cookieHeader) return null;
-  const parts = cookieHeader.split(";").map((s) => s.trim());
-  let raw: string | null = null;
-  for (const p of parts) {
-    if (p.startsWith(`${SESSION_COOKIE}=`)) raw = p.slice(SESSION_COOKIE.length + 1);
-  }
-  if (!raw) return null;
-  const row = store.sessions.get(hashToken(raw));
-  if (!row) return null;
-  if (row.expiresAt <= Date.now()) {
-    store.sessions.delete(hashToken(raw));
-    return null;
-  }
-  const user = store.users.get(row.userId);
-  if (!user || user.status !== "ACTIVE") return null;
-  return row.userId;
+export function getSessionUserIdFromCookie(header: string | null) {
+  const token = cookieToken(header);
+  if (!token) return null;
+  const db = getDb(),
+    s = db.get("sessions", hashSessionToken(token, getEnv().AUTH_SECRET));
+  if (!s || s.expiresAt <= Date.now()) return null;
+  const user = db.get("users", s.userId);
+  return user?.status === "ACTIVE" ? user.id : null;
 }
-
-export function destroySessionByCookie(cookieHeader: string | null) {
-  if (!cookieHeader) return;
-  const parts = cookieHeader.split(";").map((s) => s.trim());
-  for (const p of parts) {
-    if (p.startsWith(`${SESSION_COOKIE}=`)) {
-      const raw = p.slice(SESSION_COOKIE.length + 1);
-      store.sessions.delete(hashToken(raw));
+export function destroySessionByCookie(header: string | null) {
+  const raw = cookieToken(header);
+  if (!raw) return;
+  const db = getDb(),
+    session = db.get("sessions", hashSessionToken(raw, getEnv().AUTH_SECRET));
+  db.transaction(() => {
+    db.delete("sessions", hashSessionToken(raw, getEnv().AUTH_SECRET));
+    if (session) {
+      for (const s of db.list("gateway_sessions", "user_id=?", [session.userId])) db.delete("gateway_sessions", s.id);
+      for (const t of db.list("workspace_tickets", "user_id=?", [session.userId])) db.delete("workspace_tickets", t.id);
     }
-  }
+  });
 }
-
-export { randomUUID };

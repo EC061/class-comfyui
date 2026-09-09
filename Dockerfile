@@ -1,61 +1,23 @@
-# Multi-arch production image: web + gateway + migrate in one image.
-# Usage:
-#   web:     command: ["web"]
-#   gateway: command: ["gateway"]
-#   migrate: command: ["migrate"]
-
-FROM node:20-alpine AS base
-RUN apk add --no-cache libc6-compat openssl
-RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
+# Node 24 provides the same SQLite engine on amd64 and arm64; no native npm addon.
+FROM node:24-bookworm-slim AS build
 WORKDIR /app
-# Never prompt in non-interactive builds.
-ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-
-FROM base AS deps
-# NOTE: .npmrc must be copied here too. pnpm records install settings in
-# node_modules/.modules.yaml; if the builder stage later reinstalls with
-# different effective settings, pnpm deletes node_modules and reinstalls from
-# scratch (breaking the build when the store isn't carried over).
-COPY pnpm-workspace.yaml package.json pnpm-lock.yaml .npmrc ./
-COPY apps/web/package.json apps/web/package.json
-COPY apps/gateway/package.json apps/gateway/package.json
-COPY packages/config/package.json packages/config/package.json
-COPY packages/shared/package.json packages/shared/package.json
-COPY packages/auth/package.json packages/auth/package.json
-COPY packages/database/package.json packages/database/package.json
-# Strict frozen install: the lockfile is committed, so any drift fails fast
-# instead of being masked by a fallback reinstall.
-RUN pnpm install --frozen-lockfile
-
-FROM base AS builder
-# Bring over the COMPLETE install: top-level node_modules AND the per-package
-# node_modules dirs pnpm creates under apps/*/ and packages*/ (symlinks into
-# the virtual store). Copying only /app/node_modules leaves tsc/Next unable to
-# resolve workspace dependencies (e.g. drizzle-orm, pg).
-COPY --from=deps /app /app
-# Overlay full sources. .dockerignore keeps local node_modules/.next/dist out
-# of the context, so this cannot clobber the install above.
+RUN npm install --global pnpm@9.12.0
 COPY . .
-# No reinstall here: manifests are byte-identical to the deps stage context.
-RUN pnpm --filter @class-comfyui/database build
-RUN pnpm --filter @class-comfyui/gateway build
-RUN pnpm --filter @class-comfyui/web build
+RUN pnpm install --frozen-lockfile
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN pnpm build
 
-FROM node:20-alpine AS runner
-RUN apk add --no-cache openssl \
-  && addgroup -S app && adduser -S app -G app
+FROM node:24-bookworm-slim AS runner
+ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 HOSTNAME=0.0.0.0
 WORKDIR /app
-ENV NODE_ENV=production
-COPY --from=builder /app/apps/web/.next/standalone ./
-COPY --from=builder /app/apps/web/.next/static ./apps/web/.next/static
-COPY --from=builder /app/apps/web/public ./apps/web/public
-COPY --from=builder /app/apps/gateway/dist ./gateway/dist
-COPY --from=builder /app/apps/gateway/package.json ./gateway/package.json
-COPY --from=builder /app/packages/database/dist ./packages/database/dist
-COPY --from=builder /app/packages/database/package.json ./packages/database/package.json
-COPY --from=builder /app/node_modules ./node_modules
-COPY scripts/docker-entrypoint.sh ./docker-entrypoint.sh
-RUN chmod +x ./docker-entrypoint.sh && chown -R app:app /app
-USER app
+COPY --from=build --chown=node:node /app/apps/web/.next/standalone ./
+COPY --from=build --chown=node:node /app/apps/web/.next/static ./apps/web/.next/static
+COPY --from=build --chown=node:node /app/apps/web/public ./apps/web/public
+COPY --from=build --chown=node:node /app/apps/gateway/dist/index.cjs ./gateway/index.cjs
+COPY --from=build --chown=node:node /app/packages/database/dist/*.cjs ./database/
+COPY --chmod=755 scripts/docker-entrypoint.sh ./docker-entrypoint.sh
+RUN mkdir -p /data/audit /data/uploads && chown -R node:node /data
+USER node
 EXPOSE 3000 8081
-ENTRYPOINT ["./docker-entrypoint.sh"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["web"]

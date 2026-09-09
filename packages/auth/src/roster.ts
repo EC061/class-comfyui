@@ -1,3 +1,4 @@
+import { parse } from "csv-parse/sync";
 export type RosterRowState = "NEW" | "UNCHANGED" | "UPDATED" | "MISSING_FROM_NEW_ROSTER" | "INVALID" | "DUPLICATE";
 
 export interface ParsedRosterRow {
@@ -26,52 +27,24 @@ export interface RosterPreview {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-function splitCsvLine(line: string): string[] {
-  // Minimal CSV parser supporting quoted fields with commas and escaped quotes.
-  const out: string[] = [];
-  let cur = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (inQuotes) {
-      if (c === '"') {
-        if (line[i + 1] === '"') {
-          cur += '"';
-          i++;
-        } else {
-          inQuotes = false;
-        }
-      } else {
-        cur += c;
-      }
-    } else {
-      if (c === '"') inQuotes = true;
-      else if (c === ",") {
-        out.push(cur);
-        cur = "";
-      } else cur += c;
-    }
-  }
-  out.push(cur);
-  return out;
-}
-
 export function parseRosterCsv(csvText: string): { rows: ParsedRosterRow[]; errors: string[] } {
   const errors: string[] = [];
-  const lines = csvText.split(/\r?\n/);
-  // Remove BOM
-  if (lines.length > 0 && lines[0].charCodeAt(0) === 0xfeff) lines[0] = lines[0].slice(1);
-  // Drop trailing empty lines
-  while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
-  if (lines.length === 0) return { rows: [], errors: ["Empty file"] };
-
-  const headerCells = splitCsvLine(lines[0]).map((h) => h.trim());
+  if (Buffer.byteLength(csvText) > 5_000_000) return { rows: [], errors: ["CSV exceeds 5 MB"] };
+  let records: string[][];
+  try {
+    records = parse(csvText, { bom: true, skip_empty_lines: true, trim: true, max_record_size: 10000 }) as string[][];
+  } catch {
+    return { rows: [], errors: ["Malformed CSV: check quoting and column counts"] };
+  }
+  if (!records.length) return { rows: [], errors: ["Empty file"] };
+  if (records.length > 10001) return { rows: [], errors: ["Maximum 10000 roster rows"] };
+  const headerCells = records[0].map((h) => h.trim());
   const expected = ["OrgDefinedId", "Last Name", "First Name", "Email", "End-of-Line Indicator"];
   const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
   const headerNorm = headerCells.map(norm);
   const expectedNorm = expected.map(norm);
   const hasAll = expectedNorm.every((e) => headerNorm.includes(e));
-  if (!hasAll) {
+  if (!hasAll || new Set(headerNorm).size !== headerNorm.length) {
     return {
       rows: [],
       errors: [`Missing required headers. Expected: ${expected.join(", ")}. Got: ${headerCells.join(", ")}`],
@@ -83,10 +56,9 @@ export function parseRosterCsv(csvText: string): { rows: ParsedRosterRow[]; erro
   }
 
   const rows: ParsedRosterRow[] = [];
-  for (let i = 1; i < lines.length; i++) {
+  for (let i = 1; i < records.length; i++) {
     const lineNo = i + 1;
-    if (lines[i].trim() === "") continue;
-    const cells = splitCsvLine(lines[i]);
+    const cells = records[i];
     const get = (name: string) => (cells[idx[name]] ?? "").trim();
     const rawId = get("OrgDefinedId");
     const lastName = get("Last Name");
@@ -99,13 +71,14 @@ export function parseRosterCsv(csvText: string): { rows: ParsedRosterRow[]; erro
     if (orgId.startsWith("#")) orgId = orgId.slice(1);
     orgId = orgId.trim();
     if (!orgId) rowErrors.push("Missing OrgDefinedId");
-    else if (!/^[0-9]+$/.test(orgId)) rowErrors.push(`Malformed OrgDefinedId: ${rawId}`);
+    else if (!/^[0-9]{1,20}$/.test(orgId)) rowErrors.push(`Malformed OrgDefinedId: ${rawId}`);
 
     if (!emailRaw) rowErrors.push("Missing email");
     else if (!EMAIL_RE.test(email)) rowErrors.push(`Malformed email: ${emailRaw}`);
     else if (email.length > 320) rowErrors.push("Email too long");
 
     if (!firstName) rowErrors.push("Missing first name");
+    if (firstName.length > 100 || lastName.length > 100) rowErrors.push("Name exceeds 100 characters");
     if (!lastName) rowErrors.push("Missing last name");
 
     rows.push({
@@ -172,7 +145,6 @@ export function reconcileRoster(parsed: ParsedRosterRow[], existing: ExistingEnr
 
     const exByEmail = byEmail.get(r.email);
     const exById = byId.get(r.orgDefinedId);
-    const ex = exByEmail ?? (exById && exById.rosterEmail !== r.email ? undefined : exById);
     // If email exists but ID differs, or ID exists but email differs -> treat as UPDATED with note
     if (!exByEmail && !exById) {
       newCount++;

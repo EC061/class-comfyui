@@ -1,6 +1,5 @@
 import "./globals.css";
 import Link from "next/link";
-import { getEnv, canonicalOrigin } from "@class-comfyui/config";
 
 export const metadata = { title: "ComfyUI Lab", description: "Classroom management for centrally hosted ComfyUI" };
 
@@ -30,18 +29,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           </div>
         </header>
         <main className="mx-auto max-w-6xl px-4 py-6">{children}</main>
-        <footer className="mx-auto max-w-6xl px-4 pb-8 text-xs text-slate-500">
-          Origin enforced against PUBLIC_URL ({canonicalOriginSafe()}).
-        </footer>
       </body>
     </html>
   );
-}
-
-function canonicalOriginSafe(): string {
-  try {
-    return canonicalOrigin(getEnv().PUBLIC_URL);
-  } catch {
-    return "unconfigured";
-  }
 }

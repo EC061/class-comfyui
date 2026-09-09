@@ -1,68 +1,52 @@
 import { hashToken, newSignupToken } from "@class-comfyui/auth";
 import { getEnv, appUrl } from "@class-comfyui/config";
-import { store, audit } from "./store";
+import { getDb, audit } from "@class-comfyui/database";
 import { randomUUID } from "node:crypto";
-
-/** Generate (or regenerate) a class signup URL. Stores only the hash. Regeneration revokes old tokens. */
-export function generateSignupUrl(classId: string, actorId?: string): { url: string; raw: string; version: number } {
-  const env = getEnv();
-  const cls = store.classes.get(classId);
-  if (!cls) throw new Error("Class not found");
-  const raw = newSignupToken();
-  const version = cls.signupTokenVersion + 1;
-  cls.signupTokenVersion = version;
-  cls.signupEnabled = true;
-  cls.updatedAt = new Date().toISOString();
-  // Revoke previous
-  for (const t of store.signupTokens) {
-    if (t.classId === classId && t.enabled) {
-      t.enabled = false;
-      t.revokedAt = new Date().toISOString();
-    }
-  }
-  store.signupTokens.push({
-    classId,
-    tokenHash: hashToken(raw),
-    version,
-    enabled: true,
-    createdAt: new Date().toISOString(),
-    revokedAt: null,
+export function generateSignupUrl(classId: string, actorId?: string) {
+  const db = getDb();
+  return db.transaction(() => {
+    const c = db.get("classes", classId);
+    if (!c) throw new Error("Class not found");
+    const raw = newSignupToken();
+    for (const t of db.list("signup_tokens", "class_id=?", [classId])) db.delete("signup_tokens", t.id);
+    c.signupTokenVersion++;
+    c.signupEnabled = true;
+    c.updatedAt = new Date().toISOString();
+    db.put("classes", c);
+    db.put("signup_tokens", {
+      id: randomUUID(),
+      classId,
+      tokenHash: hashToken(raw),
+      version: c.signupTokenVersion,
+      enabled: true,
+      createdAt: c.updatedAt,
+    });
+    audit(c.signupTokenVersion === 1 ? "CLASS_SIGNUP_ENABLED" : "CLASS_SIGNUP_REGENERATED", {
+      actorId,
+      classId,
+      targetId: classId,
+    });
+    return { url: appUrl(getEnv().PUBLIC_URL, `/signup/${c.slug}/${raw}`), raw, version: c.signupTokenVersion };
   });
-  const url = appUrl(env.PUBLIC_URL, `/signup/${cls.slug}/${raw}`);
-  audit("CLASS_SIGNUP_REGENERATED", { actorId: actorId ?? null, classId, targetId: classId, metadata: { version } });
-  return { url, raw, version };
 }
-
-export function getActiveSignupUrl(classId: string): string | null {
-  // Plain token is NOT recoverable from DB (only hash stored).
-  // We intentionally return null here; UI must use the just-generated URL or regenerate.
-  // Documented secure behavior.
-  return null;
+export function validateSignupToken(slug: string, raw: string) {
+  const db = getDb(),
+    c = db.list("classes", "slug=?", [slug])[0];
+  if (!c?.active || !c.signupEnabled) return { ok: false, reason: "Invalid or disabled signup link" };
+  const t = db.list("signup_tokens", "class_id=? AND token_hash=?", [c.id, hashToken(raw)])[0];
+  return t?.enabled && t.version === c.signupTokenVersion
+    ? { ok: true, classId: c.id, version: t.version }
+    : { ok: false, reason: "Invalid or revoked signup link" };
 }
-
-/** Validate a presented signup token for a class slug. */
-export function validateSignupToken(
-  classSlug: string,
-  rawToken: string
-): { ok: boolean; classId?: string; reason?: string } {
-  const cls = store.classesBySlug.get(classSlug);
-  if (!cls) return { ok: false, reason: "Unknown class" };
-  if (!cls.active) return { ok: false, reason: "Class is archived" };
-  if (!cls.signupEnabled) return { ok: false, reason: "Signup is disabled" };
-  const h = hashToken(rawToken);
-  const found = store.signupTokens.find((t) => t.classId === cls.id && t.tokenHash === h && t.enabled);
-  if (!found) return { ok: false, reason: "Invalid or revoked signup link" };
-  return { ok: true, classId: cls.id };
-}
-
 export function setSignupEnabled(classId: string, enabled: boolean, actorId?: string) {
-  const cls = store.classes.get(classId);
-  if (!cls) throw new Error("Class not found");
-  cls.signupEnabled = enabled;
-  cls.updatedAt = new Date().toISOString();
-  audit(enabled ? "CLASS_SIGNUP_ENABLED" : "CLASS_SIGNUP_DISABLED", {
-    actorId: actorId ?? null,
-    classId,
-    targetId: classId,
+  const db = getDb();
+  return db.transaction(() => {
+    const c = db.get("classes", classId);
+    if (!c) throw new Error("Class not found");
+    c.signupEnabled = enabled;
+    c.updatedAt = new Date().toISOString();
+    db.put("classes", c);
+    audit(enabled ? "CLASS_SIGNUP_ENABLED" : "CLASS_SIGNUP_DISABLED", { actorId, classId, targetId: classId });
+    return c;
   });
 }

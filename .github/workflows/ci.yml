@@ -1,25 +1,40 @@
 name: ci
 on:
   push:
-    branches: ["main"]
   pull_request:
-
 jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        # No `version:` key: the action reads the exact version from the
-        # `packageManager` field in package.json. Specifying both errors out
-        # with "Multiple versions of pnpm specified".
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm format:check
+      - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
-      - run: pnpm --filter @class-comfyui/web build
-      - run: pnpm --filter @class-comfyui/gateway build
+      - run: pnpm build
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:e2e
+      - name: Build runtime image
+        run: docker build -t class-comfyui:local .
+      - name: Run Compose and health checks
+        run: |
+          cp docker-compose.example.yml docker-compose.yml
+          mkdir -p data
+          sudo chown 1000:1000 data
+          docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --wait
+          curl --fail http://localhost:8080/api/health
+          curl --fail -H 'Host: comfy.localhost' http://127.0.0.1:8080/health
+          docker compose -f docker-compose.yml -f docker-compose.local.yml down
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-results
+          path: |
+            test-results/
+            playwright-report/

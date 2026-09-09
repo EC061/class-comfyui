@@ -1,0 +1,40 @@
+# Local override. First copy the example if you have no real config yet:
+#   cp docker-compose.example.yml docker-compose.yml
+# Then run: docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
+# Development values are intentionally public and must not be used for deployment.
+x-local: &local
+  NODE_ENV: "development"
+  PUBLIC_URL: "http://localhost:8080"
+  COMFY_PUBLIC_URL: "http://comfy.localhost:8080"
+  AUTH_SECRET: "local-development-auth-secret-32-characters"
+  WORKSPACE_JWT_SECRET: "local-development-workspace-secret-32-characters"
+  ADMIN_REGISTRATION_CODE: "local-development-admin-code-32-characters"
+  SMTP_HOST: "mailpit"
+  SMTP_PORT: "1025"
+  SMTP_PASSWORD: ""
+services:
+  nginx:
+    environment:
+      PUBLIC_HOST: "localhost"
+      COMFY_HOST: "comfy.localhost"
+  web:
+    image: class-comfyui:local
+    build: .
+    environment:
+      <<: *local
+  gateway:
+    image: class-comfyui:local
+    build: .
+    environment:
+      <<: *local
+  migrate:
+    image: class-comfyui:local
+    build: .
+    environment:
+      NODE_ENV: "development"
+  mailpit:
+    image: axllent/mailpit:latest
+    environment:
+      MP_MAX_MESSAGES: "200"
+    ports:
+      - "127.0.0.1:8025:8025"

@@ -1,14 +1,10 @@
 #!/bin/sh
-set -e
-cmd="${1:-web}"
-if [ "$cmd" = "web" ]; then
-  exec node apps/web/server.js
-elif [ "$cmd" = "gateway" ]; then
-  exec node gateway/dist/index.mjs
-elif [ "$cmd" = "migrate" ]; then
-  exec node packages/database/dist/db/migrate.js
-elif [ "$cmd" = "seed" ]; then
-  exec node packages/database/dist/db/seed.js
-else
-  exec "$@"
-fi
+set -eu
+case "${1:-web}" in
+ web) exec node apps/web/server.js ;;
+ gateway) exec node gateway/index.cjs ;;
+ migrate) exec node database/migrate.cjs ;;
+ seed) exec node database/seed.cjs ;;
+ backup) shift; exec node database/backup.cjs "$@" ;;
+ *) exec "$@" ;;
+esac

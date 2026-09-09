@@ -41,9 +41,15 @@ describe("strict origin enforcement", () => {
     ).toBe(false);
   });
 
-  it("falls back to strict host check when Origin absent", () => {
+  it("requires same-origin fetch metadata and referer when Origin absent", () => {
     expect(
-      isAllowedBrowserOrigin({ publicUrl: PUBLIC_URL, originHeader: null, hostHeader: "comfy-admin.example.edu" })
+      isAllowedBrowserOrigin({
+        publicUrl: PUBLIC_URL,
+        originHeader: null,
+        hostHeader: "comfy-admin.example.edu",
+        fetchSite: "same-origin",
+        referer: PUBLIC_URL + "/dashboard",
+      })
     ).toBe(true);
     expect(isAllowedBrowserOrigin({ publicUrl: PUBLIC_URL, originHeader: null, hostHeader: "evil.example.com" })).toBe(
       false

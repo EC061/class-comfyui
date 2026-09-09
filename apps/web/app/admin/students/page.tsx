@@ -5,6 +5,7 @@ export default function StudentsPage() {
   const [users, setUsers] = useState<
     Array<{ id: string; email: string; firstName: string; lastName: string; globalRole: string; status: string }>
   >([]);
+  const [error, setError] = useState("");
   const [q, setQ] = useState("");
   async function load() {
     const r = await fetch(`/api/admin/users?q=${encodeURIComponent(q)}`);
@@ -12,19 +13,20 @@ export default function StudentsPage() {
   }
   useEffect(() => {
     load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   async function setStatus(id: string, status: string) {
-    await fetch(`/api/admin/users?id=${id}`, {
+    const response = await fetch(`/api/admin/users?id=${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
     });
+    if (!response.ok) setError((await response.json()).error);
     load();
   }
   return (
     <div className="card">
       <h1 className="text-xl font-bold">Students</h1>
+      {error && <p role="alert">{error}</p>}
       <div className="mt-2 flex gap-2">
         <input className="input" placeholder="Search…" value={q} onChange={(e) => setQ(e.target.value)} />
         <button className="btn-secondary" onClick={load}>

@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
+import { Jobs } from "@/components/jobs";
 
 interface Session {
   user: { id: string; email: string; globalRole: string } | null;
@@ -10,6 +11,7 @@ interface Session {
     courseCode: string;
     term: string;
     status: string;
+    classActive: boolean;
   }>;
 }
 
@@ -50,21 +52,23 @@ export default function DashboardPage() {
         <h1 className="text-xl font-bold">My classes</h1>
         <p className="text-sm text-slate-600">{sess.user.email}</p>
         <div className="mt-4 grid gap-2">
-          {(sess.enrollments ?? []).map((e) => (
-            <div key={e.classId} className="flex items-center justify-between rounded-lg border p-3">
-              <div>
-                <div className="font-medium">
-                  {e.courseCode} — {e.term}
+          {(sess.enrollments ?? [])
+            .filter((e) => e.status === "ACTIVE" && e.classActive)
+            .map((e) => (
+              <div key={e.classId} className="flex items-center justify-between rounded-lg border p-3">
+                <div>
+                  <div className="font-medium">
+                    {e.courseCode} — {e.term}
+                  </div>
+                  <div className="text-sm text-slate-600">
+                    {e.className} · {e.status}
+                  </div>
                 </div>
-                <div className="text-sm text-slate-600">
-                  {e.className} · {e.status}
-                </div>
+                <button className="btn" onClick={() => openComfy(e.classId)}>
+                  Open ComfyUI
+                </button>
               </div>
-              <button className="btn" onClick={() => openComfy(e.classId)}>
-                Open ComfyUI
-              </button>
-            </div>
-          ))}
+            ))}
           {(sess.enrollments ?? []).length === 0 && <p className="text-sm">No enrollments yet.</p>}
         </div>
         {msg && <p className="mt-2 text-sm text-red-600">{msg}</p>}
@@ -75,37 +79,5 @@ export default function DashboardPage() {
 }
 
 function MyJobs() {
-  const [jobs, setJobs] = useState<
-    Array<{ id: string; status: string; submittedAt: string; workerName: string | null }>
-  >([]);
-  useEffect(() => {
-    fetch("/api/jobs").then(async (r) => {
-      if (r.ok) setJobs((await r.json()).jobs ?? []);
-    });
-  }, []);
-  return (
-    <div className="card">
-      <h2 className="font-bold">My jobs</h2>
-      <table className="data mt-2">
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Status</th>
-            <th>Worker</th>
-            <th>Submitted</th>
-          </tr>
-        </thead>
-        <tbody>
-          {jobs.map((j) => (
-            <tr key={j.id}>
-              <td className="font-mono text-xs">{j.id.slice(0, 8)}</td>
-              <td>{j.status}</td>
-              <td>{j.workerName ?? "—"}</td>
-              <td>{j.submittedAt}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
+  return <Jobs />;
 }

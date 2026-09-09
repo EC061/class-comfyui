@@ -86,11 +86,30 @@ export function verifyWorkspaceToken(token: string, secret: string): WorkspaceCl
     const a = Buffer.from(s);
     const b = Buffer.from(expected);
     if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+    const header = JSON.parse(b64urlDecode(h).toString("utf8"));
+    if (header.alg !== "HS256" || header.typ !== "JWT") return null;
     const payload = JSON.parse(b64urlDecode(p).toString("utf8")) as WorkspaceClaims;
     const now = Math.floor(Date.now() / 1000);
-    if (payload.exp <= now) return null;
+    if (
+      typeof payload.exp !== "number" ||
+      typeof payload.iat !== "number" ||
+      payload.exp <= now ||
+      payload.iat > now + 5 ||
+      payload.exp - payload.iat > 60
+    )
+      return null;
     if (payload.iss !== "class-comfyui") return null;
-    if (!payload.sub || !payload.classId || !payload.jti) return null;
+    if (
+      typeof payload.sub !== "string" ||
+      typeof payload.classId !== "string" ||
+      typeof payload.enrollmentId !== "string" ||
+      typeof payload.jti !== "string" ||
+      !payload.sub ||
+      !payload.classId ||
+      !payload.enrollmentId ||
+      !payload.jti
+    )
+      return null;
     return payload;
   } catch {
     return null;
@@ -116,30 +135,9 @@ export function checkAdminCode(provided: string, expected: string): boolean {
   return timingSafeEqual(a, b);
 }
 
-// ---- Simple in-memory rate limiter (production uses Redis wrapper in web/lib) ----
-export interface RateLimitResult {
-  allowed: boolean;
-  remaining: number;
-  resetMs: number;
-}
-
-const buckets = new Map<string, { count: number; resetAt: number }>();
-
-export function rateLimitCheck(key: string, limit: number, windowMs: number, now = Date.now()): RateLimitResult {
-  const cur = buckets.get(key);
-  if (!cur || now >= cur.resetAt) {
-    buckets.set(key, { count: 1, resetAt: now + windowMs });
-    return { allowed: true, remaining: limit - 1, resetMs: windowMs };
-  }
-  if (cur.count >= limit) {
-    return { allowed: false, remaining: 0, resetMs: cur.resetAt - now };
-  }
-  cur.count += 1;
-  return { allowed: true, remaining: limit - cur.count, resetMs: cur.resetAt - now };
-}
-
-export function resetRateLimits() {
-  buckets.clear();
+/** Keyed session lookup. Rotating AUTH_SECRET revokes existing browser sessions. */
+export function hashSessionToken(token: string, secret: string) {
+  return createHmac("sha256", secret).update(token).digest("hex");
 }
 
 export { canonicalEmail };
