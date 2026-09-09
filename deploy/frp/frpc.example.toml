@@ -1,0 +1,18 @@
+# Example FRPC config (client side, on campus network). NOT managed by Compose.
+# Copy to frpc.toml, fill in real values, keep secrets out of git.
+# FRP handles all public TLS; nginx behind it serves plain HTTP on 127.0.0.1:8080.
+
+serverAddr = "frps.example.edu"
+serverPort = 7000
+
+auth.method = "token"
+# CHANGE_ME: set a long random token shared with FRPS
+auth.token = "CHANGE_ME_FRP_TOKEN"
+
+[[proxies]]
+name = "comfy-admin-http"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 8080
+# CHANGE_ME: public domains served by FRPS (must have TLS certs on FRPS)
+customDomains = ["comfy-admin.example.edu", "comfy.example.edu"]

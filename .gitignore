@@ -1,0 +1,13 @@
+node_modules
+apps/web/.next
+apps/web/out
+apps/gateway/dist
+packages/*/dist
+*.tsbuildinfo
+.next
+dist
+.env
+.env.local
+data
+/data
+coverage

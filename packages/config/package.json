@@ -1,0 +1,14 @@
+{
+  "name": "@class-comfyui/config",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc --noEmit -p ../../tsconfig.json",
+    "typecheck": "tsc --noEmit -p ../../tsconfig.json"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  }
+}
