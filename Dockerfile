@@ -28,12 +28,15 @@ COPY packages/database/package.json packages/database/package.json
 RUN pnpm install --frozen-lockfile
 
 FROM base AS builder
-COPY --from=deps /app/node_modules ./node_modules
+# Bring over the COMPLETE install: top-level node_modules AND the per-package
+# node_modules dirs pnpm creates under apps/*/ and packages*/ (symlinks into
+# the virtual store). Copying only /app/node_modules leaves tsc/Next unable to
+# resolve workspace dependencies (e.g. drizzle-orm, pg).
+COPY --from=deps /app /app
+# Overlay full sources. .dockerignore keeps local node_modules/.next/dist out
+# of the context, so this cannot clobber the install above.
 COPY . .
-# No reinstall here: the manifests above are byte-identical to the build
-# context, so the node_modules from the deps stage is already correct.
-# (A redundant `pnpm install` risks pnpm wiping node_modules when it detects
-#  differing settings, leaving builds with missing dependencies.)
+# No reinstall here: manifests are byte-identical to the deps stage context.
 RUN pnpm --filter @class-comfyui/database build
 RUN pnpm --filter @class-comfyui/gateway build
 RUN pnpm --filter @class-comfyui/web build
