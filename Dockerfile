@@ -8,21 +8,32 @@ FROM node:20-alpine AS base
 RUN apk add --no-cache libc6-compat openssl
 RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
 WORKDIR /app
+# Never prompt in non-interactive builds.
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 
 FROM base AS deps
-COPY pnpm-workspace.yaml package.json pnpm-lock.yaml* ./
+# NOTE: .npmrc must be copied here too. pnpm records install settings in
+# node_modules/.modules.yaml; if the builder stage later reinstalls with
+# different effective settings, pnpm deletes node_modules and reinstalls from
+# scratch (breaking the build when the store isn't carried over).
+COPY pnpm-workspace.yaml package.json pnpm-lock.yaml .npmrc ./
 COPY apps/web/package.json apps/web/package.json
 COPY apps/gateway/package.json apps/gateway/package.json
 COPY packages/config/package.json packages/config/package.json
 COPY packages/shared/package.json packages/shared/package.json
 COPY packages/auth/package.json packages/auth/package.json
 COPY packages/database/package.json packages/database/package.json
-RUN pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
+# Strict frozen install: the lockfile is committed, so any drift fails fast
+# instead of being masked by a fallback reinstall.
+RUN pnpm install --frozen-lockfile
 
 FROM base AS builder
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-RUN pnpm install --no-frozen-lockfile
+# No reinstall here: the manifests above are byte-identical to the build
+# context, so the node_modules from the deps stage is already correct.
+# (A redundant `pnpm install` risks pnpm wiping node_modules when it detects
+#  differing settings, leaving builds with missing dependencies.)
 RUN pnpm --filter @class-comfyui/database build
 RUN pnpm --filter @class-comfyui/gateway build
 RUN pnpm --filter @class-comfyui/web build
@@ -34,7 +45,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=builder /app/apps/web/.next/standalone ./
 COPY --from=builder /app/apps/web/.next/static ./apps/web/.next/static
-COPY --from=builder /app/apps/web/public ./apps/web/public 2>/dev/null || true
+COPY --from=builder /app/apps/web/public ./apps/web/public
 COPY --from=builder /app/apps/gateway/dist ./gateway/dist
 COPY --from=builder /app/apps/gateway/package.json ./gateway/package.json
 COPY --from=builder /app/packages/database/dist ./packages/database/dist
