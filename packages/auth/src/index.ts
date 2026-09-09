@@ -143,4 +143,4 @@ export function resetRateLimits() {
 }
 
 export { canonicalEmail };
-export * from "./roster.js";
+export * from "./roster";

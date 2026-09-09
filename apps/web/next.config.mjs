@@ -11,9 +11,6 @@ const nextConfig = {
   ],
   experimental: {
     serverActions: { bodySizeLimit: "5mb" },
-    // Resolve ESM-style `.js` relative imports to their `.ts` sources
-    // inside workspace packages (gateway `tsc` requires explicit `.js`).
-    extensionAlias: { ".js": [".ts", ".tsx"] },
   },
   async headers() {
     return [

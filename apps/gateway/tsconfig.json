@@ -1,16 +1,17 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "outDir": "dist",
-    "rootDir": "src",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
+    // Typecheck-only (tsc --noEmit); esbuild produces the runtime bundle,
+    // so no outDir/rootDir constraints are needed even though typechecking
+    // follows extensionless imports into workspace packages.
+    "noEmit": true,
+    // Bundler resolution: workspace imports are extensionless (`./roster`).
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
     "target": "ES2022",
     "strict": true,
     "skipLibCheck": true,
-    "esModuleInterop": true,
-    "noEmit": false,
-    "declaration": true
+    "esModuleInterop": true
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]
