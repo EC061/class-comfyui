@@ -53,3 +53,26 @@ describe("roster parser", () => {
     expect(preview.updatedCount).toBe(1);
   });
 });
+
+describe("campus domain canonicalization", () => {
+  it("rewrites uga.view.usg.edu to uga.edu and leaves other domains alone", () => {
+    const csv = `OrgDefinedId,Last Name,First Name,Email,End-of-Line Indicator\n#1,Cheng,Edward,NC96132@UGA.view.usg.edu,#\n#2,Doe,Jane,jane@view.usg.edu,#\n#3,Roe,Rick,rick@notuga.view.usg.edu,#`;
+    const { rows, errors } = parseRosterCsv(csv);
+    expect(errors).toEqual([]);
+    expect(rows[0].email).toBe("nc96132@uga.edu");
+    expect(rows[0].displayEmail).toBe("NC96132@UGA.view.usg.edu");
+    expect(rows[1].email).toBe("jane@view.usg.edu");
+    expect(rows[2].email).toBe("rick@notuga.view.usg.edu");
+  });
+
+  it("matches an existing enrollment stored under the plain domain", () => {
+    const csv = `OrgDefinedId,Last Name,First Name,Email,End-of-Line Indicator\n#1,Cheng,Edward,nc96132@uga.view.usg.edu,#`;
+    const { rows } = parseRosterCsv(csv);
+    const preview = reconcileRoster(rows, [
+      { rosterEmail: "nc96132@uga.edu", orgDefinedId: "1", firstName: "Edward", lastName: "Cheng" },
+    ]);
+    expect(preview.unchangedCount).toBe(1);
+    expect(preview.newCount).toBe(0);
+    expect(preview.missingCount).toBe(0);
+  });
+});

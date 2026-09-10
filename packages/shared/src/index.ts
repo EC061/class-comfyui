@@ -1,9 +1,20 @@
 import { z } from "zod";
 
-export const EmailSchema = z.string().trim().toLowerCase().pipe(z.string().email().max(320));
+export const EmailSchema = z.string().trim().toLowerCase().pipe(z.string().email().max(320)).transform(canonicalEmail);
+
+/**
+ * University-issued addresses appear on rosters under the campus subdomain
+ * (nc96132@uga.view.usg.edu) but resolve to the plain domain (nc96132@uga.edu).
+ * Only this exact domain is rewritten; every other domain is left alone.
+ */
+const DOMAIN_ALIASES: Record<string, string> = { "uga.view.usg.edu": "uga.edu" };
 
 export function canonicalEmail(email: string): string {
-  return email.trim().toLowerCase();
+  const trimmed = email.trim().toLowerCase();
+  const at = trimmed.lastIndexOf("@");
+  if (at === -1) return trimmed;
+  const alias = DOMAIN_ALIASES[trimmed.slice(at + 1)];
+  return alias ? `${trimmed.slice(0, at + 1)}${alias}` : trimmed;
 }
 
 export const ClassCreateSchema = z.object({

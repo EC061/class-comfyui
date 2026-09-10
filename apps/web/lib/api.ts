@@ -13,7 +13,7 @@ import {
   parseRosterCsv,
   reconcileRoster,
 } from "@class-comfyui/auth";
-import { EmailSchema, ClassCreateSchema, WorkerCreateSchema } from "@class-comfyui/shared";
+import { EmailSchema, ClassCreateSchema, WorkerCreateSchema, canonicalEmail } from "@class-comfyui/shared";
 import { currentUser } from "./auth-helpers";
 import { requireOrigin } from "./origin";
 import { checkRateLimit, clientIp } from "./rate-limit";
@@ -259,7 +259,7 @@ function rosterPreview(user: User, b: Record<string, any>) {
     rows,
     csvHash: hashToken(input.csv),
     missingIds: existing
-      .filter((e) => !rows.some((r) => r.email === e.rosterEmail || r.orgDefinedId === e.orgDefinedId))
+      .filter((e) => !rows.some((r) => r.email === canonicalEmail(e.rosterEmail) || r.orgDefinedId === e.orgDefinedId))
       .map((e) => e.id),
     summary,
   });
@@ -271,7 +271,7 @@ function rosterPreview(user: User, b: Record<string, any>) {
       ...summary,
       rows: preview.rows,
       missing: existing.filter(
-        (e) => !rows.some((r) => r.email === e.rosterEmail || r.orgDefinedId === e.orgDefinedId)
+        (e) => !rows.some((r) => r.email === canonicalEmail(e.rosterEmail) || r.orgDefinedId === e.orgDefinedId)
       ),
     },
   });

@@ -1,4 +1,5 @@
 import { parse } from "csv-parse/sync";
+import { canonicalEmail } from "@class-comfyui/shared";
 export type RosterRowState = "NEW" | "UNCHANGED" | "UPDATED" | "MISSING_FROM_NEW_ROSTER" | "INVALID" | "DUPLICATE";
 
 export interface ParsedRosterRow {
@@ -64,7 +65,7 @@ export function parseRosterCsv(csvText: string): { rows: ParsedRosterRow[]; erro
     const lastName = get("Last Name");
     const firstName = get("First Name");
     const emailRaw = get("Email");
-    const email = emailRaw.trim().toLowerCase();
+    const email = canonicalEmail(emailRaw);
     const rowErrors: string[] = [];
 
     let orgId = rawId.trim();
@@ -110,7 +111,7 @@ export interface ExistingEnrollmentLite {
 
 /** Reconcile parsed rows against existing enrollments. Pure function for preview + tests. */
 export function reconcileRoster(parsed: ParsedRosterRow[], existing: ExistingEnrollmentLite[]): RosterPreview {
-  const byEmail = new Map(existing.map((e) => [e.rosterEmail.toLowerCase(), e]));
+  const byEmail = new Map(existing.map((e) => [canonicalEmail(e.rosterEmail), e]));
   const byId = new Map(existing.map((e) => [e.orgDefinedId, e]));
   const seenEmail = new Set<string>();
   const seenId = new Set<string>();
@@ -155,7 +156,7 @@ export function reconcileRoster(parsed: ParsedRosterRow[], existing: ExistingEnr
         match.firstName === r.firstName &&
         match.lastName === r.lastName &&
         match.orgDefinedId === r.orgDefinedId &&
-        match.rosterEmail.toLowerCase() === r.email;
+        canonicalEmail(match.rosterEmail) === r.email;
       if (same) {
         unchangedCount++;
         rows.push({ ...r, state: "UNCHANGED" });
@@ -170,7 +171,7 @@ export function reconcileRoster(parsed: ParsedRosterRow[], existing: ExistingEnr
   const newIds = new Set(parsed.filter((r) => r.valid).map((r) => r.orgDefinedId));
   let missingCount = 0;
   for (const e of existing) {
-    if (!newEmails.has(e.rosterEmail.toLowerCase()) && !newIds.has(e.orgDefinedId)) {
+    if (!newEmails.has(canonicalEmail(e.rosterEmail)) && !newIds.has(e.orgDefinedId)) {
       missingCount++;
       rows.push({
         line: -1,
