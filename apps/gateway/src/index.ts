@@ -17,6 +17,7 @@ import { workerFetch } from "./storage";
 import { installUserData, saveUserData } from "./userdata";
 import { seedStarters } from "./starters";
 import { installTemplates } from "./templates";
+import { installJobs } from "./jobs";
 const cookieName = "comfy_gateway";
 function cookie(header: string | undefined) {
   return header
@@ -606,6 +607,7 @@ export function createApp() {
     res.json({});
   });
   installUserData(app);
+  installJobs(app);
   installTemplates(app, proxyWorkerFile);
   // Public frontend assets and read-only model catalogs only. Worker-global APIs,
   // custom extension APIs, filesystem routes, manager/install and arbitrary mutations
