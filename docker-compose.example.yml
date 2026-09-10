@@ -124,3 +124,17 @@ services:
     volumes:
       - ./data:/data
     security_opt: ["no-new-privileges:true"]
+
+# The default bridge subnet is pinned OUT of 172.16/12 on purpose. Docker assigns
+# its default pool in order (172.17.0.0/16, then 172.18.0.0/16, ...), so an
+# unpinned Compose network lands on 172.18. If this host also terminates a VPN
+# whose clients get 172.18.x addresses, the bridge route wins and replies to those
+# clients go into the bridge instead of back over the campus network: `ip route get
+# <vpn-client-ip>` resolves to `dev br-... src 172.18.0.1`. Keep this on a subnet
+# neither the host nor its VPN can hand out. Editing it recreates the network, so
+# apply it with `down` then `up -d`, never a plain `restart`.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.254.240.0/24
