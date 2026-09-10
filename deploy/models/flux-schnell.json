@@ -1,0 +1,10 @@
+[
+  {
+    "url": "https://huggingface.co/Comfy-Org/flux1-schnell/resolve/main/flux1-schnell-fp8.safetensors",
+    "dest": "checkpoints",
+    "file": "flux1-schnell-fp8.safetensors",
+    "bytes": 17236328572,
+    "sha256": "ead426278b49030e9da5df862994f25ce94ab2ee4df38b556ddddb3db093bf72",
+    "note": "Apache-2.0, ungated. All-in-one fp8 checkpoint (transformer + both text encoders + VAE), so it loads through CheckpointLoaderSimple and needs no DualCLIPLoader/VAELoader wiring. 4-step generation at cfg 1.0. If it does not appear under CheckpointLoaderSimple, fall back to the split path: flux1-schnell.safetensors into diffusion_models/, t5xxl_fp8_e4m3fn + clip_l into text_encoders/, ae into vae/."
+  }
+]

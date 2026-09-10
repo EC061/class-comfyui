@@ -260,6 +260,30 @@ the detected values; `--no-systemd` installs without creating services.
 It deliberately does **not** download models or change firewall rules, and it prints the
 commands for both.
 
+### Downloading models
+
+`scripts/fetch-models.sh` installs weights from a JSON manifest in `deploy/models/`,
+so the set of models students can load stays reviewable in git rather than living in
+one administrator's shell history:
+
+```bash
+scripts/fetch-models.sh --check minimax-h3     # verify every URL first, download nothing
+scripts/fetch-models.sh minimax-h3 flux-schnell
+```
+
+Each entry pins a URL, destination under `<comfy-dir>/models/`, byte size and SHA256.
+Downloads are resumable and skip files already present at the expected size; a size
+mismatch re-downloads, and a SHA256 mismatch fails loudly. Entries without a SHA256
+print the computed digest so it can be pinned back into the manifest.
+
+Set `HF_TOKEN` in the git-ignored `.env` to raise Hugging Face rate limits and reach
+gated repositories. Installing `aria2c` switches downloads to eight parallel
+connections, several times faster than curl on a fast link.
+
+Shipped manifests target **Ampere** (A6000, compute 8.6), which is why they select
+`int8_convrot` builds over `fp8_scaled` and `nvfp4_awq` — those formats are native to
+Ada and Blackwell respectively. Adjust the manifest for different hardware.
+
 ### Registering workers
 
 The manifest loads into the database without an admin browser session:
