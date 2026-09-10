@@ -116,24 +116,55 @@ function RosterTab({
     totalRows: number;
   } | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  const [previewing, setPreviewing] = useState(false);
 
-  async function doPreview() {
-    const r = await fetch("/api/roster/preview", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ classId, csv }),
-    });
-    const j = await r.json();
-    if (!r.ok) setMsg(j.error);
-    else {
-      setPreview(j.preview);
-      setImportId(j.importId);
-      setMissing(j.preview.missing || []);
-      setRowPreview(j.preview.rows || []);
+  // Preview automatically as the CSV changes; the last edit wins.
+  useEffect(() => {
+    if (!csv.trim()) {
+      setPreview(null);
+      setImportId(null);
+      setMissing([]);
+      setRowPreview([]);
       setArchiveIds([]);
-      setMsg(null);
+      setPreviewing(false);
+      return;
     }
-  }
+    let stale = false;
+    setPreviewing(true);
+    const timer = setTimeout(async () => {
+      try {
+        const r = await fetch("/api/roster/preview", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ classId, csv }),
+        });
+        const j = await r.json();
+        if (stale) return;
+        if (!r.ok) {
+          setMsg(j.error);
+          setPreview(null);
+          setImportId(null);
+          setMissing([]);
+          setRowPreview([]);
+        } else {
+          setPreview(j.preview);
+          setImportId(j.importId);
+          setMissing(j.preview.missing || []);
+          setRowPreview(j.preview.rows || []);
+          setArchiveIds([]);
+          setMsg(null);
+        }
+      } catch {
+        if (!stale) setMsg("Could not reach the server to preview this roster.");
+      } finally {
+        if (!stale) setPreviewing(false);
+      }
+    }, 400);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
+  }, [classId, csv]);
   async function doImport() {
     const r = await fetch("/api/roster/import", {
       method: "POST",
@@ -181,17 +212,19 @@ function RosterTab({
           }}
           placeholder="OrgDefinedId,Last Name,First Name,Email,End-of-Line Indicator"
         />
-        <div className="mt-2 flex gap-2">
-          <button className="btn-secondary" onClick={doPreview}>
-            Preview
-          </button>
+        <div className="mt-2 flex items-center gap-2">
           <button
             className="btn disabled:opacity-50"
-            disabled={!importId || !!preview?.invalidCount || !!preview?.duplicateCount}
+            disabled={previewing || !importId || !!preview?.invalidCount || !!preview?.duplicateCount}
             onClick={doImport}
           >
             Confirm import
           </button>
+          {previewing && (
+            <span role="status" className="text-xs text-slate-600">
+              Checking roster…
+            </span>
+          )}
         </div>
         {preview && (
           <p className="mt-2 text-sm">

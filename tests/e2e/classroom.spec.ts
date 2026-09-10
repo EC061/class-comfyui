@@ -48,7 +48,7 @@ test("administrator and two isolated students complete the production flow; data
       "OrgDefinedId,Last Name,First Name,Email,End-of-Line Indicator\n#100000001,Example,Alice,student1@example.edu,#\n#100000002,Example,Bob,student2@example.edu,#"
     ),
   });
-  await page.getByRole("button", { name: "Preview", exact: true }).click();
+  // Preview is automatic on CSV change; no button to click.
   await expect(page.getByText(/2 rows · New: 2/)).toBeVisible();
   await page.getByRole("button", { name: "Confirm import" }).click();
   await expect(page.getByText(/Roster imported successfully/)).toBeVisible();
