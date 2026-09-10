@@ -84,6 +84,10 @@ export interface Worker {
   lastAssignedAt: number;
   externalBusy: boolean;
   nodeDefinitions?: Record<string, any>;
+  // Reported by the worker's /system_stats during health polling. Surfaced to the
+  // workspace so its frontend can version-check nodes instead of guessing.
+  comfyVersion?: string;
+  pythonVersion?: string;
 }
 export type JobStatus = "QUEUED" | "DISPATCHING" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED" | "LOST";
 export interface Job {

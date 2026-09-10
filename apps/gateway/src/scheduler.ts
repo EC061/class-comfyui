@@ -85,7 +85,8 @@ export class Scheduler {
         .list("workers")
         .map(async (w) => {
           let state: Worker["healthStatus"] = "DISABLED",
-            externalBusy = false;
+            externalBusy = false,
+            versions: { comfy?: string; python?: string } = {};
           if (w.enabled)
             try {
               const [stats, queue] = await Promise.all([
@@ -93,6 +94,8 @@ export class Scheduler {
                 workerFetch(w, "/queue", {}, 3000),
               ]);
               if (!stats.ok || !queue.ok) throw new Error();
+              const sys = ((await stats.json()) as any)?.system;
+              versions = { comfy: sys?.comfyui_version, python: sys?.python_version };
               const q = (await queue.json()) as any;
               const managed = getDb().list("jobs", "worker_id=? AND status IN ('DISPATCHING','RUNNING')", [w.id]);
               const ids = new Set(managed.map((j) => j.comfyPromptId));
@@ -107,6 +110,10 @@ export class Scheduler {
             if (!current) return;
             current.healthStatus = current.enabled ? state : "DISABLED";
             current.externalBusy = externalBusy;
+            // Keep the last known versions when a poll fails, so a blip does not
+            // regress the workspace to "managed".
+            if (versions.comfy) current.comfyVersion = versions.comfy;
+            if (versions.python) current.pythonVersion = versions.python;
             current.lastHealthCheck = new Date().toISOString();
             getDb().put("workers", current);
           });

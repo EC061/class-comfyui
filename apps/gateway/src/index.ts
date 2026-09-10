@@ -483,9 +483,19 @@ export function createApp() {
       next(e);
     }
   });
-  app.get("/system_stats", (_req, res) =>
-    res.json({ system: { comfyui_version: "managed", python_version: "managed", embedded_python: false }, devices: [] })
-  );
+  // Real versions so the frontend can version-check nodes rather than warn blindly.
+  // `devices` stays empty on purpose: GPU inventory is not a student's business.
+  app.get("/system_stats", (_req, res) => {
+    const w = metadataWorker();
+    res.json({
+      system: {
+        comfyui_version: w?.comfyVersion ?? "managed",
+        python_version: w?.pythonVersion ?? "managed",
+        embedded_python: false,
+      },
+      devices: [],
+    });
+  });
   app.get("/users", (_req, res) => res.json({ storage: "server", migrated: true }));
   app.get("/settings", (_req, res) => {
     const s = res.locals.session as Session;
