@@ -30,5 +30,21 @@
     "bytes": 605254808,
     "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
     "note": "Audio VAE. Required: H3 generates synchronized stereo audio, decoded through VAEDecodeAudio."
+  },
+  {
+    "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+    "dest": "loras",
+    "file": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+    "bytes": 1956193000,
+    "sha256": "2339acdf19bfe123f46b971ea35d367a84adb85de43627e1eceafa5a5b2b111e",
+    "note": "Turbo distillation LoRA for the FL2VA base, 8 steps instead of ~20. Effectively required for classroom use: it is the difference between a clip finishing while a student watches and one that ties up a GPU for many minutes. The stock ComfyUI H3 template loads this by default."
+  },
+  {
+    "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+    "dest": "loras",
+    "file": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+    "bytes": 1956192992,
+    "sha256": "c396a9a06f58399e9df9754b18299818d84a2ddd371724ba48fe4a41221437dc",
+    "note": "4-step variant, 768p-tuned. Faster still and lower quality than the 8-step; useful for a quick iterate-then-finalize loop in class."
   }
 ]
