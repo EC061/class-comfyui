@@ -5,14 +5,16 @@ A self-hosted classroom management application and authenticated execution gatew
 ## Architecture and deployment boundary
 
 ```text
-Internet HTTPS -> external FRPS/TLS -> external FRPC -> 127.0.0.1:8080 nginx
-                                                        |             |
-                                                     Next.js       Gateway + scheduler
-                                                        |             |
-                                                        +-- SQLite ---+
-                                                            /data
-                                                               |
-                                                    private ComfyUI GPU workers
+Internet HTTPS
+  -> remote reverse proxy (TLS for both hostnames)
+     -> external FRPS -> external FRPC, two plain-TCP tunnels
+        -> 127.0.0.1:8080 nginx --- Next.js  (comfy-admin hostname)
+           127.0.0.1:8090 nginx --- Gateway + scheduler (comfy hostname)
+                                        |             |
+                                        +-- SQLite ---+
+                                            /data
+                                               |
+                                    private ComfyUI GPU workers
 ```
 
 This revision replaces the prototype's disconnected memory stores and unused PostgreSQL/Redis services with **one persistent SQLite database in WAL mode**. Web and gateway run on the **same management host** and mount the same directory. GPU workers can be on other hosts. No Kubernetes or database server is needed.
@@ -32,8 +34,7 @@ packages/database/src/    typed SQLite repository, migration, seed, backup
 packages/auth/src/        token cryptography and CSV parsing/reconciliation
 packages/config/src/      validated canonical URLs and limits
 packages/shared/src/      shared schemas and security helpers
-deploy/nginx/             HTTP host routing and WebSocket configuration
-deploy/frp/               external FRPC example (not managed by Compose)
+deploy/nginx/             per-port HTTP routing and WebSocket configuration
 tests/integration/        real APIs + SQLite + SMTP + mock worker tests
 tests/e2e/                Playwright against production application builds
 scripts/                  runtime entrypoint and disposable test services
@@ -43,14 +44,15 @@ scripts/                  runtime entrypoint and disposable test services
 
 | Service                      | Container/internal port                   | Published production port |
 | ---------------------------- | ----------------------------------------- | ------------------------- |
-| nginx                        | 80                                        | **127.0.0.1:8080**        |
+| nginx, management site       | 8080                                      | **127.0.0.1:8080**        |
+| nginx, gateway site          | 8090                                      | **127.0.0.1:8090**        |
 | Next.js                      | 3000                                      | none                      |
 | Gateway                      | 8081                                      | none                      |
 | SQLite                       | filesystem only                           | none                      |
 | ComfyUI worker               | typically 8188 on the private GPU network | never public              |
 | Mailpit, local override only | 1025 SMTP / 8025 UI                       | 127.0.0.1:8025            |
 
-FRPC must run on the management host, or otherwise have a deliberately configured private route to nginx. Firewall each GPU worker so only the gateway host and administrators can reach it.
+Your external FRPC opens **one plain-TCP tunnel per published port** — 8080 for the management hostname and 8090 for the gateway hostname — so routing is by port, not by `Host`. FRPC is not part of this stack and must not be run from it. FRPC must run on the management host, or otherwise have a deliberately configured private route to these two loopback ports. Firewall each GPU worker so only the gateway host and administrators can reach it.
 
 ## Production configuration
 
@@ -69,7 +71,8 @@ Before starting, edit:
 - `image`: your lowercase `ghcr.io/<owner>/<repository>:<tag>` (shared YAML anchor).
 - `PUBLIC_URL`: the exact management origin, e.g. `https://comfy-admin.example.edu`.
 - `COMFY_PUBLIC_URL`: a separate gateway origin, e.g. `https://comfy.example.edu`.
-- nginx `PUBLIC_HOST` and `COMFY_HOST`: matching hostnames, without scheme or port.
+- nginx `PUBLIC_HOST` and `COMFY_HOST`: the authority of each URL above — hostname, plus a port only when the URL uses a non-default one, and never a scheme or path. nginx rewrites the upstream `Host` header to these values, because a TCP tunnel carries whatever `Host` the remote reverse proxy chose to send.
+- nginx `PUBLIC_SCHEME` and `COMFY_SCHEME`: the scheme of each URL above, normally `https`.
 - `AUTH_SECRET`, `WORKSPACE_JWT_SECRET`, `ADMIN_REGISTRATION_CODE`: three independent random secrets, at least 32 characters each. Placeholder/development secrets prevent production startup.
 - All SMTP fields: host, port, user, password, secure, sender name and sender email.
 - The `./data:/data` bind mount if you want a different **local** storage directory. Keep the same mount in web, gateway and migrate.
@@ -92,12 +95,12 @@ chmod 700 data
 docker compose config --quiet
 docker compose pull
 docker compose up -d --wait
-curl --fail -H 'Host: comfy-admin.example.edu' http://127.0.0.1:8080/api/health
-curl --fail -H 'Host: comfy.example.edu' http://127.0.0.1:8080/health
+curl --fail http://127.0.0.1:8080/api/health
+curl --fail http://127.0.0.1:8090/health
 docker compose ps
 ```
 
-Replace the two curl Host values with your configured hostnames. Compose runs the migration before web/gateway and checks both application health endpoints. A database-open or schema error prevents healthy startup; there is no fallback database or automatic production seed.
+Each port serves exactly one site, so no `Host` header is needed to reach it. Compose runs the migration before web/gateway and checks both application health endpoints. A database-open or schema error prevents healthy startup; there is no fallback database or automatic production seed.
 
 Build locally instead of pulling:
 
@@ -117,7 +120,7 @@ A missing `Origin` is accepted only when **all** of these agree: exact canonical
 
 Cookies are host-only, HttpOnly, SameSite=Lax, and Secure when the corresponding configured URL uses HTTPS. Email GET links display a confirmation page; the challenge is consumed by a protected POST. Account, class, and enrollment eligibility are rechecked before signup verification and every gateway request. Disabling signup does not disable an existing student's normal login. Disabling a user or archiving their enrollment removes workspace access, including established WebSockets.
 
-nginx rejects unknown hosts, overwrites client-IP forwarding headers and does not log URL paths/query strings. Both applications strip/ignore forged identity headers. Do not expose the application ports directly. In a shared FRPC/NAT deployment, IP rate limits apply to that shared ingress address; email/account-specific limits apply separately.
+nginx serves one site per port, overwrites the `Host` and client-IP forwarding headers and does not log URL paths/query strings. Because each tunnel terminates at a single site, a wrong or missing `Host` cannot cross between the management and gateway applications; `Origin` equality, not `Host`, is what enforces CSRF. Both applications strip/ignore forged identity headers. Do not expose the application ports directly. In a shared FRPC/NAT deployment, IP rate limits apply to that shared ingress address; email/account-specific limits apply separately.
 
 ## First administrator and SMTP
 
@@ -222,9 +225,18 @@ Upgrade by backing up, selecting a pinned release tag in the Compose image ancho
 
 `docker.yml` uses Buildx to build native `linux/amd64` from the same Dockerfile and publishes `ghcr.io/<owner>/<repo>`. There is deliberately no arm64/QEMU leg: emulation made every publish take 12+ minutes for hardware this stack does not deploy to. Main/default-branch updates publish `latest` and `sha-…`; `v1.2.3` pushes publish `v1`, `v1.2`, and `v1.2.3`. PR builds do not push. Automatic metadata `latest` on release tags is disabled. Enable Actions package-write permissions and grant deployment hosts GHCR read access for private images. This repository does not claim an image is published until the workflow succeeds.
 
-## FRP
+## FRP and TLS
 
-`deploy/frp/frpc.example.toml` is an external-routing example. Configure FRPS-side HTTPS/TLS termination for both canonical hostnames and route the resulting HTTP traffic through FRPC to `127.0.0.1:8080`, preserving the hostname. The example HTTP proxy stanza alone does not configure HTTPS certificates/termination. Keep FRP tokens and server addresses in your private FRP configuration. This Compose stack neither starts FRP nor serves TLS.
+FRPC and FRPS are **external to this repository**. No FRP client, configuration or example ships here and Compose never starts one. This stack serves plain HTTP on two loopback ports and never terminates TLS.
+
+Configure two plain-TCP proxies in your own FRPC configuration, one per port, and terminate TLS for both hostnames on the reverse proxy in front of FRPS:
+
+```text
+comfy-admin.example.edu  --TLS-->  remote reverse proxy  -->  frps remote port A  ==tcp==>  127.0.0.1:8080
+comfy.example.edu        --TLS-->  remote reverse proxy  -->  frps remote port B  ==tcp==>  127.0.0.1:8090
+```
+
+Do not merge the two hostnames onto one tunnel: the tunnels are what separate the two applications. Have the remote reverse proxy forward WebSocket upgrades (`Upgrade`/`Connection`) and allow long-lived connections on the gateway hostname; workspaces stream over WebSockets for the lifetime of a job. Allow at least `MAX_UPLOAD_MB` request bodies on the gateway hostname. Keep FRP tokens and server addresses in your private FRP configuration.
 
 ## Local development and verification
 
@@ -252,7 +264,7 @@ mkdir -p data
 docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build --wait
 ```
 
-Open `http://localhost:8080` and Mailpit at `http://localhost:8025`. The gateway is `http://comfy.localhost:8080`; if your browser does not resolve it, map `comfy.localhost` to `127.0.0.1`. The local-only admin code is in `docker-compose.local.yml`. This override must never be used for public deployment. Register a real private worker in the UI, or run `PORT=8188 pnpm exec tsx scripts/mock-comfy.ts` and use an address reachable from the gateway container. No development seed runs automatically; `NODE_ENV=development SQLITE_PATH=/absolute/local/path/lab.sqlite pnpm db:seed` explicitly creates fabricated demo records in an empty database.
+Open `http://localhost:8080` and Mailpit at `http://localhost:8025`. The gateway is `http://comfy.localhost:8090`; if your browser does not resolve it, map `comfy.localhost` to `127.0.0.1`. The two sites keep separate hostnames locally so host-only cookies stay isolated exactly as they are in production. The local-only admin code is in `docker-compose.local.yml`. This override must never be used for public deployment. Register a real private worker in the UI, or run `PORT=8188 pnpm exec tsx scripts/mock-comfy.ts` and use an address reachable from the gateway container. No development seed runs automatically; `NODE_ENV=development SQLITE_PATH=/absolute/local/path/lab.sqlite pnpm db:seed` explicitly creates fabricated demo records in an empty database.
 
 ## Final real-server verification
 
@@ -271,15 +283,16 @@ On the management host:
 curl --fail http://10.0.0.21:8188/system_stats
 curl --fail http://10.0.0.21:8188/queue
 docker compose up -d --wait
-curl --fail -H 'Host: comfy-admin.example.edu' http://127.0.0.1:8080/api/health
-curl --fail -H 'Host: comfy.example.edu' http://127.0.0.1:8080/health
+curl --fail http://127.0.0.1:8080/api/health
+curl --fail http://127.0.0.1:8090/health
 ```
 
-Replace the example worker IP/hostnames. Register A6000/4090 workers, import a fabricated test class, and use two separate browser profiles. Upload different images with the same original filename, save workflows with the same name, and queue one reviewed SDXL/Flux workflow from each profile. Confirm both jobs finish, each history shows only its owner, downloads/checksums appear in admin auditing, and direct worker ports are unreachable from a student network. Restart web/gateway and confirm sessions, classes and completed jobs remain. Install actual course models before this test; the mock does not validate model availability, VRAM capacity or third-party node compatibility.
+Replace the example worker IP. Then repeat both checks through the public hostnames to confirm the tunnels and remote TLS are correct. Register A6000/4090 workers, import a fabricated test class, and use two separate browser profiles. Upload different images with the same original filename, save workflows with the same name, and queue one reviewed SDXL/Flux workflow from each profile. Confirm both jobs finish, each history shows only its owner, downloads/checksums appear in admin auditing, and direct worker ports are unreachable from a student network. Restart web/gateway and confirm sessions, classes and completed jobs remain. Install actual course models before this test; the mock does not validate model availability, VRAM capacity or third-party node compatibility.
 
 ## Troubleshooting and operational limits
 
-- **403 origin:** check both canonical URLs, nginx hostnames, scheme/port, and client Origin. Do not disable origin enforcement.
+- **403 origin:** check both canonical URLs, `PUBLIC_HOST`/`COMFY_HOST`, scheme/port, and client Origin. Do not disable origin enforcement.
+- **Wrong site answers a hostname:** a tunnel points at the wrong loopback port. Port 8080 is the management site, 8090 the gateway.
 - **Startup secret error:** replace all three placeholders with independent secrets of at least 32 characters.
 - **SQLite permission/busy errors:** confirm identical local bind mounts and UID 1000 access; ensure no external process holds a long write transaction. Do not delete an active WAL file.
 - **SMTP 502:** verify credentials/TLS/provider connectivity in Settings. Errors do not fall back to logging tokens.

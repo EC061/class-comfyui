@@ -17,7 +17,7 @@ const positive = (n: number) => z.coerce.number().int().positive().default(n);
 const EnvSchema = z.object({
   NODE_ENV: z.enum(["production", "development", "test"]).default("development"),
   PUBLIC_URL: canonical.default("http://localhost:8080"),
-  COMFY_PUBLIC_URL: canonical.default("http://comfy.localhost:8080"),
+  COMFY_PUBLIC_URL: canonical.default("http://comfy.localhost:8090"),
   SQLITE_PATH: z.string().default("./data/lab.sqlite"),
   PORT: positive(3000),
   GATEWAY_PORT: positive(8081),

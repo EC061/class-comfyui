@@ -28,8 +28,8 @@ jobs:
           mkdir -p data
           sudo chown 1000:1000 data
           docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --wait
-          curl --fail http://localhost:8080/api/health
-          curl --fail -H 'Host: comfy.localhost' http://127.0.0.1:8080/health
+          curl --fail http://127.0.0.1:8080/api/health
+          curl --fail http://127.0.0.1:8090/health
           docker compose -f docker-compose.yml -f docker-compose.local.yml down
       - uses: actions/upload-artifact@v4
         if: failure()

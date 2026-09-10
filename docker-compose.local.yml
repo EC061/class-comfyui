@@ -5,7 +5,7 @@
 x-local: &local
   NODE_ENV: "development"
   PUBLIC_URL: "http://localhost:8080"
-  COMFY_PUBLIC_URL: "http://comfy.localhost:8080"
+  COMFY_PUBLIC_URL: "http://comfy.localhost:8090"
   AUTH_SECRET: "local-development-auth-secret-32-characters"
   WORKSPACE_JWT_SECRET: "local-development-workspace-secret-32-characters"
   ADMIN_REGISTRATION_CODE: "local-development-admin-code-32-characters"
@@ -15,8 +15,11 @@ x-local: &local
 services:
   nginx:
     environment:
-      PUBLIC_HOST: "localhost"
-      COMFY_HOST: "comfy.localhost"
+      # Authority including the non-default local port, matching the URLs above.
+      PUBLIC_HOST: "localhost:8080"
+      COMFY_HOST: "comfy.localhost:8090"
+      PUBLIC_SCHEME: "http"
+      COMFY_SCHEME: "http"
   web:
     image: class-comfyui:local
     build: .

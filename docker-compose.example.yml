@@ -10,13 +10,23 @@ services:
   nginx:
     image: nginx:stable-alpine
     restart: unless-stopped
+    # One loopback listener per public hostname. An EXTERNAL frpc (never started
+    # by this stack) opens one plain-TCP tunnel per port to your external frps;
+    # the reverse proxy in front of frps terminates TLS for both hostnames.
+    #   127.0.0.1:8080 -> tcp -> PUBLIC_URL host   (management/admin)
+    #   127.0.0.1:8090 -> tcp -> COMFY_PUBLIC_URL host (gateway/workspace)
     ports:
-      - "127.0.0.1:8080:80"
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8090:8090"
     environment:
-      # MUST CHANGE these to the hostname portions of the two canonical URLs.
+      # MUST CHANGE to the authority of each canonical URL: hostname, plus a port
+      # only when the URL carries a non-default one. No scheme, no path.
       PUBLIC_HOST: "comfy-admin.example.edu"
       COMFY_HOST: "comfy.example.edu"
-      NGINX_ENVSUBST_FILTER: "PUBLIC_HOST|COMFY_HOST"
+      # Scheme the browser actually uses, i.e. the scheme of the URLs above.
+      PUBLIC_SCHEME: "https"
+      COMFY_SCHEME: "https"
+      NGINX_ENVSUBST_FILTER: "PUBLIC_HOST|COMFY_HOST|PUBLIC_SCHEME|COMFY_SCHEME"
     volumes:
       - ./deploy/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
     depends_on:
@@ -25,7 +35,11 @@ services:
       gateway:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", 'wget -q -O /dev/null --header="Host: $$PUBLIC_HOST" http://127.0.0.1/api/health']
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O /dev/null http://127.0.0.1:8080/api/health && wget -q -O /dev/null http://127.0.0.1:8090/health",
+        ]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -38,7 +52,8 @@ services:
     init: true
     environment: &app-environment
       NODE_ENV: "production"
-      # MUST CHANGE: exact, separate browser origins. HTTP is supported for local testing.
+      # MUST CHANGE: exact, separate browser origins, each served by its own TCP
+      # tunnel and given TLS by the remote reverse proxy. HTTP is for local testing.
       PUBLIC_URL: "https://comfy-admin.example.edu"
       COMFY_PUBLIC_URL: "https://comfy.example.edu"
       HOSTNAME: "0.0.0.0"
