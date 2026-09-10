@@ -7,10 +7,6 @@ on:
     tags: ["v*.*.*"]
   pull_request:
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-
 jobs:
   build-push:
     runs-on: ubuntu-latest
@@ -19,38 +15,45 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v5
-      # NOTE: docker/* are on their latest majors but still run on the deprecated
-      # node20 runtime upstream. Their warnings are harmless; only bump on new majors.
-      # Single-arch amd64 build by design: no QEMU step, no emulation.
-      - uses: docker/setup-buildx-action@v3
+      # No docker/* actions on purpose: their latest majors still run on the
+      # deprecated node20 runtime. Raw CLI keeps this workflow warning-free.
+      # Native amd64 only, no QEMU: emulation made every publish take 12+ min.
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          flavor: latest=false
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-
-            type=semver,pattern=v{{version}}
-            type=semver,pattern=v{{major}}.{{minor}}
-            type=semver,pattern=v{{major}}
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Compute tags
+        id: tags
+        # Mirrors the old metadata-action rules: `latest` on main only,
+        # always `sha-<short>`, plus v/vMajor/vMajor.Minor on version tags.
+        # GHCR names must be lowercase; github.repository preserves case.
+        run: |
+          REPO_LC="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          TAGS="ghcr.io/${REPO_LC}:sha-$(git rev-parse --short HEAD)"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            V="${GITHUB_REF_NAME#v}"
+            TAGS="${TAGS},ghcr.io/${REPO_LC}:v${V},ghcr.io/${REPO_LC}:v${V%.*},ghcr.io/${REPO_LC}:v${V%%.*}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TAGS="ghcr.io/${REPO_LC}:latest,${TAGS}"
+          fi
+          echo "tags=${TAGS}" >> "${GITHUB_OUTPUT}"
       - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          # Native amd64 only. No arm64/QEMU leg: emulation made every
-          # publish take 12+ minutes for hardware we don't deploy to.
-          platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        run: |
+          docker buildx create --use --driver docker-container
+          IFS=',' read -ra TAG_ARR <<< "${{ steps.tags.outputs.tags }}"
+          TAG_FLAGS=()
+          for t in "${TAG_ARR[@]}"; do TAG_FLAGS+=(--tag "$t"); done
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            PUSH_FLAGS=(--push --provenance mode=max --sbom=true)
+          else
+            PUSH_FLAGS=()
+          fi
+          docker buildx build \
+            --platform linux/amd64 \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            "${TAG_FLAGS[@]}" \
+            "${PUSH_FLAGS[@]}" \
+            .
