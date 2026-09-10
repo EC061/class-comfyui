@@ -141,4 +141,5 @@ export function hashSessionToken(token: string, secret: string) {
 }
 
 export { canonicalEmail };
+export * from "./password";
 export * from "./roster";

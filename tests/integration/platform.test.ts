@@ -1,7 +1,7 @@
 import { beforeAll, afterAll, beforeEach, afterEach, describe, it, expect } from "vitest";
 import { SMTPServer } from "smtp-server";
 import { simpleParser } from "mailparser";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createServer } from "node:http";
@@ -37,18 +37,26 @@ async function api(
   );
 }
 const authCookie = (r: Response) => r.headers.get("set-cookie")!.split(";")[0];
-async function verified(email: string, isAdmin = false) {
-  const r = await api("/auth/request-code", { email, isAdmin, adminCode: process.env.ADMIN_REGISTRATION_CODE });
-  expect(r.status).toBe(200);
-  return consume(email);
+const PASSWORD = "correct-horse-battery-staple";
+function mailLink(email: string) {
+  const text = emails.filter((m) => m.to === email.toLowerCase()).at(-1)!.text;
+  return new URL(text.match(/https?:\/\/\S+/)![0]);
 }
+/** Opens the one activation link an account ever receives. */
 async function consume(email: string) {
-  const text = emails.filter((m) => m.to === email.toLowerCase()).at(-1)!.text,
-    url = new URL(text.match(/https?:\/\/\S+/)![0]);
-  return api("/auth/verify", { email, token: url.searchParams.get("token") });
+  return api("/auth/verify", { email, token: mailLink(email).searchParams.get("token") });
 }
-async function admin() {
-  const res = await verified("admin@example.edu", true);
+async function login(email: string, password = PASSWORD) {
+  return api("/auth/login", { email, password });
+}
+async function admin(email = "admin@example.edu") {
+  const r = await api("/auth/register", {
+    email,
+    password: PASSWORD,
+    adminCode: process.env.ADMIN_REGISTRATION_CODE,
+  });
+  expect(r.status).toBe(200);
+  const res = await consume(email);
   expect(res.status).toBe(200);
   return authCookie(res);
 }
@@ -79,9 +87,11 @@ async function signup(cookie: string, c: any) {
   expect(r.status).toBe(201);
   return (await r.json()).url as string;
 }
+async function register(c: any, url: string, email = "student1@example.edu", password = PASSWORD) {
+  return api("/auth/register", { classSlug: c.slug, signupToken: url.split("/").at(-1), email, password });
+}
 async function student(c: any, url: string, email = "student1@example.edu") {
-  const r = await api("/signup/request", { classSlug: c.slug, signupToken: url.split("/").at(-1), email });
-  expect(r.status).toBe(200);
+  expect((await register(c, url, email)).status).toBe(200);
   const v = await consume(email);
   expect(v.status).toBe(200);
   return authCookie(v);
@@ -181,8 +191,12 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
       "https://sub.comfy-admin.example.edu",
       null,
     ])
-      expect((await api("/auth/request-code", { email: "a@example.edu" }, "", "POST", invalid)).status).toBe(403);
-    expect((await api("/auth/request-code", { email: "a@example.edu" })).status).toBe(403);
+      expect(
+        (await api("/auth/login", { email: "a@example.edu", password: PASSWORD }, "", "POST", invalid)).status
+      ).toBe(403);
+    expect((await api("/auth/login", { email: "a@example.edu", password: PASSWORD })).status).toBe(401);
+    // Neither a class signup link nor the administrator code: no account is possible.
+    expect((await api("/auth/register", { email: "a@example.edu", password: PASSWORD })).status).toBe(403);
     const c = await admin();
     expect(
       (await api("/admin/classes", { name: "Allowed", slug: "allowed", courseCode: "A", term: "T" }, c)).status
@@ -199,55 +213,68 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     second.close();
     closeDb();
     expect((await api("/admin/classes", undefined, a)).status).toBe(200);
-    expect((await verified("admin@example.edu")).status).toBe(200);
+    expect((await login("admin@example.edu")).status).toBe(200);
+    expect((await login("admin@example.edu", "wrong-password-entirely")).status).toBe(401);
   });
   it("requires roster and email ownership, binds class, revokes old links and pending challenges", async () => {
     const a = await admin(),
       c = await createClass(a);
     await roster(a, c.id);
-    const url = await signup(a, c),
-      token = url.split("/").at(-1);
+    const url = await signup(a, c);
     const before = emails.length;
-    expect(
-      (await api("/signup/request", { classSlug: c.slug, signupToken: token, email: "attacker@example.com" })).status
-    ).toBe(403);
+    expect((await register(c, url, "attacker@example.com")).status).toBe(403);
     expect(emails.length).toBe(before);
-    expect(getDb().userByEmail("student1@example.edu")).toBeUndefined();
+    expect(getDb().userByEmail("attacker@example.com")).toBeUndefined();
     const wrong = await createClass(a, "class-b"),
       wrongUrl = await signup(a, wrong);
-    expect(
-      (
-        await api("/signup/request", {
-          classSlug: wrong.slug,
-          signupToken: wrongUrl.split("/").at(-1),
-          email: "student1@example.edu",
-        })
-      ).status
-    ).toBe(403);
-    expect(
-      (await api("/signup/request", { classSlug: c.slug, signupToken: token, email: "student1@example.edu" })).status
-    ).toBe(200);
+    expect((await register(wrong, wrongUrl, "student1@example.edu")).status).toBe(403);
+    expect((await register(c, url, "student1@example.edu")).status).toBe(200);
+    // A password alone activates nothing: the account cannot sign in until its
+    // address is confirmed, and its enrollment stays unclaimed.
+    expect(getDb().userByEmail("student1@example.edu")?.status).toBe("PENDING");
+    expect(getDb().list("enrollments", "email=?", ["student1@example.edu"])[0].userId).toBeNull();
+    expect((await login("student1@example.edu")).status).toBe(403);
+    // An administrator may block an unconfirmed account but cannot confirm it for its owner.
+    const pendingId = getDb().userByEmail("student1@example.edu")!.id;
+    expect((await api("/admin/users?id=" + pendingId, { status: "ACTIVE" }, a, "PATCH")).status).toBe(409);
+    expect((await api("/admin/users?id=" + pendingId, { status: "DISABLED" }, a, "PATCH")).status).toBe(200);
+    // Unblocking returns it to PENDING, so this is not a two-step way around activation.
+    expect((await api("/admin/users?id=" + pendingId, { status: "ACTIVE" }, a, "PATCH")).status).toBe(200);
+    expect(getDb().get("users", pendingId)?.status).toBe("PENDING");
+    expect((await login("student1@example.edu")).status).toBe(403);
     await signup(a, c);
     expect((await consume("student1@example.edu")).status).toBe(403);
-    expect(getDb().userByEmail("student1@example.edu")).toBeUndefined();
-    expect(
-      (await api("/signup/request", { classSlug: c.slug, signupToken: token, email: "student2@example.edu" })).status
-    ).toBe(403);
+    expect(getDb().userByEmail("student1@example.edu")?.status).toBe("PENDING");
+    expect(getDb().list("enrollments", "email=?", ["student1@example.edu"])[0].userId).toBeNull();
+    expect((await register(c, url, "student2@example.edu")).status).toBe(403);
+    // Re-registering over an unconfirmed account replaces its password, so the
+    // rightful owner of an address can always take it back.
+    const fresh = await signup(a, c);
+    expect((await register(c, fresh, "student1@example.edu", "a-different-long-password")).status).toBe(200);
+    expect((await consume("student1@example.edu")).status).toBe(200);
+    expect((await login("student1@example.edu", "a-different-long-password")).status).toBe(200);
+    expect((await login("student1@example.edu")).status).toBe(401);
   });
   it("registration is single use, preserves global account, and disabled signup does not disable login", async () => {
     const a = await admin(),
       c = await createClass(a);
     await roster(a, c.id);
     const url = await signup(a, c);
-    await student(c, url, "Student1@Example.EDU");
+    const alice = await student(c, url, "Student1@Example.EDU");
     expect((await consume("student1@example.edu")).status).toBe(400);
     const u = getDb().userByEmail("student1@example.edu")!;
     await api(`/admin/classes/${c.id}/signup`, { enabled: false }, a, "PATCH");
-    expect((await verified("student1@example.edu")).status).toBe(200);
+    expect((await login("student1@example.edu")).status).toBe(200);
     const c2 = await createClass(a, "class-b");
     await roster(a, c2.id);
     const url2 = await signup(a, c2);
-    await student(c2, url2);
+    // Registering again over a confirmed account is refused; the second class is
+    // joined from the signed-in session and sends no further confirmation email.
+    expect((await register(c2, url2, "student1@example.edu")).status).toBe(409);
+    const before = emails.length;
+    const join = await api("/enroll", { classSlug: c2.slug, signupToken: url2.split("/").at(-1) }, alice);
+    expect(join.status).toBe(200);
+    expect(emails.length).toBe(before);
     expect(getDb().userByEmail(u.email)?.id).toBe(u.id);
     expect(getDb().list("enrollments", "user_id=?", [u.id])).toHaveLength(2);
   });
@@ -255,18 +282,27 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     const a = await admin();
     const adminUser = getDb().userByEmail("admin@example.edu")!;
     expect((await api("/admin/users?id=" + adminUser.id, { status: "DISABLED" }, a, "PATCH")).status).toBe(409);
-    expect((await api("/auth/request-code", { email: "admin@example.edu" })).status).toBe(200);
+    expect((await api("/auth/password-reset", { email: "admin@example.edu" })).status).toBe(200);
     for (const t of getDb().list("verifications")) {
       t.expiresAt = 0;
       getDb().put("verifications", t);
     }
-    expect((await consume("admin@example.edu")).status).toBe(400);
+    expect(
+      (
+        await api("/auth/password-reset/confirm", {
+          email: "admin@example.edu",
+          token: mailLink("admin@example.edu").searchParams.get("token"),
+          password: "yet-another-long-password",
+        })
+      ).status
+    ).toBe(400);
+    expect((await login("admin@example.edu")).status).toBe(200);
     const c = await createClass(a);
     await roster(a, c.id);
     await student(c, await signup(a, c));
     const u = getDb().userByEmail("student1@example.edu")!;
     await api("/admin/users?id=" + u.id, { status: "DISABLED" }, a, "PATCH");
-    expect((await api("/auth/request-code", { email: u.email })).status).toBe(403);
+    expect((await login(u.email)).status).toBe(403);
   });
   it("previews, reconciles, and rolls back conflicting roster import", async () => {
     const a = await admin(),
@@ -298,7 +334,7 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     ).toBe(400);
     const old = process.env.SMTP_PORT;
     process.env.SMTP_PORT = "1";
-    expect((await api("/auth/request-code", { email: "admin@example.edu" })).status).toBe(502);
+    expect((await api("/auth/password-reset", { email: "admin@example.edu" })).status).toBe(502);
     process.env.SMTP_PORT = old;
     expect(
       getDb()
@@ -468,6 +504,7 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
           email: `load${i}@example.edu`,
           firstName: "Load",
           lastName: String(i),
+          passwordHash: "",
           emailVerifiedAt: new Date().toISOString(),
           status: "ACTIVE",
           globalRole: "STUDENT",
@@ -682,6 +719,221 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
       20000
     );
     expect(mock.submissions).toHaveLength(1);
+  });
+  it("signs in with a password, and a reset link sets a new one and ends existing sessions", async () => {
+    const a = await admin();
+    // A confirmed account cannot be re-registered, with the code or otherwise.
+    expect(
+      (
+        await api("/auth/register", {
+          email: "admin@example.edu",
+          password: PASSWORD,
+          adminCode: process.env.ADMIN_REGISTRATION_CODE,
+        })
+      ).status
+    ).toBe(409);
+    const c = await createClass(a);
+    await roster(a, c.id);
+    const url = await signup(a, c);
+    expect((await register(c, url, "student1@example.edu", "short")).status).toBe(400);
+    const s = await student(c, url);
+    expect((await (await api("/auth/session", undefined, s)).json()).user.email).toBe("student1@example.edu");
+    expect((await api("/auth/password-reset", { email: "student1@example.edu" })).status).toBe(200);
+    const token = mailLink("student1@example.edu").searchParams.get("token");
+    expect(
+      (
+        await api("/auth/password-reset/confirm", {
+          email: "student1@example.edu",
+          token,
+          password: "brand-new-long-password",
+        })
+      ).status
+    ).toBe(200);
+    expect((await (await api("/auth/session", undefined, s)).json()).user).toBeNull();
+    expect((await login("student1@example.edu")).status).toBe(401);
+    expect((await login("student1@example.edu", "brand-new-long-password")).status).toBe(200);
+    expect(
+      (
+        await api("/auth/password-reset/confirm", {
+          email: "student1@example.edu",
+          token,
+          password: "a-third-long-password",
+        })
+      ).status
+    ).toBe(400);
+    // An account carried over from the passwordless schema has no usable hash: it
+    // cannot sign in, and the same emailed link is how it gets its first password.
+    const u = getDb().userByEmail("student1@example.edu")!;
+    u.passwordHash = "";
+    getDb().put("users", u);
+    expect((await login("student1@example.edu", "brand-new-long-password")).status).toBe(401);
+    expect((await api("/auth/password-reset", { email: "student1@example.edu" })).status).toBe(200);
+    expect(
+      (
+        await api("/auth/password-reset/confirm", {
+          email: "student1@example.edu",
+          token: mailLink("student1@example.edu").searchParams.get("token"),
+          password: "post-migration-password",
+        })
+      ).status
+    ).toBe(200);
+    expect((await login("student1@example.edu", "post-migration-password")).status).toBe(200);
+    // Unknown addresses get the same answer as known ones, and send no mail.
+    const before = emails.length;
+    expect((await api("/auth/password-reset", { email: "nobody@example.edu" })).status).toBe(200);
+    expect(emails.length).toBe(before);
+  });
+  it("restricts administrative routes by role and promotes an existing account with the code", async () => {
+    const a = await admin(),
+      c = await createClass(a);
+    await roster(a, c.id);
+    const s = await student(c, await signup(a, c));
+    for (const route of ["/admin/classes", "/admin/users", "/admin/metrics", "/workers", `/admin/classes/${c.id}`])
+      expect((await api(route, undefined, s)).status).toBe(403);
+    expect(
+      (await api("/admin/classes", { name: "Sneaky", slug: "sneaky", courseCode: "X", term: "Y" }, s)).status
+    ).toBe(403);
+    expect((await api("/roster/preview", { classId: c.id, csv: "x" }, s)).status).toBe(403);
+    expect((await api("/admin/classes", undefined)).status).toBe(401);
+    // A student keeps their own views.
+    expect((await api("/jobs", undefined, s)).status).toBe(200);
+    expect((await api("/auth/session", undefined, s)).status).toBe(200);
+    expect((await api("/auth/admin-code", { adminCode: "not-the-code" }, s)).status).toBe(403);
+    expect((await api("/auth/admin-code", { adminCode: process.env.ADMIN_REGISTRATION_CODE }, s)).status).toBe(200);
+    expect(getDb().userByEmail("student1@example.edu")?.globalRole).toBe("ADMIN");
+    expect((await api("/admin/metrics", undefined, s)).status).toBe(200);
+  });
+  it("refuses to delete a class while its jobs are queued or running", async () => {
+    const a = await admin(),
+      c = await createClass(a);
+    await roster(a, c.id);
+    const s = await student(c, await signup(a, c));
+    await api("/workers", { name: "GPU", baseUrl: mock.url }, a);
+    const w = getDb().list("workers")[0];
+    w.healthStatus = "ONLINE";
+    getDb().put("workers", w);
+    const g = await workspace(s, c.id);
+    expect((await gw("/prompt", prompt, g)).status).toBe(200);
+    const r = await api(`/admin/classes/${c.id}`, { confirm: c.slug }, a, "DELETE");
+    expect(r.status).toBe(409);
+    expect((await r.json()).code).toBe("ACTIVE_JOBS");
+    expect(getDb().list("classes")).toHaveLength(1);
+  });
+  it("permanently deletes a class with every record and file it owns", async () => {
+    const a = await admin(),
+      c = await createClass(a);
+    await roster(a, c.id);
+    const s = await student(c, await signup(a, c));
+    await api("/workers", { name: "GPU", baseUrl: mock.url }, a);
+    const w = getDb().list("workers")[0];
+    w.healthStatus = "ONLINE";
+    getDb().put("workers", w);
+    const g = await workspace(s, c.id);
+    // Produce one of everything the class owns on disk: a staged input, a saved
+    // workflow, and an archived output.
+    const form = new FormData();
+    form.set("image", new Blob([Buffer.from("fake-png-bytes")], { type: "image/png" }), "input.png");
+    expect(
+      (
+        await fetch(gatewayUrl + "/upload/image", {
+          method: "POST",
+          headers: { Origin: process.env.COMFY_PUBLIC_URL!, Cookie: g },
+          body: form,
+        })
+      ).status
+    ).toBe(200);
+    await gw("/userdata/workflows/keep.json", { nodes: [] }, g);
+    const submitted = await gw("/prompt", prompt, g),
+      id = (await submitted.json()).prompt_id;
+    scheduler = new Scheduler();
+    scheduler.start();
+    await waitFor(
+      () => getDb().get("jobs", id)?.archiveStatus,
+      (v) => v === "COMPLETE"
+    );
+    await scheduler.stop();
+    scheduler = undefined;
+
+    const output = getDb().list("outputs")[0],
+      upload = getDb().list("uploads")[0],
+      classDir = path.join(process.env.AUDIT_DATA_DIR!, c.slug);
+    expect(existsSync(output.storagePath)).toBe(true);
+    expect(existsSync(upload.storagePath)).toBe(true);
+    expect(getDb().list("user_data", "class_id=?", [c.id]).length).toBeGreaterThan(0);
+    expect(getDb().list("audits", "class_id=?", [c.id]).length).toBeGreaterThan(0);
+
+    // The slug is the confirmation, and a student may not delete anything.
+    expect((await api(`/admin/classes/${c.id}`, { confirm: "not-the-slug" }, a, "DELETE")).status).toBe(400);
+    expect((await api(`/admin/classes/${c.id}`, { confirm: c.slug }, s, "DELETE")).status).toBe(403);
+    expect(getDb().list("classes")).toHaveLength(1);
+
+    const deleted = await api(`/admin/classes/${c.id}`, { confirm: c.slug }, a, "DELETE");
+    expect(deleted.status).toBe(200);
+    expect((await deleted.json()).failures).toEqual([]);
+
+    for (const table of [
+      "classes",
+      "enrollments",
+      "jobs",
+      "outputs",
+      "uploads",
+      "user_data",
+      "signup_tokens",
+      "roster_imports",
+      "roster_import_rows",
+      "invitations",
+      "workspace_tickets",
+      "gateway_sessions",
+    ] as const)
+      expect(getDb().list(table), table).toHaveLength(0);
+    expect(getDb().list("audits", "class_id=?", [c.id])).toHaveLength(0);
+    // The administrator's own action is what survives, not the class's history.
+    const record = getDb()
+      .list("audits")
+      .find((e) => e.type === "CLASS_DELETED")!;
+    expect(record.classId).toBeNull();
+    expect(record.metadata.slug).toBe(c.slug);
+    expect(existsSync(output.storagePath)).toBe(false);
+    expect(existsSync(upload.storagePath)).toBe(false);
+    expect(existsSync(classDir)).toBe(false);
+    expect(existsSync(path.dirname(upload.storagePath))).toBe(false);
+    // The student's account and their sign-in survive; only the class is gone.
+    expect((await login("student1@example.edu")).status).toBe(200);
+    expect((await (await api("/jobs", undefined, a)).json()).jobs).toHaveLength(0);
+    expect((await api(`/admin/classes/${c.id}`, undefined, a)).status).toBe(404);
+    expect((await api(`/admin/classes/${c.id}`, { confirm: c.slug }, a, "DELETE")).status).toBe(404);
+  });
+  it("upgrades a passwordless v1 database and still fails closed on a newer one", () => {
+    const file = path.join(dir, "legacy.sqlite"),
+      legacy = new LabDatabase(file),
+      now = new Date().toISOString();
+    legacy.put("users", {
+      id: randomUUID(),
+      email: "legacy@example.edu",
+      firstName: "Legacy",
+      lastName: "Admin",
+      passwordHash: "",
+      emailVerifiedAt: now,
+      status: "ACTIVE",
+      globalRole: "ADMIN",
+      lastLoginAt: null,
+      createdAt: now,
+    });
+    // Rewind to the passwordless shape: no stored hash, one outstanding challenge.
+    legacy.sql.exec("UPDATE users SET data=json_remove(data,'$.passwordHash')");
+    legacy.sql.exec(
+      `INSERT INTO verifications(id,data) VALUES('old',json('{"id":"old","email":"legacy@example.edu","purpose":"LOGIN"}'))`
+    );
+    legacy.sql.exec("PRAGMA user_version=1");
+    legacy.close();
+
+    const upgraded = new LabDatabase(file);
+    expect((upgraded.sql.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(2);
+    expect(upgraded.userByEmail("legacy@example.edu")?.passwordHash).toBe("");
+    expect(upgraded.list("verifications")).toHaveLength(0);
+    upgraded.sql.exec("PRAGMA user_version=99");
+    upgraded.close();
+    expect(() => new LabDatabase(file)).toThrow(/newer than this application/);
   });
   it("shares rate limits and commits across independent OS processes", async () => {
     const script = `import {LabDatabase} from './packages/database/src/index.ts';const d=new LabDatabase(process.env.SQLITE_PATH);for(let i=0;i<15;i++)d.rateLimit('parallel',1000,60000);d.close();`;

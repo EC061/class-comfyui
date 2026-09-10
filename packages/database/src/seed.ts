@@ -10,6 +10,9 @@ db.transaction(() => {
     email: "admin@example.edu",
     firstName: "Demo",
     lastName: "Administrator",
+    // No password: use "Forgot password" on the sign-in page and read the emailed
+    // link out of Mailpit. The seed never invents a credential.
+    passwordHash: "",
     emailVerifiedAt: now,
     status: "ACTIVE",
     globalRole: "ADMIN",
@@ -58,4 +61,4 @@ db.transaction(() => {
   });
 });
 closeDb();
-console.log("Fabricated seed created. Authenticate through SMTP.");
+console.log('Fabricated seed created. Set the admin password with "Forgot password" and read the link from Mailpit.');

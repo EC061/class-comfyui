@@ -3,33 +3,54 @@ import { randomUUID } from "node:crypto";
 import { createReadStream, statSync } from "node:fs";
 import { Readable } from "node:stream";
 import path from "node:path";
-import { getDb, audit, activeMembership, type Verification, type User, type Enrollment } from "@class-comfyui/database";
+import {
+  getDb,
+  audit,
+  activeMembership,
+  type Verification,
+  type User,
+  type Enrollment,
+  type Role,
+} from "@class-comfyui/database";
 import { getEnv, appUrl } from "@class-comfyui/config";
 import {
   hashToken,
   newVerificationToken,
+  randomToken,
   checkAdminCode,
+  hashPassword,
+  verifyPassword,
+  hasPassword,
   signWorkspaceToken,
   parseRosterCsv,
   reconcileRoster,
 } from "@class-comfyui/auth";
-import { EmailSchema, ClassCreateSchema, WorkerCreateSchema } from "@class-comfyui/shared";
+import { EmailSchema, PasswordSchema, ClassCreateSchema, WorkerCreateSchema } from "@class-comfyui/shared";
 import { currentUser } from "./auth-helpers";
 import { requireOrigin } from "./origin";
 import { checkRateLimit, clientIp } from "./rate-limit";
 import { createSession, sessionCookieValue, destroySessionByCookie, clearSessionCookie } from "./session";
-import { sendMail, verificationEmail, buildVerifyLink, signupInviteEmail } from "./mailer";
+import {
+  sendMail,
+  activationEmail,
+  buildActivationLink,
+  passwordResetEmail,
+  buildResetLink,
+  signupInviteEmail,
+} from "./mailer";
 import { generateSignupUrl, validateSignupToken, setSignupEnabled } from "./signup";
+import { purgeClass, ActiveJobsError } from "./purge";
 class ApiError extends Error {
   constructor(
     readonly status: number,
-    message: string
+    message: string,
+    readonly code?: string
   ) {
     super(message);
   }
 }
-function fail(status: number, message: string): never {
-  throw new ApiError(status, message);
+function fail(status: number, message: string, code?: string): never {
+  throw new ApiError(status, message, code);
 }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { "Cache-Control": "no-store" } });
 function limit(action: string, id: string, n = 10, ms = 60000) {
@@ -72,43 +93,100 @@ function workerUrl(value: string) {
     fail(400, "Worker URL must be a plain HTTP lab origin");
   return u.origin;
 }
-const authBody = z.object({
+const RegisterSchema = z.object({
   email: EmailSchema,
-  classSlug: z.string().max(100).optional(),
-  signupToken: z.string().max(200).optional(),
-  isAdmin: z.boolean().default(false),
+  password: PasswordSchema,
+  firstName: z.string().trim().max(100).default(""),
+  lastName: z.string().trim().max(100).default(""),
+  classSlug: z.string().max(100).default(""),
+  signupToken: z.string().max(200).default(""),
   adminCode: z.string().max(1000).default(""),
-  firstName: z.string().max(100).default(""),
-  lastName: z.string().max(100).default(""),
 });
-async function requestVerification(req: Request, b: Record<string, any>, signupOnly: boolean) {
-  const input = authBody.parse(b),
-    db = getDb(),
+const TokenSchema = z.string().min(20).max(200);
+
+function sessionResponse(u: User, extra: Record<string, unknown> = {}) {
+  const session = createSession(u.id);
+  const res = json({ ok: true, role: u.globalRole, userId: u.id, ...extra });
+  res.headers.set("Set-Cookie", sessionCookieValue(session.raw, session.expiresAt));
+  return res;
+}
+
+/**
+ * Issues a fresh activation challenge, carrying over the class context of the
+ * challenge it replaces so a re-sent link still enrolls the student. Callers must
+ * already hold a write transaction.
+ */
+function issueActivation(u: User): string {
+  const db = getDb(),
+    raw = newVerificationToken();
+  const previous = db
+    .list("verifications", "email=?", [u.email])
+    .filter((v) => v.purpose === "ACTIVATE" && !v.consumedAt)
+    .sort((a, b) => a.expiresAt - b.expiresAt)
+    .at(-1);
+  db.deleteWhere("verifications", "email=? AND json_extract(data,'$.purpose')='ACTIVATE'", [u.email]);
+  const row: Verification = {
+    id: hashToken(raw),
+    email: u.email,
+    purpose: "ACTIVATE",
+    userId: u.id,
+    classId: previous?.classId ?? null,
+    enrollmentIds: previous?.enrollmentIds ?? [],
+    signupVersion: previous?.signupVersion ?? null,
+    expiresAt: Date.now() + getEnv().VERIFICATION_TTL_MINUTES * 60000,
+    consumedAt: null,
+  };
+  db.put("verifications", row);
+  return raw;
+}
+
+async function deliverActivation(email: string, raw: string) {
+  try {
+    await sendMail(activationEmail(email, buildActivationLink(raw, email)));
+  } catch {
+    getDb().deleteWhere("verifications", "id=?", [hashToken(raw)]);
+    fail(502, "Email delivery failed. Please retry or contact the administrator.");
+  }
+}
+
+/**
+ * One registration endpoint for both roles. The password is chosen here and the
+ * account is created inactive; a single confirmation of the address activates it,
+ * and every later sign-in is password-only.
+ *
+ * An administrator registration code produces an administrator, a valid class
+ * signup link produces a student, and neither produces nothing: self-service
+ * accounts are impossible.
+ */
+async function register(req: Request, b: Record<string, any>) {
+  const input = RegisterSchema.parse(b),
     env = getEnv(),
     ip = clientIp(req.headers);
-  limit("auth-ip", ip, 120);
-  limit("auth-email", input.email, 5, 300000);
-  if (input.isAdmin) limit("admin-register", ip, 5, 300000);
+  limit("register-ip", ip, 20, 300000);
+  limit("register-email", input.email, 5, 300000);
+  if (input.adminCode) limit("admin-register", ip, 5, 300000);
+  // Hashing is deliberately expensive, so it happens before the writer transaction.
+  const passwordHash = await hashPassword(input.password);
   const raw = newVerificationToken();
-  const challenge = db.transaction(() => {
-    const user = db.userByEmail(input.email);
-    if (user?.status === "DISABLED") fail(403, "Account unavailable");
-    const row: Verification = {
-      id: hashToken(raw),
-      email: input.email,
-      purpose: "LOGIN",
-      classId: null,
-      enrollmentIds: [],
-      signupVersion: null,
-      firstName: input.firstName,
-      lastName: input.lastName,
-      expiresAt: Date.now() + env.VERIFICATION_TTL_MINUTES * 60000,
-      consumedAt: null,
-    };
-    if (input.isAdmin) {
-      if (!checkAdminCode(input.adminCode, env.ADMIN_REGISTRATION_CODE)) fail(403, "Incorrect admin registration code");
-      row.purpose = "ADMIN";
-    } else if (signupOnly || input.classSlug || input.signupToken) {
+  getDb().transaction(() => {
+    const db = getDb(),
+      existing = db.userByEmail(input.email);
+    // An unactivated account is not proof of ownership, so its owner-to-be may
+    // register over it. That is what stops one from squatting someone's address.
+    if (existing && existing.status !== "PENDING")
+      fail(409, "An account with this email already exists. Sign in, or use the password reset link.", "EXISTS");
+
+    let role: Role = "STUDENT",
+      classId: string | null = null,
+      signupVersion: number | null = null,
+      enrollmentIds: string[] = [],
+      rosterFirst = "",
+      rosterLast = "";
+    if (input.adminCode) {
+      if (!checkAdminCode(input.adminCode, env.ADMIN_REGISTRATION_CODE))
+        fail(403, "Incorrect administrator registration code");
+      role = "ADMIN";
+    } else if (input.classSlug || input.signupToken) {
       if (!input.classSlug || !input.signupToken) fail(403, "A valid class signup link is required");
       const valid = validateSignupToken(input.classSlug, input.signupToken);
       if (!valid.ok) fail(403, "Invalid or disabled signup link");
@@ -116,66 +194,93 @@ async function requestVerification(req: Request, b: Record<string, any>, signupO
         .list("enrollments", "class_id=? AND email=?", [valid.classId!, input.email])
         .find((e) => e.status !== "ARCHIVED");
       if (!enrollment) fail(403, "This email is not eligible for this class");
-      row.purpose = "SIGNUP";
-      row.classId = valid.classId!;
-      row.signupVersion = valid.version!;
-      row.enrollmentIds = [enrollment.id];
-    } else if (!user) {
-      fail(403, "Use your class signup link to register");
+      if (enrollment.userId) fail(409, "That enrollment already belongs to an account. Sign in instead.", "EXISTS");
+      classId = valid.classId!;
+      signupVersion = valid.version!;
+      enrollmentIds = [enrollment.id];
+      rosterFirst = enrollment.firstName;
+      rosterLast = enrollment.lastName;
+    } else {
+      fail(403, "Use your class signup link, or an administrator registration code, to create an account.");
     }
-    db.put("verifications", row);
-    return row;
+
+    const now = new Date().toISOString();
+    const u: User = existing ?? {
+      id: randomUUID(),
+      email: input.email,
+      firstName: "",
+      lastName: "",
+      passwordHash: "",
+      emailVerifiedAt: null,
+      status: "PENDING",
+      globalRole: role,
+      lastLoginAt: null,
+      createdAt: now,
+    };
+    u.firstName = input.firstName || rosterFirst || u.firstName;
+    u.lastName = input.lastName || rosterLast || u.lastName;
+    u.passwordHash = passwordHash;
+    u.globalRole = role;
+    u.status = "PENDING";
+    db.put("users", u);
+    db.deleteWhere("verifications", "email=? AND json_extract(data,'$.purpose')='ACTIVATE'", [input.email]);
+    db.put("verifications", {
+      id: hashToken(raw),
+      email: input.email,
+      purpose: "ACTIVATE",
+      userId: u.id,
+      classId,
+      enrollmentIds,
+      signupVersion,
+      expiresAt: Date.now() + env.VERIFICATION_TTL_MINUTES * 60000,
+      consumedAt: null,
+    });
   });
-  try {
-    await sendMail(verificationEmail(input.email, buildVerifyLink(raw, input.email)));
-  } catch {
-    db.delete("verifications", challenge.id);
-    fail(502, "Email delivery failed. Please retry or contact the administrator.");
-  }
-  return json({ ok: true, message: "Check your email for a sign-in link." });
+  await deliverActivation(input.email, raw);
+  return json({
+    ok: true,
+    message: "Account created. Open the confirmation email to activate it, then sign in.",
+  });
 }
-function verify(req: Request, b: Record<string, any>) {
-  const input = z.object({ email: EmailSchema, token: z.string().min(20).max(200) }).parse(b);
+
+/** The one email confirmation in an account's life: it activates and signs in. */
+function activate(req: Request, b: Record<string, any>) {
+  const input = z.object({ email: EmailSchema, token: TokenSchema }).parse(b);
   limit("verification", clientIp(req.headers), 120);
   return getDb().transaction(() => {
     const db = getDb(),
       row = db.get("verifications", hashToken(input.token));
-    if (!row || row.email !== input.email || row.consumedAt || row.expiresAt <= Date.now())
-      fail(400, "Invalid, used or expired verification link");
-    let u = db.userByEmail(input.email);
-    if (u?.status === "DISABLED") fail(403, "Account disabled");
-    // Re-check current eligibility before creating a user or consuming the challenge.
+    if (
+      !row ||
+      row.purpose !== "ACTIVATE" ||
+      row.email !== input.email ||
+      row.consumedAt ||
+      row.expiresAt <= Date.now()
+    )
+      fail(400, "Invalid, used or expired activation link");
+    const u = db.get("users", row.userId);
+    if (!u || u.email.toLowerCase() !== input.email) fail(400, "Invalid activation link");
+    if (u.status === "DISABLED") fail(403, "Account unavailable");
+    // Eligibility is re-read here: a roster change or a regenerated signup link
+    // between registration and confirmation must win.
     const memberships: Enrollment[] = [];
-    if (row.purpose === "SIGNUP") {
-      const c = row.classId ? db.get("classes", row.classId) : undefined;
+    if (row.classId) {
+      const c = db.get("classes", row.classId);
       if (!c?.active || !c.signupEnabled || c.signupTokenVersion !== row.signupVersion)
         fail(403, "Signup is no longer available; request a new link");
       for (const id of row.enrollmentIds) {
         const e = db.get("enrollments", id);
-        if (!e || e.classId !== row.classId || e.rosterEmail !== input.email || e.status === "ARCHIVED")
+        if (!e || e.classId !== row.classId || e.rosterEmail.toLowerCase() !== input.email || e.status === "ARCHIVED")
           fail(403, "Enrollment no longer eligible");
         memberships.push(e);
       }
       if (!memberships.length) fail(403, "Enrollment required");
     }
-    if (row.purpose === "LOGIN" && !u) fail(403, "Account unavailable");
     const now = new Date().toISOString();
-    const becameAdmin = row.purpose === "ADMIN" && u?.globalRole !== "ADMIN";
-    if (!u)
-      u = {
-        id: randomUUID(),
-        email: input.email,
-        firstName: row.firstName || memberships[0]?.firstName || "",
-        lastName: row.lastName || memberships[0]?.lastName || "",
-        emailVerifiedAt: now,
-        status: "ACTIVE",
-        globalRole: row.purpose === "ADMIN" ? "ADMIN" : "STUDENT",
-        lastLoginAt: now,
-        createdAt: now,
-      };
-    if (row.purpose === "ADMIN") u.globalRole = "ADMIN";
+    const activating = u.status === "PENDING";
+    u.status = "ACTIVE";
+    u.emailVerifiedAt = u.emailVerifiedAt ?? now;
     u.lastLoginAt = now;
-    u.emailVerifiedAt = now;
     db.put("users", u);
     for (const e of memberships) {
       e.userId = u.id;
@@ -184,13 +289,127 @@ function verify(req: Request, b: Record<string, any>) {
     }
     row.consumedAt = Date.now();
     db.put("verifications", row);
-    if (becameAdmin) audit("ADMIN_REGISTERED", { actorId: u.id, targetId: u.id });
-    const session = createSession(u.id);
-    const res = json({ ok: true, role: u.globalRole, userId: u.id });
-    res.headers.set("Set-Cookie", sessionCookieValue(session.raw, session.expiresAt));
-    return res;
+    if (activating)
+      audit("ACCOUNT_ACTIVATED", {
+        actorId: u.id,
+        classId: row.classId,
+        targetId: u.id,
+        metadata: { role: u.globalRole },
+      });
+    if (activating && u.globalRole === "ADMIN") audit("ADMIN_REGISTERED", { actorId: u.id, targetId: u.id });
+    return sessionResponse(u);
   });
 }
+
+// A stable decoy hash so signing in with an unknown address costs the same as
+// signing in with a known one. Computed once, lazily, never stored.
+let decoy: Promise<string> | undefined;
+
+async function login(req: Request, b: Record<string, any>) {
+  const input = z.object({ email: EmailSchema, password: z.string().min(1).max(200) }).parse(b);
+  limit("login-ip", clientIp(req.headers), 60, 300000);
+  limit("login-email", input.email, 10, 300000);
+  const db = getDb(),
+    u = db.userByEmail(input.email);
+  const usable = u && hasPassword(u.passwordHash);
+  const ok = await verifyPassword(
+    input.password,
+    usable ? u!.passwordHash : await (decoy ??= hashPassword(randomToken()))
+  );
+  if (!usable || !ok) fail(401, "Incorrect email or password");
+  if (u!.status === "DISABLED") fail(403, "Account unavailable");
+  if (u!.status === "PENDING")
+    fail(403, "Confirm your email address to activate this account, then sign in.", "PENDING");
+  return db.transaction(() => {
+    const fresh = db.get("users", u!.id);
+    if (!fresh || fresh.status !== "ACTIVE") fail(403, "Account unavailable");
+    fresh.lastLoginAt = new Date().toISOString();
+    db.put("users", fresh);
+    return sessionResponse(fresh);
+  });
+}
+
+/** Re-sends the activation link. Answers identically for addresses with no account. */
+async function resendActivation(req: Request, b: Record<string, any>) {
+  const input = z.object({ email: EmailSchema }).parse(b);
+  limit("resend-ip", clientIp(req.headers), 20, 300000);
+  limit("resend-email", input.email, 3, 900000);
+  const quiet = json({ ok: true, message: "If that account is awaiting activation, a new link is on its way." });
+  const u = getDb().userByEmail(input.email);
+  if (!u || u.status !== "PENDING") return quiet;
+  const raw = getDb().transaction(() => issueActivation(u));
+  await deliverActivation(input.email, raw);
+  return quiet;
+}
+
+/**
+ * Password recovery, and the migration path for accounts created before passwords
+ * existed. An account still awaiting activation gets its activation link instead,
+ * because that is the link that also attaches its class enrollment.
+ */
+async function requestPasswordReset(req: Request, b: Record<string, any>) {
+  const input = z.object({ email: EmailSchema }).parse(b);
+  limit("reset-ip", clientIp(req.headers), 20, 300000);
+  limit("reset-email", input.email, 3, 900000);
+  const quiet = json({ ok: true, message: "If that address has an account, a password link is on its way." });
+  const db = getDb(),
+    u = db.userByEmail(input.email);
+  if (!u || u.status === "DISABLED") return quiet;
+  if (u.status === "PENDING") {
+    const raw = db.transaction(() => issueActivation(u));
+    await deliverActivation(input.email, raw);
+    return quiet;
+  }
+  const raw = newVerificationToken();
+  db.transaction(() => {
+    db.deleteWhere("verifications", "email=? AND json_extract(data,'$.purpose')='RESET'", [input.email]);
+    db.put("verifications", {
+      id: hashToken(raw),
+      email: input.email,
+      purpose: "RESET",
+      userId: u.id,
+      classId: null,
+      enrollmentIds: [],
+      signupVersion: null,
+      expiresAt: Date.now() + getEnv().VERIFICATION_TTL_MINUTES * 60000,
+      consumedAt: null,
+    });
+  });
+  try {
+    await sendMail(passwordResetEmail(input.email, buildResetLink(raw, input.email)));
+  } catch {
+    db.deleteWhere("verifications", "id=?", [hashToken(raw)]);
+    fail(502, "Email delivery failed. Please retry or contact the administrator.");
+  }
+  return quiet;
+}
+
+async function confirmPasswordReset(req: Request, b: Record<string, any>) {
+  const input = z.object({ email: EmailSchema, token: TokenSchema, password: PasswordSchema }).parse(b);
+  limit("reset-confirm", clientIp(req.headers), 60, 300000);
+  const passwordHash = await hashPassword(input.password);
+  return getDb().transaction(() => {
+    const db = getDb(),
+      row = db.get("verifications", hashToken(input.token));
+    if (!row || row.purpose !== "RESET" || row.email !== input.email || row.consumedAt || row.expiresAt <= Date.now())
+      fail(400, "Invalid, used or expired password link");
+    const u = db.get("users", row.userId);
+    if (!u || u.status === "DISABLED") fail(403, "Account unavailable");
+    if (u.status === "PENDING") fail(403, "Activate this account from its confirmation email first.", "PENDING");
+    u.passwordHash = passwordHash;
+    u.emailVerifiedAt = u.emailVerifiedAt ?? new Date().toISOString();
+    db.put("users", u);
+    row.consumedAt = Date.now();
+    db.put("verifications", row);
+    // A new password ends every established session, workspace included.
+    db.deleteWhere("sessions", "user_id=?", [u.id]);
+    db.deleteWhere("gateway_sessions", "user_id=?", [u.id]);
+    db.deleteWhere("workspace_tickets", "user_id=?", [u.id]);
+    audit("PASSWORD_RESET", { actorId: u.id, targetId: u.id });
+    return json({ ok: true, message: "Password updated. Sign in with your new password." });
+  });
+}
+
 function shapedJobs(user: User, url: URL) {
   const db = getDb();
   let jobs = db.list(
@@ -370,9 +589,12 @@ export async function handleApi(req: Request): Promise<Response> {
       const c = db.get("classes", valid.classId!)!;
       return json({ name: c.name, courseCode: c.courseCode, term: c.term });
     }
-    if (method === "POST" && (p === "/api/auth/request-code" || p === "/api/signup/request"))
-      return await requestVerification(req, b, p === "/api/signup/request");
-    if (method === "POST" && p === "/api/auth/verify") return verify(req, b);
+    if (method === "POST" && p === "/api/auth/register") return await register(req, b);
+    if (method === "POST" && p === "/api/auth/login") return await login(req, b);
+    if (method === "POST" && p === "/api/auth/verify") return activate(req, b);
+    if (method === "POST" && p === "/api/auth/resend") return await resendActivation(req, b);
+    if (method === "POST" && p === "/api/auth/password-reset") return await requestPasswordReset(req, b);
+    if (method === "POST" && p === "/api/auth/password-reset/confirm") return await confirmPasswordReset(req, b);
     if (method === "POST" && p === "/api/auth/logout") {
       destroySessionByCookie(req.headers.get("cookie"));
       const res = json({ ok: true });
@@ -397,6 +619,44 @@ export async function handleApi(req: Request): Promise<Response> {
       return json({ user: user ?? null, enrollments });
     }
     if (!user) fail(401, "Authentication required");
+    // Joining a second class needs no new email confirmation: the account's address
+    // is already proven, and the roster plus signup link still gate eligibility.
+    if (p === "/api/enroll" && method === "POST")
+      return db.transaction(() => {
+        const input = z.object({ classSlug: z.string().max(100), signupToken: TokenSchema }).parse(b);
+        limit("enroll", user.id, 10, 300000);
+        const valid = validateSignupToken(input.classSlug, input.signupToken);
+        if (!valid.ok) fail(403, "Invalid or disabled signup link");
+        const e = db
+          .list("enrollments", "class_id=? AND email=?", [valid.classId!, user.email])
+          .find((v) => v.status !== "ARCHIVED");
+        if (!e) fail(403, "This email is not eligible for this class");
+        if (e.userId && e.userId !== user.id) fail(409, "That enrollment belongs to another account");
+        if (e.userId === user.id && e.status === "ACTIVE") return json({ ok: true, classId: valid.classId! });
+        e.userId = user.id;
+        e.status = "ACTIVE";
+        db.put("enrollments", e);
+        audit("ENROLLMENT_JOINED", { actorId: user.id, classId: valid.classId!, targetId: e.id });
+        return json({ ok: true, classId: valid.classId! });
+      });
+    // Lets an existing signed-in account claim administrator rights with the code,
+    // so becoming an administrator never needs a second account.
+    if (p === "/api/auth/admin-code" && method === "POST")
+      return db.transaction(() => {
+        const input = z.object({ adminCode: z.string().min(1).max(1000) }).parse(b);
+        limit("admin-elevate-ip", clientIp(req.headers), 5, 300000);
+        limit("admin-elevate", user.id, 5, 300000);
+        if (!checkAdminCode(input.adminCode, getEnv().ADMIN_REGISTRATION_CODE))
+          fail(403, "Incorrect administrator registration code");
+        const u = db.get("users", user.id);
+        if (!u || u.status !== "ACTIVE") fail(403, "Account unavailable");
+        if (u.globalRole !== "ADMIN") {
+          u.globalRole = "ADMIN";
+          db.put("users", u);
+          audit("ADMIN_REGISTERED", { actorId: u.id, targetId: u.id });
+        }
+        return json({ ok: true, role: u.globalRole });
+      });
     if (p === "/api/workspace/session" && method === "POST")
       return db.transaction(() => {
         const input = z.object({ classId: z.string() }).parse(b);
@@ -496,7 +756,7 @@ export async function handleApi(req: Request): Promise<Response> {
         today = new Date().toISOString().slice(0, 10);
       return json({
         activeClasses: db.list("classes").filter((c) => c.active).length,
-        students: db.list("users").filter((u) => u.globalRole === "STUDENT").length,
+        students: db.list("users").filter((u) => u.globalRole === "STUDENT" && u.status === "ACTIVE").length,
         pending: db.list("enrollments").filter((e) => !e.userId && e.status === "INVITED").length,
         queued: jobs.filter((j) => j.status === "QUEUED").length,
         active: jobs.filter((j) => ["RUNNING", "DISPATCHING"].includes(j.status)).length,
@@ -564,10 +824,40 @@ export async function handleApi(req: Request): Promise<Response> {
       audit("INVITATIONS_SENT", { actorId: user.id, classId: c.id, targetId: c.id, metadata: { sent, failed } });
       return json({ ok: failed === 0, sent, failed });
     }
+    // Permanent class deletion touches the filesystem, so it cannot run inside the
+    // single administrative write transaction below.
+    const purgeMatch = p.match(/^\/api\/admin\/classes\/([^/]+)$/);
+    if (purgeMatch && method === "DELETE") {
+      const c = db.get("classes", purgeMatch[1]);
+      if (!c) fail(404, "Class not found");
+      const input = z.object({ confirm: z.string().max(200) }).parse(b);
+      // Typing the slug is the confirmation: this destroys student work irreversibly.
+      if (input.confirm !== c.slug) fail(400, `Type the class slug "${c.slug}" to confirm permanent deletion`);
+      limit("class-delete", user.id, 5, 300000);
+      let result;
+      try {
+        result = await purgeClass(c.id, user.id);
+      } catch (e) {
+        if (e instanceof ActiveJobsError) fail(409, e.message, "ACTIVE_JOBS");
+        throw e;
+      }
+      if (!result) fail(404, "Class not found");
+      return json({
+        ok: !result.failures.length,
+        slug: result.slug,
+        deleted: result.rows,
+        filesDeleted: result.filesDeleted,
+        directoriesDeleted: result.directoriesDeleted,
+        failures: result.failures,
+        message: result.failures.length
+          ? `Class deleted, but ${result.failures.length} path(s) could not be removed from disk.`
+          : "Class and all of its stored data deleted.",
+      });
+    }
     // Every administrative read/modify/write runs under one short writer transaction.
     return db.transaction(() => adminRoute(user, p, method, b, url));
   } catch (e) {
-    if (e instanceof ApiError) return json({ error: e.message }, e.status);
+    if (e instanceof ApiError) return json({ error: e.message, ...(e.code ? { code: e.code } : {}) }, e.status);
     if (e instanceof z.ZodError)
       return json(
         { error: "Invalid request", details: e.issues.map((v) => `${v.path.join(".")}: ${v.message}`).join("; ") },
@@ -657,19 +947,18 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
             .reduce((n, j) => n + db.list("outputs", "job_id=?", [j.id]).length, 0),
         })),
       });
-    if (method === "PATCH" || method === "DELETE") {
-      const input =
-        method === "DELETE"
-          ? { active: false }
-          : z
-              .object({
-                name: z.string().min(1).max(200).optional(),
-                courseCode: z.string().min(1).max(50).optional(),
-                term: z.string().min(1).max(50).optional(),
-                description: z.string().max(2000).optional(),
-                active: z.boolean().optional(),
-              })
-              .parse(b);
+    // DELETE is permanent removal and is handled before this transaction; archiving
+    // a class is `PATCH { active: false }`.
+    if (method === "PATCH") {
+      const input = z
+        .object({
+          name: z.string().min(1).max(200).optional(),
+          courseCode: z.string().min(1).max(50).optional(),
+          term: z.string().min(1).max(50).optional(),
+          description: z.string().max(2000).optional(),
+          active: z.boolean().optional(),
+        })
+        .parse(b);
       Object.assign(c, input, { updatedAt: new Date().toISOString() });
       db.put("classes", c);
       audit(c.active ? "CLASS_UPDATED" : "CLASS_ARCHIVED", { actorId: user.id, classId: c.id, targetId: c.id });
@@ -694,6 +983,10 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
           .parse(b),
         u = db.get("users", url.searchParams.get("id") || "");
       if (!u) fail(404, "User not found");
+      // An administrator may block an unconfirmed account but never confirm one for
+      // its owner: activation is what proves the address and attaches the enrollment.
+      if (u.status === "PENDING" && input.status === "ACTIVE")
+        fail(409, "This account has not confirmed its email address yet and cannot be activated for it.");
       const losingAdmin =
         u.status === "ACTIVE" &&
         u.globalRole === "ADMIN" &&
@@ -701,6 +994,10 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
       if (losingAdmin && db.list("users").filter((v) => v.status === "ACTIVE" && v.globalRole === "ADMIN").length === 1)
         fail(409, "Cannot disable or demote the final active administrator");
       Object.assign(u, input);
+      // Re-enabling an account that never confirmed its address returns it to
+      // PENDING rather than ACTIVE, so blocking and unblocking cannot be used as a
+      // two-step way around activation.
+      if (u.status === "ACTIVE" && !u.emailVerifiedAt) u.status = "PENDING";
       db.put("users", u);
       audit(u.status === "DISABLED" ? "USER_DISABLED" : "USER_ENABLED", { actorId: user.id, targetId: u.id });
       return json({ user: u });

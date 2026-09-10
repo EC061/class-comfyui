@@ -5,6 +5,8 @@ import { randomUUID } from "node:crypto";
 import type { Tables, Audit, User } from "./types";
 export * from "./types";
 
+export const SCHEMA_VERSION = 2;
+
 // Typed repositories use JSON documents with relational generated columns. All
 // identities, foreign keys, uniqueness and hot lookup indexes are enforced by SQLite.
 const definitions: Record<keyof Tables, string> = {
@@ -36,14 +38,22 @@ export class LabDatabase {
     );
     this.transaction(() => {
       const version = (this.sql.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
-      if (version > 1) throw new Error("Database schema is newer than this application");
+      if (version > SCHEMA_VERSION) throw new Error("Database schema is newer than this application");
       if (version === 0) {
         for (const [table, cols] of Object.entries(definitions))
           this.sql.exec(
             `CREATE TABLE ${table}(id TEXT PRIMARY KEY NOT NULL, data TEXT NOT NULL CHECK(json_valid(data) AND json_extract(data,'$.id')=id), ${cols})`
           );
         this.sql.exec(
-          `CREATE INDEX jobs_user ON jobs(user_id,submitted_at); CREATE INDEX jobs_class ON jobs(class_id,submitted_at); CREATE INDEX jobs_status ON jobs(status,submitted_at); CREATE INDEX jobs_submitted ON jobs(submitted_at); CREATE INDEX jobs_worker ON jobs(worker_id,status); CREATE INDEX outputs_job ON outputs(job_id); CREATE INDEX enrollment_email ON enrollments(email); CREATE INDEX enrollment_user ON enrollments(user_id); CREATE INDEX signup_class ON signup_tokens(class_id); CREATE INDEX audits_class ON audits(class_id); CREATE TABLE rate_limits(id TEXT PRIMARY KEY, count INTEGER NOT NULL, expires_at INTEGER NOT NULL); CREATE TABLE leases(id TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL); PRAGMA user_version=1;`
+          `CREATE INDEX jobs_user ON jobs(user_id,submitted_at); CREATE INDEX jobs_class ON jobs(class_id,submitted_at); CREATE INDEX jobs_status ON jobs(status,submitted_at); CREATE INDEX jobs_submitted ON jobs(submitted_at); CREATE INDEX jobs_worker ON jobs(worker_id,status); CREATE INDEX outputs_job ON outputs(job_id); CREATE INDEX enrollment_email ON enrollments(email); CREATE INDEX enrollment_user ON enrollments(user_id); CREATE INDEX signup_class ON signup_tokens(class_id); CREATE INDEX audits_class ON audits(class_id); CREATE TABLE rate_limits(id TEXT PRIMARY KEY, count INTEGER NOT NULL, expires_at INTEGER NOT NULL); CREATE TABLE leases(id TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL); PRAGMA user_version=${SCHEMA_VERSION};`
+        );
+      } else if (version === 1) {
+        // v1 authenticated by emailed one-time link and stored no password. Accounts
+        // survive with an empty hash: they cannot sign in until their owner sets a
+        // password through the emailed reset link. Outstanding v1 challenges use a
+        // retired shape and are short-lived, so they are dropped rather than mapped.
+        this.sql.exec(
+          `UPDATE users SET data=json_set(data,'$.passwordHash',''); DELETE FROM verifications; PRAGMA user_version=${SCHEMA_VERSION};`
         );
       }
     });
@@ -78,6 +88,10 @@ export class LabDatabase {
   }
   delete<K extends keyof Tables>(table: K, id: string) {
     this.sql.prepare(`DELETE FROM ${table} WHERE id=?`).run(id);
+  }
+  /** Bulk delete for cascades. Returns the number of rows removed. */
+  deleteWhere<K extends keyof Tables>(table: K, where: string, params: (string | number | null)[] = []): number {
+    return Number(this.sql.prepare(`DELETE FROM ${table} WHERE ${where}`).run(...params).changes);
   }
   userByEmail(email: string): User | undefined {
     return this.list("users", "email=?", [email.trim().toLowerCase()])[0];

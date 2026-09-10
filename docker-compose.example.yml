@@ -41,7 +41,8 @@ services:
       AUTH_SECRET: "CHANGE_ME"
       WORKSPACE_JWT_SECRET: "CHANGE_ME"
       ADMIN_REGISTRATION_CODE: "CHANGE_ME"
-      # MUST CHANGE SMTP connection and sender; failures never log sign-in tokens.
+      # MUST CHANGE SMTP connection and sender. Account activation and password
+      # resets are delivered here; failures never log the tokens.
       SMTP_HOST: "smtp.example.edu"
       SMTP_PORT: "587"
       SMTP_USER: ""

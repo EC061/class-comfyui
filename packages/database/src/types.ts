@@ -4,8 +4,11 @@ export interface User {
   email: string;
   firstName: string;
   lastName: string;
+  /** scrypt hash. Empty for accounts created before passwords existed. */
+  passwordHash: string;
   emailVerifiedAt: string | null;
-  status: "ACTIVE" | "DISABLED";
+  /** PENDING = password set, email not yet proven, so the account cannot sign in. */
+  status: "PENDING" | "ACTIVE" | "DISABLED";
   globalRole: Role;
   lastLoginAt: string | null;
   createdAt: string;
@@ -45,12 +48,12 @@ export interface SignupToken {
 export interface Verification {
   id: string;
   email: string;
-  purpose: "LOGIN" | "SIGNUP" | "ADMIN";
+  /** ACTIVATE proves a new address once; RESET re-sets a forgotten password. */
+  purpose: "ACTIVATE" | "RESET";
+  userId: string;
   classId: string | null;
   enrollmentIds: string[];
   signupVersion: number | null;
-  firstName: string;
-  lastName: string;
   expiresAt: number;
   consumedAt: number | null;
 }
