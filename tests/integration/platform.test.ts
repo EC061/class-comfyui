@@ -393,10 +393,27 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     // history globally, so proxying it would show each student the whole class.
     const mine = await (await gw("/jobs?limit=64&offset=0", undefined, ga)).json();
     expect(mine.jobs.map((j: any) => j.id)).toEqual([aid]);
-    expect(mine.jobs.map((j: any) => j.prompt_id)).toEqual([aid]);
+    // The worker's own field names (comfy_execution/jobs.py normalize_*), so the
+    // panel needs no special-casing. `created_at`/`execution_duration` name sort
+    // behaviors there, not fields, and must not appear on the job.
+    expect(mine.jobs[0].create_time).toBe(Date.parse(getDb().get("jobs", aid)!.submittedAt));
+    expect(mine.jobs[0]).not.toHaveProperty("created_at");
+    expect(mine.jobs[0]).not.toHaveProperty("execution_duration");
+    expect(typeof mine.jobs[0].outputs_count).toBe("number");
     expect(mine.pagination).toEqual({ offset: 0, limit: 64, total: 1, has_more: false });
     expect(["pending", "in_progress", "completed", "failed", "cancelled"]).toContain(mine.jobs[0].status);
-    expect((await (await gw("/jobs", undefined, gb)).json()).jobs.map((j: any) => j.id)).toEqual([bid]);
+    const theirs = await (await gw("/jobs", undefined, gb)).json();
+    expect(theirs.jobs.map((j: any) => j.id)).toEqual([bid]);
+    // A finished job carries what the panel renders from history: the execution
+    // span and a preview pointing at the archived filename, never the worker's.
+    const done = theirs.jobs[0];
+    expect(done.status).toBe("completed");
+    expect(done.outputs_count).toBeGreaterThan(0);
+    expect(done.previewable_outputs_count).toBeGreaterThan(0);
+    expect(done.execution_end_time).toBeGreaterThanOrEqual(done.execution_start_time);
+    expect(done.preview_output.filename).toBe(bo.fileName);
+    expect(done.preview_output.nodeId).toBeTruthy();
+    expect(done).not.toHaveProperty("execution_error");
     // A status the worker would reject must not silently return everything.
     expect((await gw("/jobs?status=finished", undefined, ga)).status).toBe(400);
     expect((await gw("/jobs?sort_by=user_id", undefined, ga)).status).toBe(400);

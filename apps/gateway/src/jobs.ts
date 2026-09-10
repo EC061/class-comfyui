@@ -3,17 +3,18 @@ import { getDb, type Job, type JobStatus, type Session } from "@class-comfyui/da
 
 // The frontend's Jobs panel polls GET /api/jobs on an interval and logs a hard
 // error on any non-200, so an unanswered route is a permanent console-error loop
-// (see the 1808-entry spam it produced). The worker's own /api/jobs cannot be
-// proxied to answer it: it reads prompt_queue and history globally, which is the
-// whole class's work, so every student would receive every other student's jobs.
-// This answers from the gateway's own jobs table under the same
-// `user_id AND class_id` scope as /queue and /history.
+// (1808 suppressed entries in one session). The worker's own /api/jobs cannot be
+// proxied to answer it: it builds its list from prompt_queue and history, both
+// worker-global, so every student would receive every other student's jobs. This
+// answers from the gateway's jobs table under the same `user_id AND class_id`
+// scope as /queue and /history, and mirrors the field names and query contract of
+// comfy_execution/jobs.py so the panel needs no special-casing.
 
-// ComfyUI's five statuses (comfy_execution/jobs.py, JobStatus.ALL). The gateway's
-// own vocabulary is finer-grained, so several of ours collapse onto one of theirs:
-// DISPATCHING is a job the scheduler has claimed but the worker has not confirmed,
-// and LOST is one whose worker disappeared mid-run, which a student reads as a
-// failure like any other.
+// ComfyUI's five statuses (JobStatus.ALL). Our vocabulary is finer-grained:
+// DISPATCHING is a job the scheduler has claimed but the worker has not yet
+// confirmed, and LOST is one whose worker vanished mid-run, which a student reads
+// as a failure like any other. The worker likewise folds an interrupted execution
+// into `cancelled` rather than reporting it as an error.
 const COMFY_STATUS: Record<JobStatus, string> = {
   QUEUED: "pending",
   DISPATCHING: "in_progress",
@@ -24,36 +25,120 @@ const COMFY_STATUS: Record<JobStatus, string> = {
   CANCELLED: "cancelled",
 };
 const ALL_STATUSES = ["pending", "in_progress", "completed", "failed", "cancelled"];
+// `created_at` and `execution_duration` name sort behaviors, not fields: the
+// worker sorts them by `create_time` and by the span between the execution
+// timestamps. Neither field appears in the job itself.
 const SORT_FIELDS = ["created_at", "execution_duration"];
+// Only these can appear. `animated` is a boolean flag rather than a list of items,
+// and the node allowlist has no 3D, text or latent save nodes, so the worker's
+// 3D-filename-string and text-preview branches are unreachable in this lab.
+const PREVIEWABLE = ["images", "gifs", "video", "videos", "audio"];
 
 function ownJobs(s: Session) {
   return getDb().list("jobs", "user_id=? AND class_id=?", [s.userId, s.classId!]);
 }
 
-// One job as the panel reads it. `status`, `workflow_id`, `created_at` and
-// `execution_duration` are the names the worker's own code uses -- the last two
-// are the only accepted `sort_by` values, and workflow_id is filtered by that key.
-function serialize(j: Job) {
-  const outputs = j.history?.outputs ?? {};
-  return {
-    // Both spellings of the identifier. The frontend keys rows by one of them and
-    // emitting the extra key costs nothing.
-    id: j.id,
-    prompt_id: j.id,
-    status: COMFY_STATUS[j.status],
-    created_at: Date.parse(j.submittedAt),
-    started_at: j.startedAt ? Date.parse(j.startedAt) : null,
-    completed_at: j.completedAt ? Date.parse(j.completedAt) : null,
-    // Seconds, matching the worker's own field, which is derived from execution
-    // timestamps rather than a millisecond counter.
-    execution_duration: j.runtimeMs === null ? null : j.runtimeMs / 1000,
-    workflow_id: (j.extraData?.workflow_id as string | undefined) ?? null,
-    outputs,
-    // The student's own submitted graph, never the rewritten one the scheduler
-    // sends to the worker.
-    prompt: j.promptJson,
-    error: j.error,
-  };
+// The worker reads these out of the execution messages it recorded in history,
+// which we store verbatim (storage.ts rewrites only output filenames). Reading
+// the same source keeps the units identical instead of re-deriving them from our
+// own columns; those are the fallback for a job that failed or was lost before
+// the worker wrote any history.
+function execution(job: Job) {
+  let start: number | undefined, end: number | undefined, error: Record<string, unknown> | undefined;
+  for (const entry of (job.history?.status?.messages ?? []) as unknown[]) {
+    if (!Array.isArray(entry) || entry.length < 2) continue;
+    const [name, data] = entry as [string, unknown];
+    if (!data || typeof data !== "object") continue;
+    const timestamp = (data as { timestamp?: number }).timestamp;
+    if (name === "execution_start") start = timestamp;
+    else if (["execution_success", "execution_error", "execution_interrupted"].includes(name)) {
+      end = timestamp;
+      if (name === "execution_error") error = data as Record<string, unknown>;
+    }
+  }
+  if (start === undefined && job.startedAt) start = Date.parse(job.startedAt);
+  if (end === undefined && job.completedAt) end = Date.parse(job.completedAt);
+  // Our own failures carry a message rather than the worker's error dict. The
+  // panel reads the message, so give it one under the same key.
+  if (!error && job.error) error = { exception_message: job.error };
+  return { start, end, error };
+}
+
+function outputs(job: Job) {
+  let count = 0,
+    previewable = 0,
+    preview: Record<string, unknown> | undefined,
+    fallback: Record<string, unknown> | undefined;
+  for (const [nodeId, node] of Object.entries(job.history?.outputs ?? {})) {
+    if (!node || typeof node !== "object") continue;
+    for (const [mediaType, items] of Object.entries(node as Record<string, unknown>)) {
+      if (mediaType === "animated" || !Array.isArray(items)) continue;
+      for (const item of items) {
+        if (!item || typeof item !== "object") continue;
+        count++;
+        if (!PREVIEWABLE.includes(mediaType)) continue;
+        previewable++;
+        const enriched = { ...(item as Record<string, unknown>), nodeId, mediaType };
+        // A saved output outranks a temp preview, matching the worker's priority.
+        if (!preview && (item as { type?: string }).type === "output") preview = enriched;
+        else if (!fallback) fallback = enriched;
+      }
+    }
+  }
+  return { count, previewable, preview: preview ?? fallback };
+}
+
+// The worker's normalize_* helpers run their dicts through prune_dict, so a field
+// it could not determine is absent rather than null. Matched here so the panel
+// sees the same shape it would from a direct worker response.
+function prune<T extends Record<string, unknown>>(job: T) {
+  return Object.fromEntries(Object.entries(job).filter(([, v]) => v !== undefined && v !== null));
+}
+
+function serialize(job: Job) {
+  const created = Date.parse(job.submittedAt),
+    workflowId = (job.extraData?.workflow_id ??
+      (job.extraData?.extra_pnginfo as { workflow?: { id?: string } } | undefined)?.workflow?.id) as string | undefined;
+  // A queued job has no execution timestamps and no outputs, exactly as the
+  // worker's normalize_queue_item reports it.
+  if (!["COMPLETED", "FAILED", "CANCELLED", "LOST"].includes(job.status))
+    return prune({
+      id: job.id,
+      status: COMFY_STATUS[job.status],
+      // Our queue tuples already use the submit time in ComfyUI's priority slot.
+      priority: created,
+      create_time: created,
+      outputs_count: 0,
+      previewable_outputs_count: 0,
+      workflow_id: workflowId,
+    });
+  const { start, end, error } = execution(job),
+    o = outputs(job);
+  return prune({
+    id: job.id,
+    status: COMFY_STATUS[job.status],
+    priority: created,
+    create_time: created,
+    execution_start_time: start,
+    execution_end_time: end,
+    execution_error: error,
+    outputs_count: o.count,
+    previewable_outputs_count: o.previewable,
+    preview_output: o.preview,
+    workflow_id: workflowId,
+  });
+}
+
+type Serialized = ReturnType<typeof serialize>;
+
+// `created_at` sorts on create_time; `execution_duration` on the span between the
+// execution timestamps, treating a job missing either one as zero rather than
+// sorting it last. Both match apply_sorting().
+function sortKey(job: Serialized, sortBy: string) {
+  if (sortBy !== "execution_duration") return (job.create_time as number) ?? 0;
+  const start = (job.execution_start_time as number) ?? 0,
+    end = (job.execution_end_time as number) ?? 0;
+  return end && start ? end - start : 0;
 }
 
 export function installJobs(app: express.Express) {
@@ -111,22 +196,14 @@ export function installJobs(app: express.Express) {
     }
 
     let jobs = ownJobs(res.locals.session as Session).map(serialize);
-    if (statusFilter) jobs = jobs.filter((j) => statusFilter!.includes(j.status));
+    if (statusFilter) jobs = jobs.filter((j) => statusFilter!.includes(j.status as string));
     if (query.workflow_id) jobs = jobs.filter((j) => j.workflow_id === query.workflow_id);
 
-    const key = sortBy === "created_at" ? "created_at" : "execution_duration";
     const direction = sortOrder === "asc" ? 1 : -1;
-    // A job that has not run has no duration. Sorting by it must not interleave
-    // those nulls with real durations, so they sort last in either direction.
-    jobs.sort((a, b) => {
-      const x = a[key],
-        y = b[key];
-      if (x === null || y === null) return x === y ? 0 : x === null ? 1 : -1;
-      return (x - y) * direction;
-    });
+    jobs.sort((a, b) => (sortKey(a, sortBy) - sortKey(b, sortBy)) * direction);
 
-    const total = jobs.length;
-    const page = limit === null ? jobs.slice(offset) : jobs.slice(offset, offset + limit);
+    const total = jobs.length,
+      page = limit === null ? jobs.slice(offset) : jobs.slice(offset, offset + limit);
     res.json({
       jobs: page,
       pagination: { offset, limit, total, has_more: offset + page.length < total },
