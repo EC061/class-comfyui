@@ -15,6 +15,7 @@ import { verifyWorkspaceToken, hashSessionToken, newSessionToken } from "@class-
 import { Scheduler } from "./scheduler";
 import { workerFetch } from "./storage";
 import { installUserData, saveUserData } from "./userdata";
+import { seedStarters } from "./starters";
 const cookieName = "comfy_gateway";
 function cookie(header: string | undefined) {
   return header
@@ -97,30 +98,26 @@ const coreNodes = [
   "ModelSamplingFlux",
   "EmptySD3LatentImage",
   "SaveAnimatedWEBP",
-  // MiniMax-H3 video+audio, running on the lab's own weights. The ComfyCloud*
-  // and Minimax*Node variants are deliberately absent: identical names, but they
-  // POST student prompts and images to a paid third-party API.
+  // MiniMax-H3 video+audio, running on the lab's own weights. Two exclusions are
+  // deliberate. The ComfyCloud*/Minimax*Node variants carry near-identical names
+  // but POST student prompts and images to a paid third-party API. The Ref2VA and
+  // Fun-ControlNet nodes work only against checkpoints this lab has not
+  // downloaded, and a node that can only fail is worse than an absent one.
   "MiniMaxH3ImageToVideo",
-  "MiniMaxH3ReferenceToVideo",
   "MiniMaxH3AddGuide",
   "MiniMaxH3SigmaShift",
-  "MiniMaxH3FunControlNetApply",
   "EmptyMiniMaxH3LatentAV",
   "VAEDecodeAudio",
-  "ModelPatchLoader",
   // H3 graphs sample through SamplerCustomAdvanced rather than KSampler.
   "SamplerCustomAdvanced",
   "BasicGuider",
   "BasicScheduler",
   "KSamplerSelect",
   "RandomNoise",
-  // Video and audio I/O.
+  // Video and audio output.
   "CreateVideo",
   "SaveVideo",
   "SaveAudio",
-  "LoadVideo",
-  "GetVideoComponents",
-  "Video Slice",
   // Utility nodes the stock H3 templates wire in.
   "ResolutionSelector",
   "GetImageSize",
@@ -248,6 +245,9 @@ export function createApp() {
       res.status(401).send("Workspace link used, expired, or access revoked");
       return;
     }
+    // Placed on entry rather than at enrollment, so students who enrolled before
+    // a starter existed receive it on their next visit.
+    seedStarters({ userId: claims.sub, classId: claims.classId, enrollmentId: claims.enrollmentId } as Session);
     res.setHeader(
       "Set-Cookie",
       `${cookieName}=${raw}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${env.SESSION_TTL_HOURS * 3600}${env.COMFY_PUBLIC_URL.startsWith("https:") ? "; Secure" : ""}`

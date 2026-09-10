@@ -173,6 +173,37 @@ The management dashboard issues a signed, 60-second workspace ticket tied to use
 
 The managed endpoints include `/prompt`, `/ws`, `/queue`, `/interrupt`, `/history`, `/view`, `/upload/image`, `/object_info`, `/system_stats`, `/settings`, `/userdata`, and `/v2/userdata` (also under `/api/` where applicable). Arbitrary extension APIs, upload-mask editing, and worker-global history deletion are not exposed. Frontend builds that require additional APIs need an explicitly authorized adapter, not transparent fallback proxying. Do not reuse one browser profile for different students; browser-local caches/extensions are outside server-side isolation.
 
+## Starter workflows
+
+ComfyUI's own template browser is not proxied. Unblocking it would show students a gallery that is mostly broken on this
+deployment: most stock templates reference models that were never downloaded, and every `api_minimax_h3_*` template is
+built on cloud API nodes the allowlist denies. Instead, `apps/gateway/src/starters/` holds a curated set that is written
+into each student's workspace under `workflows/` the first time they open it. Existing students pick up new starters on
+their next visit, so distributing one never requires recreating a class.
+
+A student who deletes or edits a starter keeps that decision: the `__starters__` marker records each path once placed,
+and seeding never rewrites a path it has already offered. Bump `VERSION` in `apps/gateway/src/starters/index.ts` to push
+a revision to everyone.
+
+The Flux image starter is hand-authored. The MiniMax-H3 video starter is generated from the template installed alongside
+the running ComfyUI, because it is a subgraph workflow whose serialization tracks the frontend and a stale hand-copy
+fails in the student's editor rather than at build time. Regenerate it on the GPU host after a ComfyUI upgrade, then
+commit the result:
+
+```bash
+scripts/build-starters.py            # defaults to /opt/comfyui
+git diff --stat apps/gateway/src/starters/
+```
+
+The script repoints the template at the weights `deploy/models/minimax-h3.json` actually fetches, enables the turbo LoRA
+(8 sampling steps rather than roughly 20), drops the template's note cards, and then verifies every node type in both
+starters against a live worker's `/object_info` and against `COMFY_ALLOWED_NODES`. A starter referencing a blocked or
+absent node fails at submit time with an error a student cannot act on, so that check gates the commit.
+
+H3 constrains video length to the model's block grid: valid frame counts are `17k + 5`, so 5, 22, 39, 56, 73, and so on.
+The starter asks for 2 seconds and the graph's math node snaps that to 56 frames at 24fps. A student who wires a length
+in by hand needs to respect the same grid.
+
 ## Completion, recovery and auditing
 
 The scheduler records `QUEUED → DISPATCHING → RUNNING → COMPLETED/FAILED/CANCELLED/LOST`. Completion requires terminal worker history; polling timeout never means success. Running jobs can reconnect to their recorded worker/prompt after gateway restart. If the gateway crashes between dispatch and saving the worker prompt ID, the job becomes `LOST` and is **not automatically resubmitted**: the worker may already be executing it. Inspect its queue before manually retrying. No distributed system can promise exactly-once execution against an upstream without idempotent submission.

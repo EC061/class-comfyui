@@ -1,6 +1,12 @@
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { getDb, activeMembership, type Session, type UserData } from "@class-comfyui/database";
+// Internal rows that live in the same table as the student's files but are not
+// files: the settings blob and the starter-seeding marker.
+const RESERVED = ["__settings__", "__starters__"];
+function reserved(p: string) {
+  return RESERVED.includes(p);
+}
 function validPath(p: string) {
   return (
     p.length > 0 &&
@@ -47,7 +53,7 @@ export function installUserData(app: express.Express) {
     }
     const prefix = dir ? dir + "/" : "";
     const results = files(res.locals.session)
-      .filter((v) => v.path !== "__settings__" && v.path.startsWith(prefix))
+      .filter((v) => !reserved(v.path) && v.path.startsWith(prefix))
       .map((v) => ({ row: v, relative: v.path.slice(prefix.length) }))
       .filter((v) => req.query.recurse === "true" || !v.relative.includes("/"));
     res.json(
@@ -69,7 +75,7 @@ export function installUserData(app: express.Express) {
     const prefix = dir ? dir + "/" : "",
       directories = new Set<string>(),
       result: Record<string, unknown>[] = [];
-    for (const row of files(res.locals.session).filter((v) => v.path !== "__settings__" && v.path.startsWith(prefix))) {
+    for (const row of files(res.locals.session).filter((v) => !reserved(v.path) && v.path.startsWith(prefix))) {
       const pieces = row.path.split("/");
       for (let i = 1; i < pieces.length; i++) {
         const folder = pieces.slice(0, i).join("/");
@@ -87,7 +93,7 @@ export function installUserData(app: express.Express) {
   app.post("/userdata/:source/move/:dest", (req, res) => {
     const s = res.locals.session as Session,
       { source, dest } = req.params;
-    if (!validPath(source) || !validPath(dest) || source === "__settings__" || dest === "__settings__") {
+    if (!validPath(source) || !validPath(dest) || reserved(source) || reserved(dest)) {
       res.status(400).json({ error: "Invalid path" });
       return;
     }
@@ -113,7 +119,7 @@ export function installUserData(app: express.Express) {
   app.all("/userdata/*", express.text({ type: "*/*", limit: "5mb" }), (req, res) => {
     const s = res.locals.session as Session,
       p = String((req.params as Record<string, string>)[0]);
-    if (!validPath(p) || p === "__settings__") {
+    if (!validPath(p) || reserved(p)) {
       res.status(400).json({ error: "Invalid path" });
       return;
     }

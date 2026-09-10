@@ -11,7 +11,9 @@
     "target": "ES2022",
     "strict": true,
     "skipLibCheck": true,
-    "esModuleInterop": true
+    "esModuleInterop": true,
+    // The starter workflows are committed JSON, imported and bundled by esbuild.
+    "resolveJsonModule": true
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist"]
