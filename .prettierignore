@@ -6,3 +6,5 @@ data/
 test-results/
 playwright-report/
 pnpm-lock.yaml
+# Generated from the installed ComfyUI template by scripts/build-starters.py.
+apps/gateway/src/starters/video-minimax-h3.json

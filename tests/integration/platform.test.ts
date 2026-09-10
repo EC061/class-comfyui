@@ -359,7 +359,14 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     expect((await (await api("/jobs", undefined, alice)).json()).jobs.map((j: any) => j.id)).toEqual([aid]);
     await gw("/userdata/workflows/test.json", { nodes: ["alice"] }, ga);
     const listing = await (await gw("/api/userdata?dir=workflows&recurse=true&full_info=true", undefined, ga)).json();
-    expect(listing[0].path).toBe("test.json");
+    const paths = listing.map((v: any) => v.path);
+    expect(paths).toContain("test.json");
+    // Starter workflows are seeded on workspace entry, so the directory is not
+    // empty for a student who has never saved anything.
+    expect(paths).toContain("1 - Image (Flux).json");
+    // The seeding marker shares the user_data table with the student's files but
+    // must never surface as one.
+    expect(await (await gw("/api/userdata?recurse=true", undefined, ga)).json()).not.toContain("__starters__");
     const settings = await fetch(gatewayUrl + "/api/settings/theme", {
       method: "POST",
       headers: { Cookie: ga, Origin: process.env.COMFY_PUBLIC_URL! },
