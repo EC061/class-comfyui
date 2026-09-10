@@ -97,6 +97,42 @@ const coreNodes = [
   "ModelSamplingFlux",
   "EmptySD3LatentImage",
   "SaveAnimatedWEBP",
+  // MiniMax-H3 video+audio, running on the lab's own weights. The ComfyCloud*
+  // and Minimax*Node variants are deliberately absent: identical names, but they
+  // POST student prompts and images to a paid third-party API.
+  "MiniMaxH3ImageToVideo",
+  "MiniMaxH3ReferenceToVideo",
+  "MiniMaxH3AddGuide",
+  "MiniMaxH3SigmaShift",
+  "MiniMaxH3FunControlNetApply",
+  "EmptyMiniMaxH3LatentAV",
+  "VAEDecodeAudio",
+  "ModelPatchLoader",
+  // H3 graphs sample through SamplerCustomAdvanced rather than KSampler.
+  "SamplerCustomAdvanced",
+  "BasicGuider",
+  "BasicScheduler",
+  "KSamplerSelect",
+  "RandomNoise",
+  // Video and audio I/O.
+  "CreateVideo",
+  "SaveVideo",
+  "SaveAudio",
+  "LoadVideo",
+  "GetVideoComponents",
+  "Video Slice",
+  // Utility nodes the stock H3 templates wire in.
+  "ResolutionSelector",
+  "GetImageSize",
+  "ImageScaleToTotalPixels",
+  "ComfyMathExpression",
+  "ComfySwitchNode",
+  "PrimitiveInt",
+  "PrimitiveFloat",
+  "PrimitiveBoolean",
+  "PrimitiveString",
+  "PrimitiveStringMultiline",
+  "MarkdownNote",
 ];
 function approvedNodes() {
   return new Set(
