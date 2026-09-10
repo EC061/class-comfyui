@@ -132,7 +132,6 @@ const coreNodes = [
   "PrimitiveBoolean",
   "PrimitiveString",
   "PrimitiveStringMultiline",
-  "MarkdownNote",
 ];
 function approvedNodes() {
   return new Set(
