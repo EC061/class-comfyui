@@ -96,9 +96,14 @@ function prune<T extends Record<string, unknown>>(job: T) {
 }
 
 function serialize(job: Job) {
+  // The worker reads workflow_id from extra_data.extra_pnginfo.workflow.id. We
+  // store that same object as workflowJson and keep extraData empty, so its id is
+  // the identical value. create_time deliberately differs: the worker takes the
+  // browser's extra_data.create_time, while submittedAt is server-set, so a
+  // student cannot reorder their own job list by editing a request.
   const created = Date.parse(job.submittedAt),
-    workflowId = (job.extraData?.workflow_id ??
-      (job.extraData?.extra_pnginfo as { workflow?: { id?: string } } | undefined)?.workflow?.id) as string | undefined;
+    rawId = (job.workflowJson as { id?: unknown } | null)?.id,
+    workflowId = typeof rawId === "string" ? rawId : undefined;
   // A queued job has no execution timestamps and no outputs, exactly as the
   // worker's normalize_queue_item reports it.
   if (!["COMPLETED", "FAILED", "CANCELLED", "LOST"].includes(job.status))

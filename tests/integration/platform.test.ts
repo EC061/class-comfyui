@@ -120,7 +120,7 @@ const prompt = {
     "1": { class_type: "SaveImage", inputs: { filename_prefix: "../../other-user", images: ["2", 0] } },
     "2": { class_type: "EmptyLatentImage", inputs: {} },
   },
-  extra_data: { extra_pnginfo: { workflow: { nodes: [{ id: 1 }] } } },
+  extra_data: { extra_pnginfo: { workflow: { id: "wf-integration", nodes: [{ id: 1 }] } } },
 };
 async function waitFor<T>(fn: () => T | Promise<T>, check: (v: T) => boolean, ms = 15000) {
   const until = Date.now() + ms;
@@ -400,6 +400,12 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     expect(mine.jobs[0]).not.toHaveProperty("created_at");
     expect(mine.jobs[0]).not.toHaveProperty("execution_duration");
     expect(typeof mine.jobs[0].outputs_count).toBe("number");
+    // workflow_id is the submitted graph's own id, and filtering on it stays
+    // inside the student's own jobs.
+    expect(mine.jobs[0].workflow_id).toBe("wf-integration");
+    const filtered = await (await gw("/jobs?workflow_id=wf-integration", undefined, ga)).json();
+    expect(filtered.jobs.map((j: any) => j.id)).toEqual([aid]);
+    expect((await (await gw("/jobs?workflow_id=other", undefined, ga)).json()).pagination.total).toBe(0);
     expect(mine.pagination).toEqual({ offset: 0, limit: 64, total: 1, has_more: false });
     expect(["pending", "in_progress", "completed", "failed", "cancelled"]).toContain(mine.jobs[0].status);
     const theirs = await (await gw("/jobs", undefined, gb)).json();
