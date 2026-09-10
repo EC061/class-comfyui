@@ -30,13 +30,13 @@ apps/web/                 Next.js 16 App Router, management APIs and UI
 apps/gateway/src/         authenticated HTTP/WebSocket gateway
   scheduler.ts            durable fair scheduling, capacity, recovery
   storage.ts              streaming output archival and input staging
-packages/database/src/    typed SQLite repository, migration, seed, backup
+packages/database/src/    typed SQLite repository, migration, seed, backup, worker registration
 packages/auth/src/        token cryptography and CSV parsing/reconciliation
 packages/config/src/      validated canonical URLs and limits
 packages/shared/src/      shared schemas and security helpers
 tests/integration/        real APIs + SQLite + SMTP + mock worker tests
 tests/e2e/                Playwright against production application builds
-scripts/                  runtime entrypoint and disposable test services
+scripts/                  runtime entrypoint, GPU worker provisioning, test services
 ```
 
 ## Ports
@@ -222,6 +222,65 @@ Upgrade by backing up, selecting a pinned release tag in the Compose image ancho
 
 `docker.yml` uses Buildx to build native `linux/amd64` from the same Dockerfile and publishes `ghcr.io/<owner>/<repo>`. There is deliberately no arm64/QEMU leg: emulation made every publish take 12+ minutes for hardware this stack does not deploy to. Main/default-branch updates publish `latest` and `sha-…`; `v1.2.3` pushes publish `v1`, `v1.2`, and `v1.2.3`. PR builds do not push. Automatic metadata `latest` on release tags is disabled. Enable Actions package-write permissions and grant deployment hosts GHCR read access for private images. This repository does not claim an image is published until the workflow succeeds.
 
+## GPU workers
+
+ComfyUI is **not** installed or configured by the application image, which contains no
+Python and no CUDA. The gateway is an access-control and scheduling layer in front of
+ComfyUI instances you run yourself, reached over plain HTTP, on this host or others.
+That boundary is deliberate: custom nodes are arbitrary Python that a gateway cannot
+sandbox, models are large and license-encumbered, and driver/CUDA builds are host-specific.
+
+`scripts/setup-comfyui.sh` automates the mechanical part on an NVIDIA host. It detects
+every GPU, installs ComfyUI with [uv](https://docs.astral.sh/uv/), and runs **one instance
+per GPU** — ComfyUI does not split a single job across cards, so one process per GPU is
+what yields real concurrency:
+
+```bash
+scripts/setup-comfyui.sh --dry-run   # inspect the plan, change nothing
+scripts/setup-comfyui.sh
+```
+
+It detects GPU model, VRAM and architecture; picks the PyTorch wheel from the driver
+version; assigns ports from `--base-port` (8188 by default); gives each instance its own
+output and temp directory so concurrent jobs cannot collide on filenames; installs a
+`comfyui@.service` systemd template with one environment file per GPU; and writes a worker
+manifest to `deploy/comfyui/workers.json`. Re-running updates the checkout and units
+without disturbing running instances. `--gpus`, `--dir`, `--host` and `--bind` override
+the detected values; `--no-systemd` installs without creating services.
+
+It deliberately does **not** download models or change firewall rules, and it prints the
+commands for both.
+
+### Registering workers
+
+The manifest loads into the database without an admin browser session:
+
+```bash
+docker compose run --rm -v "$PWD/deploy/comfyui/workers.json":/tmp/workers.json:ro migrate workers /tmp/workers.json
+```
+
+Registration is idempotent on `baseUrl`: re-running an unchanged manifest is a no-op, and a
+changed one updates in place. Worker identity, health status, cached node metadata and
+assignment history belong to the gateway and are never reset by a re-run. Each write is
+audited with a null actor, marking it a host operation rather than an administrator's
+action. The same URL rules as the admin API apply — a plain `http://` origin with no path,
+credentials or query.
+
+Workers can equally be added through **Admin → Workers**; the manifest path exists so a
+freshly imaged GPU host needs no clicking. Health is polled every second, so a correctly
+registered instance turns `ONLINE` almost immediately.
+
+### After provisioning
+
+Install at least one checkpoint under `<comfy-dir>/models/checkpoints/`. Instances report
+healthy with no models present, because `/system_stats` and `/queue` answer regardless, but
+jobs fail without one — `COMFY_ALLOWED_NODES` leads with `CheckpointLoaderSimple`.
+
+ComfyUI has no authentication of its own and reads and writes the filesystem, so restrict
+its ports to the gateway host. The systemd unit applies `NoNewPrivileges`, `PrivateTmp`,
+`ProtectSystem=full` and `ProtectHome=read-only`, which reduce blast radius but are not a
+sandbox: treat any host running custom nodes as capable of executing arbitrary code.
+
 ## FRP, TLS and the remote reverse proxy
 
 FRPC, FRPS and the reverse proxy are **external to this repository**. No FRP client, proxy configuration or example ships here and Compose never starts one. This stack serves plain HTTP on two ports and never terminates TLS. Because there is no local proxy, **the remote reverse proxy is a required part of the security model**, not just a router.
@@ -304,7 +363,8 @@ Open `http://localhost:8080` and Mailpit at `http://localhost:8025`. The gateway
 
 ## Final real-server verification
 
-On each GPU server, use your existing pinned ComfyUI installation with reviewed nodes/models:
+On each GPU server, use a ComfyUI installation with reviewed nodes/models — either your
+own, or one provisioned by `scripts/setup-comfyui.sh` (see **GPU workers** above):
 
 ```bash
 # Run in the GPU server's ComfyUI virtual environment.

@@ -21,3 +21,6 @@ coverage
 # never overwrites the deployed node's configuration.
 /docker-compose.yml
 !docker-compose.example.yml
+
+# Generated per-host by scripts/setup-comfyui.sh (addresses vary by machine).
+/deploy/comfyui/workers.json

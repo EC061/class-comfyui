@@ -5,10 +5,11 @@
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
-    "build": "esbuild src/migrate.ts src/seed.ts src/backup.ts --bundle --platform=node --format=cjs --outdir=dist --out-extension:.js=.cjs",
+    "build": "esbuild src/migrate.ts src/seed.ts src/backup.ts src/workers.ts --bundle --platform=node --format=cjs --outdir=dist --out-extension:.js=.cjs",
     "migrate": "tsx src/migrate.ts",
     "seed": "tsx src/seed.ts",
-    "backup": "tsx src/backup.ts"
+    "backup": "tsx src/backup.ts",
+    "workers": "tsx src/workers.ts"
   },
   "dependencies": {},
   "devDependencies": {
