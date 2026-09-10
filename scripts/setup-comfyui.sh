@@ -152,6 +152,19 @@ else
   run git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
 fi
 
+# Models and a torch venv on NFS/SMB are slow to load and make systemd mount
+# namespacing unreliable. Warn loudly rather than silently producing a slow rig.
+probe="$COMFY_DIR"
+while [ ! -e "$probe" ] && [ "$probe" != "/" ]; do probe="$(dirname "$probe")"; done
+FSTYPE="$(stat -f -c %T "$probe" 2>/dev/null || echo unknown)"
+case "$FSTYPE" in
+  nfs* | smb* | cifs* | fuse.sshfs | 9p)
+    warn "$COMFY_DIR is on a $FSTYPE filesystem."
+    warn "Model loading will be slow and systemd sandboxing may fail. Prefer local disk:"
+    warn "  scripts/setup-comfyui.sh --dir /opt/comfyui"
+    ;;
+esac
+
 log "Creating virtualenv and installing PyTorch ($CUDA_TAG)"
 run uv venv --python 3.12 "$COMFY_DIR/.venv"
 PY="$COMFY_DIR/.venv/bin/python"
@@ -165,6 +178,13 @@ run uv pip install --python "$PY" -r "$COMFY_DIR/requirements.txt"
 UNIT=/etc/systemd/system/comfyui@.service
 ENV_DIR=/etc/comfyui
 SERVICE_USER="$(id -un)"
+
+# ProtectHome=read-only would make a checkout under /home unwritable, and it is a
+# no-op for the sandbox when the checkout is the thing being protected from.
+case "$COMFY_DIR" in
+  /home/* | /root/*) PROTECT_HOME="# ProtectHome omitted: checkout lives under $COMFY_DIR" ;;
+  *) PROTECT_HOME="ProtectHome=read-only" ;;
+esac
 
 if [ "$USE_SYSTEMD" = 1 ]; then
   log "Installing systemd template unit $UNIT"
@@ -189,7 +209,7 @@ RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ProtectHome=read-only
+$PROTECT_HOME
 ReadWritePaths=$COMFY_DIR
 
 [Install]

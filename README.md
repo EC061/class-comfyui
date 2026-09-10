@@ -240,6 +240,15 @@ scripts/setup-comfyui.sh --dry-run   # inspect the plan, change nothing
 scripts/setup-comfyui.sh
 ```
 
+Install to **local disk**, not an NFS home directory — model loading is slow over the
+network and systemd's mount namespacing is unreliable there. The script warns if it
+detects one, and omits `ProtectHome` when the checkout lives under `/home`:
+
+```bash
+sudo mkdir -p /opt/comfyui && sudo chown "$(id -u):$(id -g)" /opt/comfyui
+scripts/setup-comfyui.sh --dir /opt/comfyui
+```
+
 It detects GPU model, VRAM and architecture; picks the PyTorch wheel from the driver
 version; assigns ports from `--base-port` (8188 by default); gives each instance its own
 output and temp directory so concurrent jobs cannot collide on filenames; installs a
