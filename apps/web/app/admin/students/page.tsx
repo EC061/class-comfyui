@@ -25,7 +25,10 @@ export default function StudentsPage() {
   }
   return (
     <div className="card">
-      <h1 className="text-xl font-bold">Students</h1>
+      <h1 className="text-xl font-bold">People</h1>
+      <p className="mt-1 text-sm text-slate-600">
+        PENDING accounts have chosen a password but have not confirmed their email address yet.
+      </p>
       {error && <p role="alert">{error}</p>}
       <div className="mt-2 flex gap-2">
         <input className="input" placeholder="Search…" value={q} onChange={(e) => setQ(e.target.value)} />
@@ -53,12 +56,19 @@ export default function StudentsPage() {
               <td>{u.globalRole}</td>
               <td>{u.status}</td>
               <td className="flex gap-1">
-                <button
-                  className="btn-secondary"
-                  onClick={() => setStatus(u.id, u.status === "ACTIVE" ? "DISABLED" : "ACTIVE")}
-                >
-                  {u.status === "ACTIVE" ? "Disable" : "Enable"}
-                </button>
+                {u.status === "PENDING" ? (
+                  // Only its owner can confirm the address, so there is nothing to enable.
+                  <button className="btn-secondary" onClick={() => setStatus(u.id, "DISABLED")}>
+                    Block
+                  </button>
+                ) : (
+                  <button
+                    className="btn-secondary"
+                    onClick={() => setStatus(u.id, u.status === "ACTIVE" ? "DISABLED" : "ACTIVE")}
+                  >
+                    {u.status === "ACTIVE" ? "Disable" : "Enable"}
+                  </button>
+                )}
               </td>
             </tr>
           ))}

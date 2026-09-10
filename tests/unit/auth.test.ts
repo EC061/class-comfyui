@@ -6,6 +6,9 @@ import {
   signWorkspaceToken,
   verifyWorkspaceToken,
   checkAdminCode,
+  hashPassword,
+  verifyPassword,
+  hasPassword,
 } from "@class-comfyui/auth";
 
 describe("auth primitives", () => {
@@ -34,5 +37,22 @@ describe("auth primitives", () => {
     expect(checkAdminCode("correct-horse", "correct-horse")).toBe(true);
     expect(checkAdminCode("wrong", "correct-horse")).toBe(false);
     expect(checkAdminCode("", "correct-horse")).toBe(false);
+  });
+
+  it("password hashes are salted, verifiable, and unusable when absent or malformed", async () => {
+    const password = "correct-horse-battery-staple";
+    const a = await hashPassword(password),
+      b = await hashPassword(password);
+    expect(a).not.toBe(b); // per-hash salt
+    expect(a).toMatch(/^scrypt\$32768\$8\$1\$[\w-]+\$[\w-]+$/);
+    expect(a).not.toContain(password);
+    expect(await verifyPassword(password, a)).toBe(true);
+    expect(await verifyPassword(password + "!", a)).toBe(false);
+    expect(await verifyPassword("", a)).toBe(false);
+    // An account with no password, or a corrupted record, never authenticates.
+    for (const stored of ["", "not-a-hash", "scrypt$1$1$1$aaaa$bbbb", a.replace("32768", "8")])
+      expect(await verifyPassword(password, stored)).toBe(false);
+    expect(hasPassword(a)).toBe(true);
+    for (const stored of ["", undefined, null, "plaintext"]) expect(hasPassword(stored)).toBe(false);
   });
 });

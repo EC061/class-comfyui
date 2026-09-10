@@ -1,5 +1,6 @@
 "use client";
 import { use, useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Jobs } from "@/components/jobs";
 
 type Tab = "Overview" | "Roster" | "Signup" | "Jobs" | "Outputs" | "Activity" | "Settings";
@@ -420,7 +421,15 @@ function SettingsTab({
   cls,
   reload,
 }: {
-  cls: { id: string; name: string; active: boolean; courseCode?: string; term?: string; description?: string };
+  cls: {
+    id: string;
+    name: string;
+    slug: string;
+    active: boolean;
+    courseCode?: string;
+    term?: string;
+    description?: string;
+  };
   reload: () => void;
 }) {
   const [name, setName] = useState(cls.name),
@@ -482,7 +491,72 @@ function SettingsTab({
       <button className="btn-secondary" onClick={toggle}>
         {cls.active ? "Archive class" : "Reactivate class"}
       </button>
+      <p className="mt-1 text-xs text-slate-500">
+        Archiving keeps every record and revokes workspace access. Nothing is erased.
+      </p>
       <p role="status">{message}</p>
+      <DangerZone cls={cls} />
+    </div>
+  );
+}
+
+/** Permanent deletion. Separated, and gated on typing the slug, because it erases student work. */
+function DangerZone({ cls }: { cls: { id: string; name: string; slug: string } }) {
+  const router = useRouter();
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  async function destroy() {
+    setError("");
+    setBusy(true);
+    const r = await fetch("/api/admin/classes/" + cls.id, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm }),
+    });
+    const j = await r.json().catch(() => ({}));
+    setBusy(false);
+    if (!r.ok) {
+      setError(j.error ?? "Deletion failed");
+      return;
+    }
+    if (j.failures?.length) {
+      setError(j.message);
+      return;
+    }
+    router.push("/admin/classes");
+  }
+  return (
+    <div className="mt-6 rounded-lg border border-red-300 bg-red-50 p-4">
+      <h3 className="font-bold text-red-800">Delete this class permanently</h3>
+      <p className="mt-1 text-sm text-red-800">
+        Erases the roster, every job and archived output, every uploaded input, every saved workflow and setting, this
+        class&apos;s activity records, and all of its files on disk. This cannot be undone and no backup is made. Jobs
+        must not be queued or running.
+      </p>
+      <label className="label mt-3" htmlFor="confirm-slug">
+        Type <span className="font-mono">{cls.slug}</span> to confirm
+      </label>
+      <input
+        id="confirm-slug"
+        className="input max-w-sm"
+        value={confirm}
+        onChange={(e) => setConfirm(e.target.value)}
+        placeholder={cls.slug}
+        autoComplete="off"
+      />
+      <button
+        className="btn mt-3 bg-red-700 hover:bg-red-800 disabled:opacity-50"
+        disabled={busy || confirm !== cls.slug}
+        onClick={destroy}
+      >
+        {busy ? "Deleting…" : "Delete class and all data"}
+      </button>
+      {error && (
+        <p role="alert" className="mt-2 text-sm font-medium text-red-800">
+          {error}
+        </p>
+      )}
     </div>
   );
 }
