@@ -16,6 +16,7 @@ import { Scheduler } from "./scheduler";
 import { workerFetch } from "./storage";
 import { installUserData, saveUserData } from "./userdata";
 import { seedStarters } from "./starters";
+import { installTemplates } from "./templates";
 const cookieName = "comfy_gateway";
 function cookie(header: string | undefined) {
   return header
@@ -186,6 +187,38 @@ function allowedFile(base: string, file: string) {
   const resolved = path.resolve(file);
   return resolved.startsWith(path.resolve(base) + path.sep) ? resolved : undefined;
 }
+// Forward a vetted path to the metadata worker verbatim. Callers decide what is
+// vetted; this only moves bytes.
+async function proxyWorkerFile(req: express.Request, res: express.Response) {
+  const worker = metadataWorker();
+  if (!worker) {
+    res.status(503).send("No healthy worker available");
+    return;
+  }
+  const response = await workerFetch(worker, req.path);
+  res.status(response.status);
+  if (response.headers.has("content-type")) res.setHeader("Content-Type", response.headers.get("content-type")!);
+  if (!response.body) {
+    res.end();
+    return;
+  }
+  await pipeline(Readable.fromWeb(response.body as any), res);
+}
+// Static frontend files the browser fetches without credentials, which the
+// session gate below would answer with 401 or a JSON error body. The PWA
+// manifest is fetched by <link rel="manifest">, which omits cookies; the
+// icon-font stylesheet and its fonts are pulled in from the manifest's own
+// document. Serving a JSON 404 for a .css request also trips strict MIME
+// checking in the browser, so these must resolve or not be requested at all.
+// All of it is public ComfyUI frontend build output, carrying no student data.
+function publicAsset(p: string) {
+  return (
+    !p.split("/").includes("..") &&
+    (/^\/(assets\/)?manifest-[A-Za-z0-9_-]+\.json$/.test(p) ||
+      /^\/[A-Za-z0-9_.-]+\.(css|woff2?|ttf|eot|ico|png|svg|webp)$/.test(p) ||
+      /^\/(assets|fonts)\/[A-Za-z0-9_.@-]+\.(css|woff2?|ttf|eot|ico|png|svg|webp)$/.test(p))
+  );
+}
 export function createApp() {
   const app = express();
   app.disable("x-powered-by");
@@ -253,6 +286,13 @@ export function createApp() {
       `${cookieName}=${raw}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${env.SESSION_TTL_HOURS * 3600}${env.COMFY_PUBLIC_URL.startsWith("https:") ? "; Secure" : ""}`
     );
     res.redirect(303, "/");
+  });
+  app.get("*", (req, res, next) => {
+    if (!publicAsset(req.path)) {
+      next();
+      return;
+    }
+    proxyWorkerFile(req, res).catch(next);
   });
   app.use((req, res, next) => {
     const s = session(req);
@@ -566,6 +606,7 @@ export function createApp() {
     res.json({});
   });
   installUserData(app);
+  installTemplates(app, proxyWorkerFile);
   // Public frontend assets and read-only model catalogs only. Worker-global APIs,
   // custom extension APIs, filesystem routes, manager/install and arbitrary mutations
   // are deliberately not proxied. Add vetted APIs explicitly with owner checks.
@@ -585,19 +626,7 @@ export function createApp() {
         res.status(404).json({ error: "Unsupported or private worker endpoint" });
         return;
       }
-      const worker = metadataWorker();
-      if (!worker) {
-        res.status(503).send("No healthy worker available");
-        return;
-      }
-      const response = await workerFetch(worker, req.path);
-      res.status(response.status);
-      if (response.headers.has("content-type")) res.setHeader("Content-Type", response.headers.get("content-type")!);
-      if (!response.body) {
-        res.end();
-        return;
-      }
-      await pipeline(Readable.fromWeb(response.body as any), res);
+      await proxyWorkerFile(req, res);
     } catch (e) {
       next(e);
     }

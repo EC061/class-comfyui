@@ -197,11 +197,16 @@ The managed endpoints include `/prompt`, `/ws`, `/queue`, `/interrupt`, `/histor
 
 ## Starter workflows
 
-ComfyUI's own template browser is not proxied. Unblocking it would show students a gallery that is mostly broken on this
-deployment: most stock templates reference models that were never downloaded, and every `api_minimax_h3_*` template is
-built on cloud API nodes the allowlist denies. Instead, `apps/gateway/src/starters/` holds a curated set that is written
-into each student's workspace under `workflows/` the first time they open it. Existing students pick up new starters on
-their next visit, so distributing one never requires recreating a class.
+`apps/gateway/src/starters/` holds a curated set that reaches students two ways: it is written into each student's
+workspace under `workflows/` the first time they open it, and it is the entire contents of the template browser. Existing
+students pick up new starters on their next visit, so distributing one never requires recreating a class.
+
+The worker's own template index is never proxied. Serving it would show students a gallery of 559 entries that is almost
+entirely broken on this deployment: most stock templates reference models that were never downloaded, and every
+`api_minimax_h3_*` template is built on cloud API nodes the allowlist denies. `apps/gateway/src/templates.ts` answers
+`/templates/index.json` from the curated list instead, and serves a graph only for a curated `name`; a request for a
+stock template's graph is a 404. Only static media (thumbnails, the model-filter logos in `index_logo.json`) is
+forwarded to the worker.
 
 A student who deletes or edits a starter keeps that decision: the `__starters__` marker records each path once placed,
 and seeding never rewrites a path it has already offered. Bump `VERSION` in `apps/gateway/src/starters/index.ts` to push

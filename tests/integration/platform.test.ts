@@ -403,6 +403,18 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     // The seeding marker shares the user_data table with the student's files but
     // must never surface as one.
     expect(await (await gw("/api/userdata?recurse=true", undefined, ga)).json()).not.toContain("__starters__");
+    // The template browser reads its own index. It lists the curated starters
+    // and nothing else: a stock graph would open in the editor and then fail at
+    // submit time on a missing model or a denied node.
+    const templates = await (await gw("/templates/index.json", undefined, ga)).json();
+    const names = templates.flatMap((c: any) => c.templates.map((t: any) => t.name));
+    expect(names).toEqual(["class_image_flux", "class_video_minimax_h3"]);
+    const graph = await gw("/templates/class_image_flux.json", undefined, ga);
+    expect(graph.status).toBe(200);
+    expect((await graph.json()).nodes.length).toBeGreaterThan(0);
+    expect((await gw("/templates/image_z_image_turbo.json", undefined, ga)).status).toBe(404);
+    expect(await (await gw("/api/workflow_templates", undefined, ga)).json()).toEqual({});
+    expect((await gw("/templates/index.json")).status).toBe(401);
     const settings = await fetch(gatewayUrl + "/api/settings/theme", {
       method: "POST",
       headers: { Cookie: ga, Origin: process.env.COMFY_PUBLIC_URL! },

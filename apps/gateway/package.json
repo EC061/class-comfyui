@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json --noEmit && esbuild src/index.ts --bundle --platform=node --format=cjs --outfile=dist/index.cjs",
-    "start": "node dist/index.mjs"
+    "start": "node dist/index.cjs"
   },
   "dependencies": {
     "@class-comfyui/auth": "workspace:*",
