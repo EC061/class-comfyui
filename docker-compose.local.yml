@@ -13,21 +13,20 @@ x-local: &local
   SMTP_PORT: "1025"
   SMTP_PASSWORD: ""
 services:
-  nginx:
-    environment:
-      # Authority including the non-default local port, matching the URLs above.
-      PUBLIC_HOST: "localhost:8080"
-      COMFY_HOST: "comfy.localhost:8090"
-      PUBLIC_SCHEME: "http"
-      COMFY_SCHEME: "http"
   web:
     image: class-comfyui:local
     build: .
+    # Development secrets are public, so never expose this stack beyond loopback.
+    # `!override` replaces the base list instead of appending to it (Compose 2.24+).
+    ports: !override
+      - "127.0.0.1:8080:3000"
     environment:
       <<: *local
   gateway:
     image: class-comfyui:local
     build: .
+    ports: !override
+      - "127.0.0.1:8090:8081"
     environment:
       <<: *local
   migrate:

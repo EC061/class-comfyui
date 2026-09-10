@@ -6,15 +6,15 @@ A self-hosted classroom management application and authenticated execution gatew
 
 ```text
 Internet HTTPS
-  -> remote reverse proxy (TLS for both hostnames)
-     -> external FRPS -> external FRPC, two plain-TCP tunnels
-        -> 127.0.0.1:8080 nginx --- Next.js  (comfy-admin hostname)
-           127.0.0.1:8090 nginx --- Gateway + scheduler (comfy hostname)
-                                        |             |
-                                        +-- SQLite ---+
-                                            /data
-                                               |
-                                    private ComfyUI GPU workers
+  -> remote reverse proxy: TLS, X-Real-IP, one server block per hostname
+     -> external FRPS -> external FRPC (separate machine), two plain-TCP tunnels
+        -> management-host:8080 --- Next.js (comfy-admin hostname)
+           management-host:8090 --- Gateway + scheduler (comfy hostname)
+                                  |             |
+                                  +-- SQLite ---+
+                                      /data
+                                         |
+                              private ComfyUI GPU workers
 ```
 
 This revision replaces the prototype's disconnected memory stores and unused PostgreSQL/Redis services with **one persistent SQLite database in WAL mode**. Web and gateway run on the **same management host** and mount the same directory. GPU workers can be on other hosts. No Kubernetes or database server is needed.
@@ -34,7 +34,6 @@ packages/database/src/    typed SQLite repository, migration, seed, backup
 packages/auth/src/        token cryptography and CSV parsing/reconciliation
 packages/config/src/      validated canonical URLs and limits
 packages/shared/src/      shared schemas and security helpers
-deploy/nginx/             per-port HTTP routing and WebSocket configuration
 tests/integration/        real APIs + SQLite + SMTP + mock worker tests
 tests/e2e/                Playwright against production application builds
 scripts/                  runtime entrypoint and disposable test services
@@ -44,15 +43,15 @@ scripts/                  runtime entrypoint and disposable test services
 
 | Service                      | Container/internal port                   | Published production port |
 | ---------------------------- | ----------------------------------------- | ------------------------- |
-| nginx, management site       | 8080                                      | **127.0.0.1:8080**        |
-| nginx, gateway site          | 8090                                      | **127.0.0.1:8090**        |
-| Next.js                      | 3000                                      | none                      |
-| Gateway                      | 8081                                      | none                      |
+| Next.js                      | 3000                                      | **0.0.0.0:8080**          |
+| Gateway                      | 8081                                      | **0.0.0.0:8090**          |
 | SQLite                       | filesystem only                           | none                      |
 | ComfyUI worker               | typically 8188 on the private GPU network | never public              |
 | Mailpit, local override only | 1025 SMTP / 8025 UI                       | 127.0.0.1:8025            |
 
-Your external FRPC opens **one plain-TCP tunnel per published port** — 8080 for the management hostname and 8090 for the gateway hostname — so routing is by port, not by `Host`. FRPC is not part of this stack and must not be run from it. FRPC must run on the management host, or otherwise have a deliberately configured private route to these two loopback ports. Firewall each GPU worker so only the gateway host and administrators can reach it.
+Your external FRPC opens **one plain-TCP tunnel per published port** — 8080 for the management hostname and 8090 for the gateway hostname — so routing is by port, not by `Host`. FRPC is not part of this stack and must not be run from it. There is no local reverse proxy: the remote one in front of FRPS is the only proxy, and each application is published directly on its tunnel port.
+
+Because FRPC runs on a **different machine**, both ports bind all interfaces rather than loopback. They carry plain HTTP, terminate no TLS, and **trust the `X-Real-IP` your remote proxy sets**, so they must be reachable **only** from the FRPC host: restrict them with a host firewall, a private network segment, or a Docker network scoped to that host. Anything that can reach them directly can forge a client address and evade IP rate limits. Note that Docker's published ports bypass UFW and firewalld, so write the rule in the iptables `DOCKER-USER` chain. Firewall each GPU worker so only the gateway host and administrators can reach it.
 
 ## Production configuration
 
@@ -71,8 +70,6 @@ Before starting, edit:
 - `image`: your lowercase `ghcr.io/<owner>/<repository>:<tag>` (shared YAML anchor).
 - `PUBLIC_URL`: the exact management origin, e.g. `https://comfy-admin.example.edu`.
 - `COMFY_PUBLIC_URL`: a separate gateway origin, e.g. `https://comfy.example.edu`.
-- nginx `PUBLIC_HOST` and `COMFY_HOST`: the authority of each URL above — hostname, plus a port only when the URL uses a non-default one, and never a scheme or path. nginx rewrites the upstream `Host` header to these values, because a TCP tunnel carries whatever `Host` the remote reverse proxy chose to send.
-- nginx `PUBLIC_SCHEME` and `COMFY_SCHEME`: the scheme of each URL above, normally `https`.
 - `AUTH_SECRET`, `WORKSPACE_JWT_SECRET`, `ADMIN_REGISTRATION_CODE`: three independent random secrets, at least 32 characters each. Placeholder/development secrets prevent production startup.
 - All SMTP fields: host, port, user, password, secure, sender name and sender email.
 - The `./data:/data` bind mount if you want a different **local** storage directory. Keep the same mount in web, gateway and migrate.
@@ -120,7 +117,7 @@ A missing `Origin` is accepted only when **all** of these agree: exact canonical
 
 Cookies are host-only, HttpOnly, SameSite=Lax, and Secure when the corresponding configured URL uses HTTPS. Email GET links display a confirmation page; the challenge is consumed by a protected POST. Account, class, and enrollment eligibility are rechecked before signup verification and every gateway request. Disabling signup does not disable an existing student's normal login. Disabling a user or archiving their enrollment removes workspace access, including established WebSockets.
 
-nginx serves one site per port, overwrites the `Host` and client-IP forwarding headers and does not log URL paths/query strings. Because each tunnel terminates at a single site, a wrong or missing `Host` cannot cross between the management and gateway applications; `Origin` equality, not `Host`, is what enforces CSRF. Both applications strip/ignore forged identity headers. Do not expose the application ports directly. In a shared FRPC/NAT deployment, IP rate limits apply to that shared ingress address; email/account-specific limits apply separately.
+Each tunnel terminates at a single application, so a wrong or missing `Host` cannot cross between the management and gateway sites; `Origin` equality, not `Host`, is what enforces CSRF. Both applications strip/ignore forged identity headers and enforce their own request-body limits, so no local proxy is needed for those. The rate limiter keys on `X-Real-IP`, which only the remote proxy sets — see the FRP section for the server-block requirements, and keep 8080/8090 closed to everything but the FRPC host. In a shared FRPC/NAT deployment, IP rate limits apply to that shared ingress address; email/account-specific limits apply separately.
 
 ## First administrator and SMTP
 
@@ -210,7 +207,7 @@ docker compose run --rm migrate backup /data/backups/lab-backup.sqlite
 For a consistent backup of database plus all files, stop writers first:
 
 ```bash
-docker compose stop nginx web gateway
+docker compose stop web gateway
 tar -czf lab-data-backup.tar.gz data/
 docker compose up -d --wait
 ```
@@ -225,18 +222,57 @@ Upgrade by backing up, selecting a pinned release tag in the Compose image ancho
 
 `docker.yml` uses Buildx to build native `linux/amd64` from the same Dockerfile and publishes `ghcr.io/<owner>/<repo>`. There is deliberately no arm64/QEMU leg: emulation made every publish take 12+ minutes for hardware this stack does not deploy to. Main/default-branch updates publish `latest` and `sha-…`; `v1.2.3` pushes publish `v1`, `v1.2`, and `v1.2.3`. PR builds do not push. Automatic metadata `latest` on release tags is disabled. Enable Actions package-write permissions and grant deployment hosts GHCR read access for private images. This repository does not claim an image is published until the workflow succeeds.
 
-## FRP and TLS
+## FRP, TLS and the remote reverse proxy
 
-FRPC and FRPS are **external to this repository**. No FRP client, configuration or example ships here and Compose never starts one. This stack serves plain HTTP on two loopback ports and never terminates TLS.
+FRPC, FRPS and the reverse proxy are **external to this repository**. No FRP client, proxy configuration or example ships here and Compose never starts one. This stack serves plain HTTP on two ports and never terminates TLS. Because there is no local proxy, **the remote reverse proxy is a required part of the security model**, not just a router.
 
-Configure two plain-TCP proxies in your own FRPC configuration, one per port, and terminate TLS for both hostnames on the reverse proxy in front of FRPS:
+Configure two plain-TCP proxies in your own FRPC configuration, one per port, and terminate TLS for both hostnames remotely:
 
 ```text
-comfy-admin.example.edu  --TLS-->  remote reverse proxy  -->  frps remote port A  ==tcp==>  127.0.0.1:8080
-comfy.example.edu        --TLS-->  remote reverse proxy  -->  frps remote port B  ==tcp==>  127.0.0.1:8090
+comfy-admin.example.edu  --TLS-->  remote reverse proxy  -->  frps remote port A  ==tcp==>  <management-host>:8080
+comfy.example.edu        --TLS-->  remote reverse proxy  -->  frps remote port B  ==tcp==>  <management-host>:8090
 ```
 
-Do not merge the two hostnames onto one tunnel: the tunnels are what separate the two applications. Have the remote reverse proxy forward WebSocket upgrades (`Upgrade`/`Connection`) and allow long-lived connections on the gateway hostname; workspaces stream over WebSockets for the lifetime of a job. Allow at least `MAX_UPLOAD_MB` request bodies on the gateway hostname. Keep FRP tokens and server addresses in your private FRP configuration.
+Do not merge the two hostnames onto one tunnel: the tunnels are what separate the two applications.
+
+### Required per-site configuration
+
+Each of the two remote server blocks must set these. `proxy_set_header` _replaces_ a client-supplied value, which is what makes the first two trustworthy:
+
+```nginx
+proxy_set_header Host              $host;          # preserved end to end
+proxy_set_header X-Real-IP         $remote_addr;   # sole input to IP rate limiting
+proxy_set_header X-Forwarded-Host  "";             # never let a client influence it
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header Upgrade           $http_upgrade;
+proxy_set_header Connection        $http_connection;
+proxy_http_version 1.1;
+```
+
+`$http_connection` forwards the client's own `Connection` header, which is what a browser WebSocket upgrade sends. The stricter `$connection_upgrade` form needs `map $http_upgrade $connection_upgrade { default upgrade; '' close; }` declared in the `http` block; use whichever your proxy already defines.
+
+On the **gateway** hostname additionally disable buffering and allow long-lived connections — workspaces hold a WebSocket for the lifetime of a job, and outputs stream through:
+
+```nginx
+proxy_buffering         off;
+proxy_request_buffering off;
+proxy_read_timeout      3600s;
+proxy_send_timeout      3600s;
+client_max_body_size    100m;   # at least MAX_UPLOAD_MB
+```
+
+If a WAF sits in front of these hostnames, exempt the gateway's WebSocket endpoint and upload paths; inspection that buffers request bodies breaks streaming uploads and long-lived sockets.
+
+### Do not log URLs for these two hostnames
+
+Sign-in, verification and workspace-exchange links carry **secrets in the URL**. A default access log format that includes `"$request"` or `$request_uri` writes those tokens to disk and to stdout, where anyone with log access can replay them. Give both server blocks a log format that omits the path and query:
+
+```nginx
+log_format lab '$remote_addr $server_name $request_method $status $request_time';
+access_log /var/log/nginx/lab-access.log lab;
+```
+
+Keep FRP tokens and server addresses in your private FRP configuration.
 
 ## Local development and verification
 
@@ -291,7 +327,7 @@ Replace the example worker IP. Then repeat both checks through the public hostna
 
 ## Troubleshooting and operational limits
 
-- **403 origin:** check both canonical URLs, `PUBLIC_HOST`/`COMFY_HOST`, scheme/port, and client Origin. Do not disable origin enforcement.
+- **403 origin:** check both canonical URLs, the remote proxy's `Host` forwarding, scheme/port, and client Origin. Do not disable origin enforcement.
 - **Wrong site answers a hostname:** a tunnel points at the wrong loopback port. Port 8080 is the management site, 8090 the gateway.
 - **Startup secret error:** replace all three placeholders with independent secrets of at least 32 characters.
 - **SQLite permission/busy errors:** confirm identical local bind mounts and UID 1000 access; ensure no external process holds a long write transaction. Do not delete an active WAL file.

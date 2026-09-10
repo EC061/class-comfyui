@@ -7,53 +7,28 @@
 # Do not put ./data on NFS, SMB, or a distributed filesystem. Back up with `backup`.
 name: class-comfyui
 services:
-  nginx:
-    image: nginx:stable-alpine
-    restart: unless-stopped
-    # One loopback listener per public hostname. An EXTERNAL frpc (never started
-    # by this stack) opens one plain-TCP tunnel per port to your external frps;
-    # the reverse proxy in front of frps terminates TLS for both hostnames.
-    #   127.0.0.1:8080 -> tcp -> PUBLIC_URL host   (management/admin)
-    #   127.0.0.1:8090 -> tcp -> COMFY_PUBLIC_URL host (gateway/workspace)
-    ports:
-      - "127.0.0.1:8080:8080"
-      - "127.0.0.1:8090:8090"
-    environment:
-      # MUST CHANGE to the authority of each canonical URL: hostname, plus a port
-      # only when the URL carries a non-default one. No scheme, no path.
-      PUBLIC_HOST: "comfy-admin.example.edu"
-      COMFY_HOST: "comfy.example.edu"
-      # Scheme the browser actually uses, i.e. the scheme of the URLs above.
-      PUBLIC_SCHEME: "https"
-      COMFY_SCHEME: "https"
-      NGINX_ENVSUBST_FILTER: "PUBLIC_HOST|COMFY_HOST|PUBLIC_SCHEME|COMFY_SCHEME"
-    volumes:
-      - ./deploy/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
-    depends_on:
-      web:
-        condition: service_healthy
-      gateway:
-        condition: service_healthy
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "wget -q -O /dev/null http://127.0.0.1:8080/api/health && wget -q -O /dev/null http://127.0.0.1:8090/health",
-        ]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
   web:
     # MUST CHANGE to your lowercase GHCR repository path and a published tag.
     image: &app-image ghcr.io/owner/class-comfyui:latest
     command: ["web"]
     restart: unless-stopped
     init: true
+    # An EXTERNAL frpc (never started by this stack) opens one plain-TCP tunnel
+    # per port to your external frps; the reverse proxy in front of frps
+    # terminates TLS and sets the forwarding headers for both hostnames.
+    #   :8080 -> tcp tunnel -> PUBLIC_URL host (management/admin)
+    # Binds ALL interfaces because frpc runs on a different machine. This port
+    # is plain HTTP and TRUSTS the X-Real-IP set by your reverse proxy, so
+    # anything that can reach it can forge a client address and evade IP rate
+    # limits. Restrict it to the frpc host with a host firewall. Docker
+    # publishing bypasses UFW/firewalld: filter in the iptables DOCKER-USER chain.
+    ports:
+      - "0.0.0.0:8080:3000"
     environment: &app-environment
       NODE_ENV: "production"
       # MUST CHANGE: exact, separate browser origins, each served by its own TCP
-      # tunnel and given TLS by the remote reverse proxy. HTTP is for local testing.
+      # tunnel and given TLS by the remote reverse proxy. Every link is built
+      # from these, never from a request header. HTTP is for local testing.
       PUBLIC_URL: "https://comfy-admin.example.edu"
       COMFY_PUBLIC_URL: "https://comfy.example.edu"
       HOSTNAME: "0.0.0.0"
@@ -113,6 +88,10 @@ services:
     command: ["gateway"]
     restart: unless-stopped
     init: true
+    #   :8090 -> tcp tunnel -> COMFY_PUBLIC_URL host (gateway/workspace)
+    # Same firewall requirement as the web port above.
+    ports:
+      - "0.0.0.0:8090:8081"
     # Same named configuration and same database as web; no independent identity store.
     environment:
       <<: *app-environment
