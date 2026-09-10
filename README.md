@@ -53,6 +53,8 @@ Your external FRPC opens **one plain-TCP tunnel per published port** — 8080 fo
 
 Because FRPC runs on a **different machine**, both ports bind all interfaces rather than loopback. They carry plain HTTP, terminate no TLS, and **trust the `X-Real-IP` your remote proxy sets**, so they must be reachable **only** from the FRPC host: restrict them with a host firewall, a private network segment, or a Docker network scoped to that host. Anything that can reach them directly can forge a client address and evade IP rate limits. Note that Docker's published ports bypass UFW and firewalld, so write the rule in the iptables `DOCKER-USER` chain. Firewall each GPU worker so only the gateway host and administrators can reach it.
 
+The Compose default network pins its subnet to `10.254.240.0/24` rather than taking one from Docker's default pool, which allocates `172.17.0.0/16`, `172.18.0.0/16`, and onward in order. A host that also terminates a VPN handing out addresses in that range will route replies to VPN clients into the Docker bridge instead of back over the campus network (`ip route get <client-ip>` resolves to `dev br-... src 172.18.0.1`). Keep the pinned subnet clear of anything the host or its VPN can assign, and note that changing it recreates the network: apply the edit with `docker compose down` then `docker compose up -d --wait`, not `restart`.
+
 ## Production configuration
 
 All deployment configuration lives in `docker-compose.yml`, which is **git-ignored**; the tracked `docker-compose.example.yml` is the template. **No `.env` file is required**. The gateway inherits the web service's complete environment using a YAML anchor, so there is one visible set of configuration values. `docker compose config` expands it.
@@ -197,11 +199,16 @@ The managed endpoints include `/prompt`, `/ws`, `/queue`, `/interrupt`, `/histor
 
 ## Starter workflows
 
-ComfyUI's own template browser is not proxied. Unblocking it would show students a gallery that is mostly broken on this
-deployment: most stock templates reference models that were never downloaded, and every `api_minimax_h3_*` template is
-built on cloud API nodes the allowlist denies. Instead, `apps/gateway/src/starters/` holds a curated set that is written
-into each student's workspace under `workflows/` the first time they open it. Existing students pick up new starters on
-their next visit, so distributing one never requires recreating a class.
+`apps/gateway/src/starters/` holds a curated set that reaches students two ways: it is written into each student's
+workspace under `workflows/` the first time they open it, and it is the entire contents of the template browser. Existing
+students pick up new starters on their next visit, so distributing one never requires recreating a class.
+
+The worker's own template index is never proxied. Serving it would show students a gallery of 559 entries that is almost
+entirely broken on this deployment: most stock templates reference models that were never downloaded, and every
+`api_minimax_h3_*` template is built on cloud API nodes the allowlist denies. `apps/gateway/src/templates.ts` answers
+`/templates/index.json` from the curated list instead, and serves a graph only for a curated `name`; a request for a
+stock template's graph is a 404. Only static media (thumbnails, the model-filter logos in `index_logo.json`) is
+forwarded to the worker.
 
 A student who deletes or edits a starter keeps that decision: the `__starters__` marker records each path once placed,
 and seeding never rewrites a path it has already offered. Bump `VERSION` in `apps/gateway/src/starters/index.ts` to push

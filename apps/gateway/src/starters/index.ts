@@ -16,9 +16,60 @@ import { saveUserData } from "../userdata";
 const VERSION = 1;
 export const STARTERS_MARKER = "__starters__";
 
-const STARTERS: { path: string; workflow: unknown }[] = [
-  { path: "workflows/1 - Image (Flux).json", workflow: imageFlux },
-  { path: "workflows/2 - Video with audio (MiniMax H3).json", workflow: videoMiniMaxH3 },
+// `template` is the entry the frontend's template browser renders; `name` is
+// also the URL it fetches the graph from (/templates/<name>.json). See
+// templates.ts, which serves a curated index built from this same list so the
+// browser and the seeded workspace copies never drift apart.
+export type Starter = {
+  path: string;
+  workflow: unknown;
+  category: { title: string; type: string; icon: string };
+  template: Record<string, unknown>;
+};
+
+export const STARTERS: Starter[] = [
+  {
+    path: "workflows/1 - Image (Flux).json",
+    workflow: imageFlux,
+    category: { title: "Image", type: "image", icon: "icon-[lucide--image]" },
+    template: {
+      name: "class_image_flux",
+      title: "Image (Flux)",
+      description:
+        "Text to image on this lab's Flux weights. Edit the prompt and queue it; no downloads or extra nodes needed.",
+      mediaType: "image",
+      mediaSubtype: "webp",
+      tags: ["Image", "Text to Image"],
+      models: ["FLUX.1-schnell"],
+      thumbnail: [],
+      username: "This class",
+      openSource: true,
+      searchRank: 0,
+      usage: 0,
+      date: "2026-09-10",
+    },
+  },
+  {
+    path: "workflows/2 - Video with audio (MiniMax H3).json",
+    workflow: videoMiniMaxH3,
+    category: { title: "Video", type: "video", icon: "icon-[lucide--video]" },
+    template: {
+      name: "class_video_minimax_h3",
+      title: "Video with audio (MiniMax H3)",
+      description:
+        "Text to video with synchronized audio, on the lab's own MiniMax-H3 weights with the turbo LoRA enabled (8 steps).",
+      mediaType: "image",
+      mediaSubtype: "webp",
+      tags: ["Video", "Text to Video", "Audio"],
+      models: ["MiniMax-H3"],
+      thumbnail: [],
+      username: "This class",
+      openSource: true,
+      searchRank: 1,
+      usage: 0,
+      date: "2026-09-10",
+    },
+  },
 ];
 
 type Marker = { version: number; seeded: string[] };
@@ -50,6 +101,7 @@ export function seedStarters(session: Session) {
       }
       if (marker.version >= VERSION && STARTERS.every((s) => marker.seeded.includes(s.path))) return;
 
+      const placed: string[] = [];
       const existing = new Set(
         getDb()
           .list("user_data", "user_id=? AND class_id=?", [session.userId, session.classId!])
@@ -65,9 +117,13 @@ export function seedStarters(session: Session) {
         if (marker.seeded.includes(starter.path) || existing.has(starter.path)) continue;
         saveUserData(session, starter.path, JSON.stringify(starter.workflow));
         marker.seeded.push(starter.path);
+        placed.push(starter.path);
       }
       marker.version = VERSION;
       saveUserData(session, STARTERS_MARKER, JSON.stringify(marker));
+      // Logged so a deployment running a gateway build without starters, or one
+      // whose seeding silently no-ops, is visible without querying the database.
+      if (placed.length) console.log(`starters: placed ${placed.join(", ")} for ${session.userId}`);
     });
   } catch (error) {
     // Seeding is a convenience. Never let it block entry to the workspace.

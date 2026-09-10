@@ -388,6 +388,21 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     expect(ao.sha256).toBe(createHash("sha256").update(readFileSync(ao.storagePath)).digest("hex"));
     expect((await gw("/history/" + bid, undefined, ga)).status).toBe(200);
     expect(await (await gw("/history/" + bid, undefined, ga)).json()).toEqual({});
+    // The frontend's Jobs panel polls the gateway's own list. It must be scoped
+    // like /queue and /history: the worker's /api/jobs reads prompt_queue and
+    // history globally, so proxying it would show each student the whole class.
+    const mine = await (await gw("/jobs?limit=64&offset=0", undefined, ga)).json();
+    expect(mine.jobs.map((j: any) => j.id)).toEqual([aid]);
+    expect(mine.jobs.map((j: any) => j.prompt_id)).toEqual([aid]);
+    expect(mine.pagination).toEqual({ offset: 0, limit: 64, total: 1, has_more: false });
+    expect(["pending", "in_progress", "completed", "failed", "cancelled"]).toContain(mine.jobs[0].status);
+    expect((await (await gw("/jobs", undefined, gb)).json()).jobs.map((j: any) => j.id)).toEqual([bid]);
+    // A status the worker would reject must not silently return everything.
+    expect((await gw("/jobs?status=finished", undefined, ga)).status).toBe(400);
+    expect((await gw("/jobs?sort_by=user_id", undefined, ga)).status).toBe(400);
+    expect((await gw("/jobs?limit=0", undefined, ga)).status).toBe(400);
+    expect((await gw("/jobs?status=pending,in_progress&offset=99", undefined, ga)).status).toBe(200);
+    expect((await gw("/jobs")).status).toBe(401);
     expect((await gw("/view?filename=" + bo.fileName, undefined, ga)).status).toBe(404);
     expect((await api("/outputs/" + bo.id, undefined, alice)).status).toBe(404);
     expect((await api("/outputs/" + ao.id, undefined, alice)).status).toBe(200);
@@ -403,6 +418,18 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     // The seeding marker shares the user_data table with the student's files but
     // must never surface as one.
     expect(await (await gw("/api/userdata?recurse=true", undefined, ga)).json()).not.toContain("__starters__");
+    // The template browser reads its own index. It lists the curated starters
+    // and nothing else: a stock graph would open in the editor and then fail at
+    // submit time on a missing model or a denied node.
+    const templates = await (await gw("/templates/index.json", undefined, ga)).json();
+    const names = templates.flatMap((c: any) => c.templates.map((t: any) => t.name));
+    expect(names).toEqual(["class_image_flux", "class_video_minimax_h3"]);
+    const graph = await gw("/templates/class_image_flux.json", undefined, ga);
+    expect(graph.status).toBe(200);
+    expect((await graph.json()).nodes.length).toBeGreaterThan(0);
+    expect((await gw("/templates/image_z_image_turbo.json", undefined, ga)).status).toBe(404);
+    expect(await (await gw("/api/workflow_templates", undefined, ga)).json()).toEqual({});
+    expect((await gw("/templates/index.json")).status).toBe(401);
     const settings = await fetch(gatewayUrl + "/api/settings/theme", {
       method: "POST",
       headers: { Cookie: ga, Origin: process.env.COMFY_PUBLIC_URL! },
