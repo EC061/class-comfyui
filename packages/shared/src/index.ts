@@ -17,6 +17,14 @@ export function canonicalEmail(email: string): string {
   return alias ? `${trimmed.slice(0, at + 1)}${alias}` : trimmed;
 }
 
+// Length is the only requirement that reliably adds entropy; composition rules
+// push people toward predictable substitutions. Trimming is deliberately absent
+// so a leading or trailing space stays part of the secret.
+export const PasswordSchema = z
+  .string()
+  .min(12, "Password must be at least 12 characters")
+  .max(200, "Password must be at most 200 characters");
+
 export const ClassCreateSchema = z.object({
   name: z.string().min(1).max(200),
   courseCode: z.string().min(1).max(50),

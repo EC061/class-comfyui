@@ -25,20 +25,30 @@ export async function sendMail(opts: SendMailOpts) {
     transport.close();
   }
 }
-export function buildVerifyLink(token: string, email: string) {
+export function buildActivationLink(token: string, email: string) {
   return appUrl(getEnv().PUBLIC_URL, `/verify?token=${encodeURIComponent(token)}&email=${encodeURIComponent(email)}`);
 }
-export function verificationEmail(to: string, link: string) {
+export function buildResetLink(token: string, email: string) {
+  return appUrl(getEnv().PUBLIC_URL, `/reset?token=${encodeURIComponent(token)}&email=${encodeURIComponent(email)}`);
+}
+export function activationEmail(to: string, link: string) {
   return {
     to,
-    subject: "Your ComfyUI Lab sign-in link",
-    text: `Use this one-time link to sign in:\n\n${link}\n\nExpires in ${getEnv().VERIFICATION_TTL_MINUTES} minutes. If you did not request this, ignore this email.`,
+    subject: "Activate your ComfyUI Lab account",
+    text: `Your password is set. Confirm this address once to activate the account:\n\n${link}\n\nExpires in ${getEnv().VERIFICATION_TTL_MINUTES} minutes. After activation you sign in with your email and password; no further email confirmation is needed.\n\nIf you did not create this account, ignore this email — the account stays inactive.`,
+  };
+}
+export function passwordResetEmail(to: string, link: string) {
+  return {
+    to,
+    subject: "Set your ComfyUI Lab password",
+    text: `Use this one-time link to choose a new password:\n\n${link}\n\nExpires in ${getEnv().VERIFICATION_TTL_MINUTES} minutes. Setting a password here also confirms this address and signs out other sessions.\n\nIf you did not request this, ignore this email — your current password keeps working.`,
   };
 }
 export function signupInviteEmail(to: string, courseLabel: string, url: string) {
   return {
     to,
     subject: `Invitation: ${courseLabel} ComfyUI Lab`,
-    text: `You have been invited to ${courseLabel}.\n\nCreate your account: ${url}\n\nRegister with the email associated with your course roster.`,
+    text: `You have been invited to ${courseLabel}.\n\nCreate your account: ${url}\n\nRegister with the email address on your course roster, choose a password, then confirm the address once.`,
   };
 }

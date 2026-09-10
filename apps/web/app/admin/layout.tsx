@@ -1,28 +1,11 @@
-import { cookies } from "next/headers";
-import { redirect } from "next/navigation";
-import Link from "next/link";
-import { getSessionUserIdFromCookie } from "@/lib/session";
-import { getDb } from "@class-comfyui/database";
+import { requireAdmin } from "@/lib/guards";
 export const dynamic = "force-dynamic";
+
+/**
+ * Every /admin route is gated here, on the server, before any markup exists.
+ * A student who reaches one of these addresses is sent to their own landing page.
+ */
 export default async function AdminLayout({ children }: { children: React.ReactNode }) {
-  const jar = await cookies(),
-    id = getSessionUserIdFromCookie(jar.toString());
-  if (!id) redirect("/login");
-  if (getDb().get("users", id)?.globalRole !== "ADMIN") redirect("/dashboard");
-  return (
-    <>
-      <nav className="mb-4 flex flex-wrap gap-2">
-        {["Dashboard", "Classes", "Students", "Jobs", "Workers", "Audit", "Settings"].map((label) => (
-          <Link
-            key={label}
-            className="nav-link border"
-            href={label === "Dashboard" ? "/admin" : "/admin/" + label.toLowerCase()}
-          >
-            {label}
-          </Link>
-        ))}
-      </nav>
-      {children}
-    </>
-  );
+  await requireAdmin();
+  return <>{children}</>;
 }

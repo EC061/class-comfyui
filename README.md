@@ -19,7 +19,7 @@ Internet HTTPS
 
 This revision replaces the prototype's disconnected memory stores and unused PostgreSQL/Redis services with **one persistent SQLite database in WAL mode**. Web and gateway run on the **same management host** and mount the same directory. GPU workers can be on other hosts. No Kubernetes or database server is needed.
 
-The typed repository uses separate entity tables, JSON records, indexed generated columns, foreign keys, case-insensitive email uniqueness, and class-local student-ID uniqueness. `PRAGMA journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, and a 10-second busy timeout apply to every connection. Writes use short `BEGIN IMMEDIATE` transactions; no network calls happen while a write transaction is held. Schema versions use `user_version`; a newer unknown schema fails closed.
+The typed repository uses separate entity tables, JSON records, indexed generated columns, foreign keys, case-insensitive email uniqueness, and class-local student-ID uniqueness. `PRAGMA journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, and a 10-second busy timeout apply to every connection. Writes use short `BEGIN IMMEDIATE` transactions; no network calls happen while a write transaction is held. Schema versions use `user_version`; a newer unknown schema fails closed. The current version is **2**; opening a version-1 database upgrades it in place, adding the password column to existing accounts and discarding the retired one-time-link challenges.
 
 WAL supports concurrent readers and serializes writers across the web and gateway processes. **Use a local ext4/XFS/APFS filesystem, never NFS/SMB or a distributed volume.** SQLite WAL requires all database processes to be on the same host; see [SQLite's WAL documentation](https://www.sqlite.org/wal.html). Multiple web processes can share this database. Run **one gateway service**: a database lease prevents duplicate scheduler leaders, but live WebSocket delivery is local to the gateway process. Multi-host management/active-active gateways require a different database and event transport.
 
@@ -31,7 +31,7 @@ apps/gateway/src/         authenticated HTTP/WebSocket gateway
   scheduler.ts            durable fair scheduling, capacity, recovery
   storage.ts              streaming output archival and input staging
 packages/database/src/    typed SQLite repository, migration, seed, backup, worker registration
-packages/auth/src/        token cryptography and CSV parsing/reconciliation
+packages/auth/src/        token and password cryptography, CSV parsing/reconciliation
 packages/config/src/      validated canonical URLs and limits
 packages/shared/src/      shared schemas and security helpers
 tests/integration/        real APIs + SQLite + SMTP + mock worker tests
@@ -115,16 +115,30 @@ Every management mutation and gateway mutation checks exact `Origin` equality. A
 
 A missing `Origin` is accepted only when **all** of these agree: exact canonical `Host` including port, `Sec-Fetch-Site: same-origin`, and a `Referer` whose origin exactly equals the canonical origin. Host alone is insufficient. API clients should send the configured Origin explicitly. Fetch metadata is browser-controlled; this fallback is for same-origin browser semantics, not an authentication mechanism.
 
-Cookies are host-only, HttpOnly, SameSite=Lax, and Secure when the corresponding configured URL uses HTTPS. Email GET links display a confirmation page; the challenge is consumed by a protected POST. Account, class, and enrollment eligibility are rechecked before signup verification and every gateway request. Disabling signup does not disable an existing student's normal login. Disabling a user or archiving their enrollment removes workspace access, including established WebSockets.
+Cookies are host-only, HttpOnly, SameSite=Lax, and Secure when the corresponding configured URL uses HTTPS. Email GET links display a confirmation page; the challenge is consumed by a protected POST. Account, class, and enrollment eligibility are rechecked before account activation and every gateway request. Disabling signup does not disable an existing student's normal login. Disabling a user or archiving their enrollment removes workspace access, including established WebSockets.
 
 Each tunnel terminates at a single application, so a wrong or missing `Host` cannot cross between the management and gateway sites; `Origin` equality, not `Host`, is what enforces CSRF. Both applications strip/ignore forged identity headers and enforce their own request-body limits, so no local proxy is needed for those. The rate limiter keys on `X-Real-IP`, which only the remote proxy sets — see the FRP section for the server-block requirements, and keep 8080/8090 closed to everything but the FRPC host. In a shared FRPC/NAT deployment, IP rate limits apply to that shared ingress address; email/account-specific limits apply separately.
 
-## First administrator and SMTP
+## Accounts, roles and the single entry point
 
-1. Open `PUBLIC_URL/register/admin`.
-2. Enter your email and the secret administrator registration code.
-3. Open the email sent through your SMTP server, then click **Verify**.
-4. Subsequent logins use `/login` and need only email ownership, not the registration code.
+Students and administrators use the **same two pages**: `/login` to sign in and `/register` to create an account. There is no separate administrator entry point — `/register/admin` and `/dashboard` redirect into the shared pair, as do class signup links already sitting in students' inboxes.
+
+`/` is the one landing page for both roles. What it renders is decided from the signed-in account's role: an administrator sees lab status, class/roster/worker/audit management and every job; a student sees their own classes, the button into ComfyUI, and only their own jobs. The navigation only offers links the account can use.
+
+**Registration sets the password first, then confirms the address once:**
+
+1. Open `/register` — students through their class signup link, administrators with the secret registration code.
+2. Enter name, email and a password of at least 12 characters. The account is created **inactive**: it cannot sign in yet, and no enrollment is claimed.
+3. Open the emailed confirmation link and click **Activate account**. That attaches the class enrollment and signs the account in.
+4. **Every later sign-in is email and password only.** Email confirmation happens exactly once, at signup, and never again — not on later logins, and not when joining a second class.
+
+Role comes from what the visitor can prove, never from a form field: a valid class signup link produces a student, the administrator registration code produces an administrator, and neither produces nothing. A signed-in student who has the code can claim administrator rights on their existing account rather than making a second one.
+
+Route authorization is enforced on the server: every non-public page and layout re-reads the session and role before rendering, and the API checks both again on every request. The middleware's cookie check only avoids a wasted render — a cookie's presence proves nothing.
+
+Passwords are stored as salted **scrypt** hashes (N=32768, r=8, p=1, 64-byte key) using only the Node standard library, with the cost parameters recorded per hash so they can be raised without invalidating existing passwords. A wrong password and an unknown address cost the same and return the same message. Setting a password through the emailed link ends every other session, workspace sessions included.
+
+**Forgotten passwords, and accounts that predate password sign-in:** use **Forgot your password?** on `/login`. Accounts migrated from the passwordless schema keep their identity, enrollments and history but have no usable password until their owner sets one this way; an administrator cannot set it for them. Requests for unknown addresses answer identically and send no mail. An account still awaiting activation receives its activation link instead, since that is the link that also attaches its enrollment.
 
 Multiple admins are supported. A transaction prevents disabling/demoting the last active admin. SMTP failures return an error; authentication links are never logged or returned in API responses. Use **Admin → Settings → Send test email** to check delivery. For port 587 use `SMTP_SECURE=false` (STARTTLS when offered); use `true` for implicit TLS, normally port 465. Configure your provider's SPF/DKIM/DMARC and authorized sender.
 
@@ -147,7 +161,15 @@ All fixtures are fabricated. Parsing supports quoted fields, BOM, whitespace, an
 
 Signup tokens contain 192 random bits and only their SHA-256 hashes are stored. The URL is shown once; keep your copied URL or regenerate it. Regeneration revokes the old URL **and outstanding signup challenges** immediately. Disable/enable controls preserve existing accounts/enrollments. Invitation requests validate the complete canonical URL, recheck the token while sending, email only unregistered non-archived entries, and record sent/failed deliveries. After a partial SMTP failure, retrying may resend successful invitations; there is no exactly-once delivery promise.
 
-Students open the class link, enter their roster email, and verify ownership through SMTP. Possession of the signup link is insufficient. A global user can join another class through that class's roster-gated link without creating a duplicate user. `/register` directs students to their instructor's class link.
+Students open the class link, choose a password, and confirm their roster address once through SMTP. Possession of the signup link is insufficient: the address must be on the roster. An existing signed-in account joins another class through that class's roster-gated link without creating a duplicate user and without a further confirmation email. An account that was registered but never confirmed can be registered over, which is how the rightful owner of an address reclaims it from someone who typed it first.
+
+### Archiving versus deleting a class
+
+**Archive** (class → Settings → _Archive class_) keeps every record and revokes workspace access. Nothing is erased, and it can be reversed.
+
+**Delete** (class → Settings → _Delete this class permanently_) is irreversible and takes the data with it. Deleting a class erases its roster and enrollments, every job and archived output, every staged input, every saved workflow and workspace setting, its signup tokens, invitations and roster-import records, its live workspace sessions, **its activity records**, and **all of its files on disk** — both the archive directory under `AUDIT_DATA_DIR` and each student's staged inputs under `UPLOAD_DATA_DIR`. Student accounts themselves survive: only their work in that class is gone.
+
+Deletion requires typing the class slug to confirm, and is refused with 409 while any of the class's jobs are still queued, dispatching or running — cancel or wait for them first. Database rows are removed in one transaction and the files afterwards, so a crash can never leave records pointing at deleted files; if the filesystem refuses a path, the response names it and reports the deletion as incomplete. One record survives: a `CLASS_DELETED` audit entry naming the acting administrator, the slug and the row counts. It references no class, because there is no longer one to reference. **No backup is taken. Take one first if the outputs matter** (see Backups and upgrades).
 
 ## Workers and simultaneous users
 
@@ -412,7 +434,7 @@ pnpm exec playwright install chromium
 pnpm test:e2e
 ```
 
-Playwright starts the **built** Next.js/gateway processes, a test SMTP inbox, and a mock ComfyUI backend in an isolated temporary data directory. It registers an administrator through the browser, imports a fabricated roster, creates a signup link, registers two separate browser contexts, opens workspaces, submits jobs, verifies output/WS isolation, and restarts both applications to check persistence. Integration coverage also includes 30 simultaneous users, two competing schedulers, separate OS database writers, quotas, rollback, offline/reconnect, and SMTP failures. Mock inference is not a real-GPU performance benchmark.
+Playwright starts the **built** Next.js/gateway processes, a test SMTP inbox, and a mock ComfyUI backend in an isolated temporary data directory. It registers an administrator through the browser, imports a fabricated roster, creates a signup link, registers two separate browser contexts, confirms each address once, signs a student back in with password only, checks that a student cannot reach an administrator route, opens workspaces, submits jobs, verifies output/WS isolation, restarts both applications to check persistence, and finally deletes the class through its confirmation control. Integration coverage also includes the password and reset lifecycle, the version-1 schema upgrade, role restriction of every administrative route, permanent class deletion down to the files on disk, 30 simultaneous users, two competing schedulers, separate OS database writers, quotas, rollback, offline/reconnect, and SMTP failures. Mock inference is not a real-GPU performance benchmark.
 
 For an interactive local stack:
 
@@ -423,7 +445,7 @@ mkdir -p data
 docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build --wait
 ```
 
-Open `http://localhost:8080` and Mailpit at `http://localhost:8025`. The gateway is `http://comfy.localhost:8090`; if your browser does not resolve it, map `comfy.localhost` to `127.0.0.1`. The two sites keep separate hostnames locally so host-only cookies stay isolated exactly as they are in production. The local-only admin code is in `docker-compose.local.yml`. This override must never be used for public deployment. Register a real private worker in the UI, or run `PORT=8188 pnpm exec tsx scripts/mock-comfy.ts` and use an address reachable from the gateway container. No development seed runs automatically; `NODE_ENV=development SQLITE_PATH=/absolute/local/path/lab.sqlite pnpm db:seed` explicitly creates fabricated demo records in an empty database.
+Open `http://localhost:8080` and Mailpit at `http://localhost:8025`. The gateway is `http://comfy.localhost:8090`; if your browser does not resolve it, map `comfy.localhost` to `127.0.0.1`. The two sites keep separate hostnames locally so host-only cookies stay isolated exactly as they are in production. The local-only admin code is in `docker-compose.local.yml`. This override must never be used for public deployment. Register a real private worker in the UI, or run `PORT=8188 pnpm exec tsx scripts/mock-comfy.ts` and use an address reachable from the gateway container. No development seed runs automatically; `NODE_ENV=development SQLITE_PATH=/absolute/local/path/lab.sqlite pnpm db:seed` explicitly creates fabricated demo records in an empty database. The seeded administrator has **no password** — the seed invents no credential. Give it one with **Forgot your password?** on `/login` and read the link out of Mailpit.
 
 ## Final real-server verification
 
@@ -456,6 +478,10 @@ Replace the example worker IP. Then repeat both checks through the public hostna
 - **Startup secret error:** replace all three placeholders with independent secrets of at least 32 characters.
 - **SQLite permission/busy errors:** confirm identical local bind mounts and UID 1000 access; ensure no external process holds a long write transaction. Do not delete an active WAL file.
 - **SMTP 502:** verify credentials/TLS/provider connectivity in Settings. Errors do not fall back to logging tokens.
+- **"Incorrect email or password" for an account that used to work:** it predates password sign-in and has no hash yet. Use **Forgot your password?** once; identity, enrollments and history are preserved.
+- **"Confirm your email address to activate this account":** registration completed but its confirmation link was never opened. Resend it from the sign-in page. An unconfirmed account can also simply be registered again.
+- **Class deletion returns 409:** the class still has queued, dispatching or running jobs. Cancel them or wait, then retry.
+- **Class deletion reports paths it could not remove:** the rows are already gone. Fix the filesystem permission or lock and delete the named paths by hand; nothing re-creates them.
 - **No metadata worker:** register a healthy backend at least once; workflows cannot be validated against a worker that has never supplied node metadata. Previously cached metadata permits queueing while that worker reconnects.
 - **Queued jobs:** inspect worker health, external work, tags and active quotas. Capability tags do not install models.
 - **LOST:** inspect the worker's private queue; do not automatically resubmit an ambiguous dispatch.
