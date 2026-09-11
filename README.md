@@ -401,8 +401,8 @@ ComfyUI keeps model weights in VRAM after a job finishes. Two mechanisms, on two
    first job are the price of zero idle VRAM. During term time, prefer the babysit-free setup: keep every card up
    and let each job's automatic unload do the work, with the reaper only freeing (never stopping) as a backstop.
    Install it persistently with `sed "s|@REPO@|$HOME/class-comfyui|" deploy/comfyui/comfyui-reaper.service |
-   sudo tee /etc/systemd/system/comfyui-reaper.service` followed by `sudo systemctl daemon-reload &&
-   sudo systemctl enable --now comfyui-reaper`. Pass `--no-wake` to only stop (jobs wait for a manual start), or
+sudo tee /etc/systemd/system/comfyui-reaper.service` followed by `sudo systemctl daemon-reload &&
+sudo systemctl enable --now comfyui-reaper`. Pass `--no-wake` to only stop (jobs wait for a manual start), or
    `--dry-run` to inspect. The reaper only manages `comfyui@*` units; a hand-started `python main.py` holding gigabytes is reported
    by `nvidia-smi`, never touched — kill it by hand and check `CUDA_VISIBLE_DEVICES` isolation if one process spans
    cards.
