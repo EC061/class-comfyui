@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Stop idle ComfyUI workers so their VRAM returns to zero.
+# Stop idle ComfyUI workers so their VRAM returns to zero, and start them
+# again when platform work is waiting.
 #
 # Background: a running ComfyUI process always holds ~300MiB of CUDA context,
 # and after a job it keeps the full model weights until something unloads
@@ -9,21 +10,29 @@
 # empty for --idle-seconds, it frees once more and then `systemctl stop`s the
 # unit, releasing even the context. Zero MiB idle.
 #
-# Stopped workers are safe: the gateway marks them OFFLINE and platform jobs
-# simply stay QUEUED until the unit is started again:
-#   sudo systemctl start 'comfyui@gpu*'
+# Nothing stays stopped while work waits: every poll reads the platform
+# database (same host) for QUEUED jobs and starts any stopped managed unit, so
+# a submission wakes a card within one poll interval plus unit start time
+# (tens of seconds) and model reload on the first job. Stopped workers read as
+# OFFLINE in the gateway meanwhile; that and a slow first job are the price of
+# zero idle VRAM.
+#
 # Run this script as a systemd unit/timer, or from cron. Only units matching
 # comfyui@* are ever touched; stray manual `python main.py` processes are
-# reported, never killed.
+# never killed.
 #
 # Usage:
 #   scripts/comfyui-idle-reaper.sh [--idle-seconds 600] [--interval 30]
-#     [--env-dir /etc/comfyui] [--free-only] [--dry-run] [--units 'gpu0,gpu2']
+#     [--env-dir /etc/comfyui] [--db ./data/lab.sqlite] [--no-wake]
+#     [--free-only] [--dry-run] [--units 'gpu0,gpu2']
 set -euo pipefail
 
 IDLE_SECONDS=600
 INTERVAL=30
 ENV_DIR="/etc/comfyui"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+DB_PATH="$REPO_ROOT/data/lab.sqlite"
+NO_WAKE=0
 FREE_ONLY=0
 DRY_RUN=0
 UNITS_FILTER=""
@@ -36,7 +45,9 @@ Usage: scripts/comfyui-idle-reaper.sh [options]
   --idle-seconds N   Continuous empty-queue time before stopping a unit (default: 600)
   --interval N       Seconds between polls (default: 30)
   --env-dir PATH     Directory with <instance>.env files holding COMFY_PORT (default: /etc/comfyui)
-  --units LIST       Comma-separated instance names to manage (default: all running comfyui@* units)
+  --db PATH          Platform SQLite database to watch for queued jobs (default: ./data/lab.sqlite)
+  --no-wake          Never start stopped units, only stop idle ones
+  --units LIST       Comma-separated instance names to manage (default: all installed comfyui@* units)
   --free-only        POST /free on idle but never stop the unit (keeps ~300MiB baseline, instant wake)
   --dry-run          Print what would happen, change nothing
   -h, --help         This message
@@ -57,6 +68,8 @@ while [ $# -gt 0 ]; do
     --idle-seconds) IDLE_SECONDS="$2"; shift 2 ;;
     --interval) INTERVAL="$2"; shift 2 ;;
     --env-dir) ENV_DIR="$2"; shift 2 ;;
+    --db) DB_PATH="$2"; shift 2 ;;
+    --no-wake) NO_WAKE=1; shift ;;
     --units) UNITS_FILTER="$2"; shift 2 ;;
     --free-only) FREE_ONLY=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -67,6 +80,7 @@ done
 
 command -v curl >/dev/null || { echo "error: curl is required" >&2; exit 1; }
 command -v systemctl >/dev/null || { echo "error: systemctl is required" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "error: python3 is required" >&2; exit 1; }
 if [ "$DRY_RUN" = 1 ]; then
   # Track idle clocks in memory only: same decisions as a live run, no residue.
   STATE_DIR="$(mktemp -d)"
@@ -75,8 +89,9 @@ else
   mkdir -p "$STATE_DIR"
 fi
 
-# Running units this script may manage.
-mapfile -t MANAGED < <(systemctl list-units --type=service --state=running 'comfyui@*' --no-legend --no-pager | awk '{print $1}' | sed 's/^comfyui@//; s/\.service$//')
+# Every installed unit this script may manage, running or stopped, so a unit
+# stopped earlier (by us or an admin) can still be woken.
+mapfile -t MANAGED < <(systemctl list-units --all --type=service --no-legend --no-pager 'comfyui@*' | awk '{print $1}' | sed 's/^comfyui@//; s/\.service$//')
 if [ -n "$UNITS_FILTER" ]; then
   wanted=",${UNITS_FILTER// /},"
   filtered=()
@@ -85,7 +100,11 @@ if [ -n "$UNITS_FILTER" ]; then
   done
   MANAGED=("${filtered[@]}")
 fi
-[ "${#MANAGED[@]}" -gt 0 ] || { log "no running comfyui@ units to watch"; exit 0; }
+[ "${#MANAGED[@]}" -gt 0 ] || { log "no comfyui@ units installed"; exit 0; }
+
+unit_state() {
+  systemctl is-active "comfyui@$1" 2>/dev/null || true
+}
 
 queue_empty() {
   # Empty only when both running and pending lists are []. Any curl failure
@@ -93,6 +112,23 @@ queue_empty() {
   local body
   body="$(curl -fsS -m 10 "http://127.0.0.1:$1/queue" 2>/dev/null)" || return 1
   python3 -c 'import json,sys; q=json.load(sys.stdin); sys.exit(0 if not q.get("queue_running") and not q.get("queue_pending") else 1)' <<<"$body"
+}
+
+work_waiting() {
+  # Platform jobs the scheduler has admitted but no worker has taken. A
+  # read-only WAL query: safe alongside the gateway's writers.
+  [ "$NO_WAKE" = 1 ] && return 1
+  [ -f "$DB_PATH" ] || return 1
+  local n
+  n="$(DB_PATH="$DB_PATH" python3 -c '
+import os, sqlite3
+try:
+    con = sqlite3.connect("file:%s?mode=ro" % os.environ["DB_PATH"], uri=True, timeout=5)
+    print(con.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('"'"'QUEUED'"'"','"'"'DISPATCHING'"'"')").fetchone()[0])
+except Exception:
+    print(0)
+' 2>/dev/null)" || return 1
+  [ "${n:-0}" -gt 0 ]
 }
 
 free_unit() {
@@ -105,11 +141,24 @@ free_unit() {
     -d '{"unload_models":true,"free_memory":true}' >/dev/null 2>&1
 }
 
-log "watching ${#MANAGED[@]} unit(s): ${MANAGED[*]} (idle threshold ${IDLE_SECONDS}s, poll every ${INTERVAL}s)"
+log "managing ${#MANAGED[@]} unit(s): ${MANAGED[*]} (idle threshold ${IDLE_SECONDS}s, poll every ${INTERVAL}s)"
 while true; do
+  if work_waiting; then
+    for inst in "${MANAGED[@]}"; do
+      case "$(unit_state "$inst")" in
+        active|activating|reloading) continue ;;
+      esac
+      log "$inst: platform work waiting, starting comfyui@$inst"
+      run sudo systemctl start "comfyui@$inst"
+      rm -f "$STATE_DIR/$inst"
+    done
+  fi
   for inst in "${MANAGED[@]}"; do
-    # The unit may have been stopped since discovery (by us or an admin); drop it quietly.
-    if ! systemctl is-active -q "comfyui@$inst"; then continue; fi
+    case "$(unit_state "$inst")" in
+      active) ;;
+      # Starting, stopping, or already stopped: never an idle-stop candidate.
+      *) rm -f "$STATE_DIR/$inst"; continue ;;
+    esac
     port="$(grep -E '^COMFY_PORT=' "$ENV_DIR/$inst.env" 2>/dev/null | cut -d= -f2- || true)"
     if [ -z "$port" ]; then
       log "$inst: no COMFY_PORT in $ENV_DIR/$inst.env, skipping"
@@ -120,28 +169,26 @@ while true; do
       idle_for=0
       if [ -f "$state" ]; then idle_for=$(( $(date +%s) - $(cat "$state") )); fi
       if [ ! -f "$state" ]; then
-        [ "$DRY_RUN" = 1 ] || date +%s >"$state"
+        date +%s >"$state"
         log "$inst (port $port): queue empty, idle clock started"
       elif [ "$idle_for" -ge "$IDLE_SECONDS" ]; then
         log "$inst (port $port): idle ${idle_for}s, freeing VRAM"
         if free_unit "$port"; then
           if [ "$FREE_ONLY" = 1 ]; then
             log "$inst: freed, staying up (--free-only)"
-            [ "$DRY_RUN" = 1 ] || date +%s >"$state"
+            date +%s >"$state"
           else
-            log "$inst: stopping comfyui@$inst (jobs will queue until it is started again)"
+            log "$inst: stopping comfyui@$inst (a queued job will wake it)"
             run sudo systemctl stop "comfyui@$inst"
             rm -f "$state"
-            # Refresh the watch list: a stopped unit leaves the set.
-            mapfile -t MANAGED < <(systemctl list-units --type=service --state=running 'comfyui@*' --no-legend --no-pager | awk '{print $1}' | sed 's/^comfyui@//; s/\.service$//')
           fi
         else
           log "$inst: /free failed, will retry next poll"
         fi
       fi
     else
-      # Busy or unreachable: not idle. Unreachable also clears nothing else.
-      [ -f "$state" ] && rm -f "$state"
+      # Busy or unreachable: not idle.
+      rm -f "$state"
     fi
   done
   sleep "$INTERVAL"

@@ -387,13 +387,16 @@ ComfyUI keeps model weights in VRAM after a job finishes. Two mechanisms, on two
    each job, and expect the next job on that card to pay a model-reload of tens of seconds.
 2. **Idle scale-to-zero (GPU host, opt-in).** That ~300MiB is the CUDA context plus PyTorch's allocator: it exists
    from process start with no model loaded, and no flag or `/free` call removes it — only stopping the process
-   reaches zero. `scripts/comfyui-idle-reaper.sh` does that: it polls each running `comfyui@*` unit's `/queue`,
+   reaches zero. `scripts/comfyui-idle-reaper.sh` does that: it polls each installed `comfyui@*` unit's `/queue`,
    and after `--idle-seconds` (default 600) of continuous emptiness it frees once more and `systemctl stop`s the
-   unit. A stopped worker reads as `OFFLINE` in the gateway; queued platform jobs wait and dispatch when the unit
-   is started again (`sudo systemctl start 'comfyui@gpu*'`). Pass `--free-only` to unload idle models without
-   stopping (keeps the baseline, instant wake), or `--dry-run` to inspect. The reaper only manages `comfyui@*`
-   units; a hand-started `python main.py` holding gigabytes is reported by `nvidia-smi`, never touched — kill it
-   by hand and check `CUDA_VISIBLE_DEVICES` isolation if one process spans cards.
+   unit. Nothing stays stopped while work waits: every poll also reads the platform database on the same host for
+   queued jobs and starts a stopped unit back up, so a submission wakes a card within one poll interval plus unit
+   start and first-job model reload. A stopped worker reads as `OFFLINE` in the gateway meanwhile; that and a slow
+   first job are the price of zero idle VRAM. Pass `--no-wake` to only stop (jobs wait for a manual start),
+   `--free-only` to unload idle models without stopping (keeps the baseline, instant wake), or `--dry-run` to
+   inspect. The reaper only manages `comfyui@*` units; a hand-started `python main.py` holding gigabytes is reported
+   by `nvidia-smi`, never touched — kill it by hand and check `CUDA_VISIBLE_DEVICES` isolation if one process spans
+   cards.
 
 ### After provisioning
 
