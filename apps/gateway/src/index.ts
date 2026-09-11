@@ -98,6 +98,18 @@ const coreNodes = [
   "CLIPLoader",
   "FluxGuidance",
   "ModelSamplingFlux",
+  // Model-sampling patches are pure timestep math on the loaded model: no
+  // files, no network. The frontend's own default workflow (Z-Image-Turbo)
+  // wires ModelSamplingAuraFlow, which rendered as a red "missing node" until
+  // the family was listed — even though every worker supports it natively.
+  "ModelSamplingDiscrete",
+  "ModelSamplingContinuousEDM",
+  "ModelSamplingContinuousV",
+  "ModelSamplingStableCascade",
+  "ModelSamplingSD3",
+  "ModelSamplingAuraFlow",
+  "ModelNoiseScale",
+  "RescaleCFG",
   "EmptySD3LatentImage",
   // Latent-video shape for the seeded Wan 2.1 starter (and student-built video
   // graphs). A dimension holder like EmptyLatentImage: no files, no network.

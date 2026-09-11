@@ -1,0 +1,23 @@
+[
+  {
+    "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/diffusion_models/z_image_turbo_bf16.safetensors",
+    "dest": "diffusion_models",
+    "file": "z_image_turbo_bf16.safetensors",
+    "bytes": 12309866400,
+    "note": "Z-Image-Turbo diffusion model. This exact bf16 file is what the ComfyUI frontend's own default workflow selects, so downloading it makes a fresh workspace run with zero edits. An int8_convrot build exists for Ampere; switch the loader to it only deliberately."
+  },
+  {
+    "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors",
+    "dest": "text_encoders",
+    "file": "qwen_3_4b.safetensors",
+    "bytes": 8044982048,
+    "note": "Qwen3-4B text encoder for Z-Image-Turbo. fp8_mixed is smaller; the default workflow selects the full build."
+  },
+  {
+    "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/vae/ae.safetensors",
+    "dest": "vae",
+    "file": "ae.safetensors",
+    "bytes": 335304388,
+    "note": "VAE for Z-Image-Turbo (same file as the Flux VAE)."
+  }
+]
