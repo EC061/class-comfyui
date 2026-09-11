@@ -52,6 +52,24 @@ export const JobStatusSchema = z.enum(["QUEUED", "DISPATCHING", "RUNNING", "COMP
 
 export type JobStatus = z.infer<typeof JobStatusSchema>;
 
+/**
+ * Per-student feature grants, stored as one JSON row per (user, class) in the
+ * user_data table under this reserved path — never a visible file. Teachers
+ * toggle them from the class roster; the gateway's seeder and template index
+ * read them. Revoking hides the template and stops future seeding; files
+ * already placed are left alone, never deleted out from under a student.
+ */
+export const GRANTS_PATH = "__grants__";
+
+export const GrantSchema = z
+  .object({
+    /** Seed the MiniMax-H3 example workflow and show it in the template browser. */
+    h3Video: z.boolean().default(false),
+  })
+  .catch({ h3Video: false });
+
+export type Grants = z.infer<typeof GrantSchema>;
+
 export const STRIPPED_IDENTITY_HEADERS = ["comfy-user", "x-user-id", "x-admin", "x-class-id", "x-role"] as const;
 
 /** Remove forged identity-like headers from incoming requests (case-insensitive). */

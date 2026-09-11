@@ -99,6 +99,9 @@ const coreNodes = [
   "FluxGuidance",
   "ModelSamplingFlux",
   "EmptySD3LatentImage",
+  // Latent-video shape for the seeded Wan 2.1 starter (and student-built video
+  // graphs). A dimension holder like EmptyLatentImage: no files, no network.
+  "EmptyHunyuanLatentVideo",
   "SaveAnimatedWEBP",
   // MiniMax-H3 video+audio, running on the lab's own weights. Two exclusions are
   // deliberate. The ComfyCloud*/Minimax*Node variants carry near-identical names

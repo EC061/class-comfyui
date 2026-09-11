@@ -1,9 +1,11 @@
 import express from "express";
 import { randomUUID } from "node:crypto";
 import { getDb, activeMembership, type Session, type UserData } from "@class-comfyui/database";
+import { GRANTS_PATH } from "@class-comfyui/shared";
 // Internal rows that live in the same table as the student's files but are not
-// files: the settings blob and the starter-seeding marker.
-const RESERVED = ["__settings__", "__starters__"];
+// files: the settings blob, the starter-seeding marker, and teacher-set grants.
+// Grants stay reserved so a student can never read or overwrite their own.
+const RESERVED = ["__settings__", "__starters__", GRANTS_PATH];
 function reserved(p: string) {
   return RESERVED.includes(p);
 }

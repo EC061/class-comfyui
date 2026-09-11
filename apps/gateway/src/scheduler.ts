@@ -221,6 +221,7 @@ export class Scheduler {
       });
       if (!response.ok) {
         this.finish(job.id, "FAILED", `Worker rejected prompt (${response.status})`);
+        void this.freeIfIdle(job.workerId!);
         return;
       }
       const result = (await response.json()) as { prompt_id?: string };
@@ -238,8 +239,38 @@ export class Scheduler {
         sending ? "LOST" : "FAILED",
         sending ? "Dispatch outcome unknown; job was not retried automatically" : "Input staging failed"
       );
+      // A LOST dispatch may already be executing on the worker; freeing then
+      // would evict a running job's models, so only free the certain failure.
+      if (!sending && job.workerId) void this.freeIfIdle(job.workerId);
     } finally {
       upstream?.close();
+    }
+  }
+  /**
+   * Best-effort immediate VRAM release. ComfyUI keeps model weights in VRAM
+   * after a job finishes; POST /free unloads them so the card drops back to
+   * its ~300MiB CUDA context instead of holding tens of GB until the next
+   * job. Skipped while any platform job still needs the worker, or while the
+   * worker reports external work we did not submit.
+   */
+  private async freeIfIdle(workerId: string) {
+    try {
+      const db = getDb();
+      const worker = db.get("workers", workerId);
+      if (!worker || worker.externalBusy) return;
+      if (db.list("jobs", "worker_id=? AND status IN ('DISPATCHING','RUNNING')", [workerId]).length) return;
+      await workerFetch(
+        worker,
+        "/free",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ unload_models: true, free_memory: true }),
+        },
+        10000
+      );
+    } catch {
+      /* VRAM release is hygiene, never a job failure. The idle reaper repeats it. */
     }
   }
   private finish(id: string, status: Job["status"], error: string | null = null) {
@@ -316,10 +347,14 @@ export class Scheduler {
                 job.cancelRequested || revoked ? "CANCELLED" : "FAILED",
                 "Worker execution failed or interrupted"
               );
+              void this.freeIfIdle(job.workerId!);
               return;
             }
             if (entry.status?.completed === true || entry.status?.status_str === "success") {
               const complete = this.finish(id, "COMPLETED");
+              // Free before archival: outputs download over HTTP and need no
+              // models, so VRAM is released while bytes stream to disk.
+              void this.freeIfIdle(worker.id);
               db.transaction(() => {
                 const current = db.get("jobs", id)!;
                 current.archiveStatus = "ARCHIVING";
@@ -347,6 +382,7 @@ export class Scheduler {
             q = (await r.json()) as any;
           if (![...(q.queue_running || []), ...(q.queue_pending || [])].some((v: any) => v[1] === job.comfyPromptId)) {
             this.finish(id, "CANCELLED", timedOut ? "Job timed out" : "Job cancelled");
+            void this.freeIfIdle(job.workerId!);
             return;
           }
         }
@@ -355,6 +391,7 @@ export class Scheduler {
       }
       if (timedOut && Date.now() - Date.parse(job.startedAt!) > (getEnv().JOB_TIMEOUT_SECONDS + 60) * 1000) {
         this.finish(id, "LOST", "Worker did not confirm completion before timeout");
+        if (job.workerId) void this.freeIfIdle(job.workerId);
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 500));

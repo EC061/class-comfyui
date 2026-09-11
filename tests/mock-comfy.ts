@@ -15,6 +15,7 @@ export async function mockComfy(port = 0) {
   let failView = false;
   let maxRunning = 0;
   const submissions: any[] = [];
+  const frees: any[] = [];
   const timers = new Set<ReturnType<typeof setTimeout>>();
   app.use((_req, res, next) => {
     if (!online) {
@@ -105,6 +106,10 @@ export async function mockComfy(port = 0) {
     res.json({});
   });
   app.post("/queue", (_req, res) => res.json({}));
+  app.post("/free", (req, res) => {
+    frees.push(req.body);
+    res.json({});
+  });
   app.get("/private", (_req, res) => res.json({ secret: "must never be proxied" }));
   app.get("/", (_req, res) =>
     res.type("html").send("<!doctype html><title>Mock ComfyUI</title><h1>Mock ComfyUI worker</h1>")
@@ -115,6 +120,7 @@ export async function mockComfy(port = 0) {
     server,
     url: `http://127.0.0.1:${address.port}`,
     submissions,
+    frees,
     get maxRunning() {
       return maxRunning;
     },

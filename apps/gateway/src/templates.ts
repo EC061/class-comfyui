@@ -1,5 +1,6 @@
 import express from "express";
-import { STARTERS } from "./starters";
+import { STARTERS, eligibleStarters } from "./starters";
+import type { Session } from "@class-comfyui/database";
 
 // ComfyUI's template browser (frontend 1.51) reads three things:
 //
@@ -13,11 +14,15 @@ import { STARTERS } from "./starters";
 // downloaded or cloud API nodes the allowlist denies. So the index is built
 // here from the same curated set that gets seeded into each workspace, and the
 // stock graphs stay unreachable.
+//
+// Granted starters (currently the H3 example) are filtered per student: the
+// index omits them and their graph is a 404 without the grant, so a teacher
+// handing the example to one student never exposes it to the class.
 const byName = new Map(STARTERS.map((s) => [String(s.template.name), s]));
 
-function index() {
+function index(session: Session) {
   const categories: Record<string, Record<string, unknown>> = {};
-  for (const starter of STARTERS) {
+  for (const starter of eligibleStarters(session)) {
     const key = starter.category.title;
     const category = (categories[key] ??= {
       moduleName: "default",
@@ -43,8 +48,8 @@ export function installTemplates(
   app: express.Express,
   proxy: (req: express.Request, res: express.Response) => Promise<void>
 ) {
-  app.get("/templates/index.json", (_req, res) => {
-    res.json(index());
+  app.get("/templates/index.json", (req, res) => {
+    res.json(index(res.locals.session as Session));
   });
   // A dict keyed by custom-node module. No custom nodes are exposed here, so an
   // empty one is the honest answer; the frontend fetches it unconditionally.
@@ -62,6 +67,11 @@ export function installTemplates(
     }
     const starter = byName.get(rest.replace(/\.json$/, ""));
     if (starter) {
+      const allowed = eligibleStarters(res.locals.session as Session).includes(starter);
+      if (!allowed) {
+        res.status(404).json({ error: "Unknown template" });
+        return;
+      }
       res.json(starter.workflow);
       return;
     }

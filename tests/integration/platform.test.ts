@@ -438,6 +438,7 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     // Starter workflows are seeded on workspace entry, so the directory is not
     // empty for a student who has never saved anything.
     expect(paths).toContain("1 - Image (Flux).json");
+    expect(paths).toContain("2 - Video (Wan 1.3B).json");
     // The seeding marker shares the user_data table with the student's files but
     // must never surface as one.
     expect(await (await gw("/api/userdata?recurse=true", undefined, ga)).json()).not.toContain("__starters__");
@@ -446,10 +447,13 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     // submit time on a missing model or a denied node.
     const templates = await (await gw("/templates/index.json", undefined, ga)).json();
     const names = templates.flatMap((c: any) => c.templates.map((t: any) => t.name));
-    expect(names).toEqual(["class_image_flux", "class_video_minimax_h3"]);
+    expect(names).toEqual(["class_image_flux", "class_video_wan_t2v_1_3b"]);
     const graph = await gw("/templates/class_image_flux.json", undefined, ga);
     expect(graph.status).toBe(200);
     expect((await graph.json()).nodes.length).toBeGreaterThan(0);
+    const videoGraph = await gw("/templates/class_video_wan_t2v_1_3b.json", undefined, ga);
+    expect(videoGraph.status).toBe(200);
+    expect((await videoGraph.json()).nodes.length).toBeGreaterThan(0);
     expect((await gw("/templates/image_z_image_turbo.json", undefined, ga)).status).toBe(404);
     expect(await (await gw("/api/workflow_templates", undefined, ga)).json()).toEqual({});
     expect((await gw("/templates/index.json")).status).toBe(401);
@@ -615,6 +619,49 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     expect(new Set(ordered.slice(0, 30).map((j) => j.userId)).size).toBe(30);
     expect(getDb().list("outputs")).toHaveLength(32);
   });
+  it("gates the H3 example on a teacher grant: hidden until given, seeded on next entry, never deleted on revoke", async () => {
+    const a = await admin(),
+      c = await createClass(a);
+    await roster(a, c.id);
+    const url = await signup(a, c),
+      alice = await student(c, url);
+    const enrollments = (await (await api(`/admin/classes/${c.id}`, undefined, a)).json()).enrollments as any[];
+    const mine = enrollments.find((e) => e.userId === getDb().userByEmail("student1@example.edu")?.id)!;
+    const pending = enrollments.find((e) => !e.userId)!;
+    expect(mine.h3Video).toBe(false);
+    // A grant needs a registered account, not just a roster row.
+    expect(
+      (await api(`/admin/classes/${c.id}/enrollments`, { id: pending.id, h3Video: true }, a, "PATCH")).status
+    ).toBe(409);
+    // A student cannot grant themselves the example.
+    expect((await api(`/admin/classes/${c.id}/enrollments`, { id: mine.id, h3Video: true }, alice)).status).toBe(403);
+    const ga = await workspace(alice, c.id);
+    const names = async (cookie: string) =>
+      (await (await gw("/templates/index.json", undefined, cookie)).json()).flatMap((cat: any) =>
+        cat.templates.map((t: any) => t.name)
+      );
+    expect(await names(ga)).toEqual(["class_image_flux", "class_video_wan_t2v_1_3b"]);
+    expect((await gw("/templates/class_video_minimax_h3.json", undefined, ga)).status).toBe(404);
+    const grant = await api(`/admin/classes/${c.id}/enrollments`, { id: mine.id, h3Video: true }, a, "PATCH");
+    expect(grant.status).toBe(200);
+    expect((await grant.json()).h3Video).toBe(true);
+    // The grant lands on the next workspace entry, without touching the base pair.
+    const gb = await workspace(alice, c.id);
+    expect(await names(gb)).toEqual(["class_image_flux", "class_video_wan_t2v_1_3b", "class_video_minimax_h3"]);
+    const graph = await gw("/templates/class_video_minimax_h3.json", undefined, gb);
+    expect(graph.status).toBe(200);
+    expect((await graph.json()).nodes.length).toBeGreaterThan(0);
+    const files = (await (await gw("/api/userdata?dir=workflows&recurse=true", undefined, gb)).json()) as string[];
+    expect(files).toContain("2 - Video with audio (MiniMax H3).json");
+    // Revoking hides the template and its graph but never deletes placed work.
+    expect((await api(`/admin/classes/${c.id}/enrollments`, { id: mine.id, h3Video: false }, a, "PATCH")).status).toBe(
+      200
+    );
+    expect(await names(gb)).toEqual(["class_image_flux", "class_video_wan_t2v_1_3b"]);
+    expect((await gw("/templates/class_video_minimax_h3.json", undefined, gb)).status).toBe(404);
+    const kept = (await (await gw("/api/userdata?dir=workflows&recurse=true", undefined, gb)).json()) as string[];
+    expect(kept).toContain("2 - Video with audio (MiniMax H3).json");
+  });
   it("keeps jobs queued while worker is offline, reconnects without duplicates, records execution and archive failures separately", async () => {
     const a = await admin(),
       c = await createClass(a);
@@ -733,6 +780,10 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
         (n) => n === 2
       );
       expect(mock.maxRunning).toBe(1);
+      // Terminal jobs release VRAM immediately: the scheduler POSTs /free once
+      // no platform job still needs the worker.
+      expect(mock.frees.length).toBeGreaterThan(0);
+      expect(mock.frees.every((v) => v.unload_models === true && v.free_memory === true)).toBe(true);
       expect(other.maxRunning).toBe(1);
     } finally {
       await scheduler?.stop();

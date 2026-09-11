@@ -31,6 +31,7 @@ export default function ClassDetail({ params: asyncParams }: { params: Promise<{
       jobs?: number;
       outputs?: number;
       accountStatus?: string;
+      h3Video?: boolean;
     }>
   >([]);
 
@@ -99,6 +100,7 @@ function RosterTab({
     jobs?: number;
     outputs?: number;
     accountStatus?: string;
+    h3Video?: boolean;
   }>;
   reload: () => void;
 }) {
@@ -279,6 +281,7 @@ function RosterTab({
               <th>Enrollment</th>
               <th>Last login</th>
               <th>Jobs / outputs</th>
+              <th>H3 example</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -297,6 +300,28 @@ function RosterTab({
                   <a className="underline" href={`/admin/jobs?classId=${classId}&userId=${e.userId || "unregistered"}`}>
                     {e.jobs || 0} / {e.outputs || 0}
                   </a>
+                </td>
+                <td>
+                  <button
+                    className="btn-secondary"
+                    disabled={!e.userId}
+                    title={
+                      e.userId
+                        ? "Seed the MiniMax-H3 example workflow into this student's workspace and template browser"
+                        : "Available once the student registers"
+                    }
+                    onClick={async () => {
+                      const r = await fetch(`/api/admin/classes/${classId}/enrollments`, {
+                        method: "PATCH",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ id: e.id, h3Video: !e.h3Video }),
+                      });
+                      if (!r.ok) setMsg((await r.json()).error);
+                      else reload();
+                    }}
+                  >
+                    {e.h3Video ? "Revoke H3" : "Give H3"}
+                  </button>
                 </td>
                 <td>
                   <button

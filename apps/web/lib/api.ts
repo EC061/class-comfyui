@@ -30,6 +30,8 @@ import {
   PasswordSchema,
   ClassCreateSchema,
   WorkerCreateSchema,
+  GRANTS_PATH,
+  GrantSchema,
   canonicalEmail,
 } from "@class-comfyui/shared";
 import { currentUser } from "./auth-helpers";
@@ -877,6 +879,30 @@ export async function handleApi(req: Request): Promise<Response> {
     return json({ error: "Request failed" }, 500);
   }
 }
+function readGrants(userId: string, classId: string) {
+  const row = getDb().list("user_data", "user_id=? AND class_id=? AND path=?", [userId, classId, GRANTS_PATH])[0];
+  if (!row?.content) return { h3Video: false };
+  try {
+    return GrantSchema.parse(JSON.parse(row.content));
+  } catch {
+    return { h3Video: false };
+  }
+}
+/** Merge one grant flag into the student's reserved row, preserving the rest. */
+function setGrant(userId: string, classId: string, h3Video: boolean) {
+  const db = getDb();
+  const current = readGrants(userId, classId);
+  const existing = db.list("user_data", "user_id=? AND class_id=? AND path=?", [userId, classId, GRANTS_PATH])[0];
+  db.put("user_data", {
+    id: existing?.id || randomUUID(),
+    userId,
+    classId,
+    path: GRANTS_PATH,
+    content: JSON.stringify({ ...current, h3Video }),
+    modified: Date.now(),
+  });
+  return h3Video;
+}
 function adminRoute(user: User, p: string, method: string, b: Record<string, any>, url: URL) {
   const db = getDb();
   const actor = db.get("users", user.id);
@@ -928,17 +954,39 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
       });
     }
     if (clsMatch[2] === "enrollments" && method === "PATCH") {
-      const input = z.object({ id: z.string(), status: z.enum(["ARCHIVED", "INVITED"]) }).parse(b),
+      const input = z
+          .object({
+            id: z.string(),
+            status: z.enum(["ARCHIVED", "INVITED"]).optional(),
+            h3Video: z.boolean().optional(),
+          })
+          .refine((v) => v.status !== undefined || v.h3Video !== undefined, "Nothing to update")
+          .parse(b),
         e = db.get("enrollments", input.id);
       if (!e || e.classId !== c.id) fail(404, "Enrollment not found");
-      e.status = input.status;
-      db.put("enrollments", e);
-      audit(input.status === "ARCHIVED" ? "ENROLLMENT_ARCHIVED" : "ENROLLMENT_REACTIVATED", {
-        actorId: user.id,
-        classId: c.id,
-        targetId: e.id,
-      });
-      return json({ enrollment: e });
+      if (input.status !== undefined) {
+        e.status = input.status;
+        db.put("enrollments", e);
+        audit(input.status === "ARCHIVED" ? "ENROLLMENT_ARCHIVED" : "ENROLLMENT_REACTIVATED", {
+          actorId: user.id,
+          classId: c.id,
+          targetId: e.id,
+        });
+      }
+      let h3Video: boolean | undefined;
+      if (input.h3Video !== undefined) {
+        // The H3 example is seeded into the student's workspace, so the grant
+        // needs a registered account to attach to — not just a roster row.
+        if (!e.userId) fail(409, "Student must register before receiving the H3 example");
+        h3Video = setGrant(e.userId, c.id, input.h3Video);
+        audit("GRANT_UPDATED", {
+          actorId: user.id,
+          classId: c.id,
+          targetId: e.userId,
+          metadata: { h3Video },
+        });
+      }
+      return json({ enrollment: e, ...(h3Video !== undefined ? { h3Video } : {}) });
     }
     if (method === "GET")
       return json({
@@ -947,6 +995,7 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
           ...e,
           lastLogin: e.userId ? db.get("users", e.userId)?.lastLoginAt : null,
           accountStatus: e.userId ? db.get("users", e.userId)?.status : "PENDING",
+          h3Video: e.userId ? readGrants(e.userId, c.id).h3Video : false,
           jobs: db.list("jobs", "enrollment_id=?", [e.id]).length,
           outputs: db
             .list("jobs", "enrollment_id=?", [e.id])

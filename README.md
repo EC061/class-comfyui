@@ -193,13 +193,13 @@ The management dashboard issues a signed, 60-second workspace ticket tied to use
 - Save-node prefixes are rewritten into the job's unique worker directory. API prompt and workflow JSON remain associated with the submitting user.
 - Only vetted frontend assets, model catalogs, and explicit APIs are served. Global mutation APIs, ComfyUI Manager install APIs, arbitrary custom routes, and unapproved node classes are denied.
 
-**A shared ComfyUI Python process is not an OS sandbox for arbitrary custom nodes.** `COMFY_ALLOWED_NODES` is an explicit allowlist of reviewed built-in nodes covering SDXL/Flux image generation and local MiniMax-H3 video+audio. It is default-deny, which matters more than usual now that ComfyUI ships cloud API nodes: `MiniMaxH3ImageToVideo` runs on this lab's GPUs, while the near-identically named `ComfyCloudMiniMaxH3ImageToVideoNode`, `Minimax*Node` and `MinimaxHailuo03*` send student prompts and images to a paid third-party service. Only the local variants are listed, and the same reasoning applies to the Veo, Sora, Kling and Runway nodes. Review a custom node's filesystem/network/subprocess behavior before adding it. Never enable arbitrary file readers, shell execution, or server administration nodes for students. If a course requires untrusted Python/custom nodes, run separate worker containers/VMs per trust boundary. Keep the same reviewed node/model set on interchangeable workers; model or node incompatibility is a visible failed job, not a silent retry.
+**A shared ComfyUI Python process is not an OS sandbox for arbitrary custom nodes.** `COMFY_ALLOWED_NODES` is an explicit allowlist of reviewed built-in nodes covering SDXL/Flux image generation, Wan 2.1 video generation, and local MiniMax-H3 video+audio. It is default-deny, which matters more than usual now that ComfyUI ships cloud API nodes: `MiniMaxH3ImageToVideo` runs on this lab's GPUs, while the near-identically named `ComfyCloudMiniMaxH3ImageToVideoNode`, `Minimax*Node` and `MinimaxHailuo03*` send student prompts and images to a paid third-party service. Only the local variants are listed, and the same reasoning applies to the Veo, Sora, Kling and Runway nodes. Review a custom node's filesystem/network/subprocess behavior before adding it. Never enable arbitrary file readers, shell execution, or server administration nodes for students. If a course requires untrusted Python/custom nodes, run separate worker containers/VMs per trust boundary. Keep the same reviewed node/model set on interchangeable workers; model or node incompatibility is a visible failed job, not a silent retry.
 
 The managed endpoints include `/prompt`, `/ws`, `/queue`, `/interrupt`, `/history`, `/view`, `/upload/image`, `/object_info`, `/system_stats`, `/settings`, `/userdata`, and `/v2/userdata` (also under `/api/` where applicable). Arbitrary extension APIs, upload-mask editing, and worker-global history deletion are not exposed. Frontend builds that require additional APIs need an explicitly authorized adapter, not transparent fallback proxying. Do not reuse one browser profile for different students; browser-local caches/extensions are outside server-side isolation.
 
 ## Starter workflows
 
-`apps/gateway/src/starters/` holds a curated set that reaches students two ways: it is written into each student's
+`apps/gateway/src/starters/` holds a curated pair that reaches students two ways: it is written into each student's
 workspace under `workflows/` the first time they open it, and it is the entire contents of the template browser. Existing
 students pick up new starters on their next visit, so distributing one never requires recreating a class.
 
@@ -214,24 +214,35 @@ A student who deletes or edits a starter keeps that decision: the `__starters__`
 and seeding never rewrites a path it has already offered. Bump `VERSION` in `apps/gateway/src/starters/index.ts` to push
 a revision to everyone.
 
-The Flux image starter is hand-authored. The MiniMax-H3 video starter is generated from the template installed alongside
-the running ComfyUI, because it is a subgraph workflow whose serialization tracks the frontend and a stale hand-copy
-fails in the student's editor rather than at build time. Regenerate it on the GPU host after a ComfyUI upgrade, then
-commit the result:
+The set is one image and two video examples, with the image starter first so it is the default students see:
+
+- **Image (Flux)**: hand-authored text-to-image on `flux1-schnell-fp8` (4 steps). Every student receives it.
+- **Video (Wan 2.1 1.3B)**: text-to-video on `wan2.1_t2v_1.3B_fp16` plus the UMT5 fp8 text encoder and Wan VAE
+  (`deploy/models/wan-t2v-1.3b.json`, ~10 GB total, a few minutes per 2-second 832x480 clip at 10 steps).
+  It is adapted from ComfyUI's official Wan T2V example, so it tracks the frontend's serialization. Every student
+  receives it.
+- **Video with audio (MiniMax H3)**: text-to-video with synchronized audio on the lab's own MiniMax-H3 weights with
+  the turbo LoRA enabled (8 steps). This one is **gated**: it is seeded and shown in the template browser only for
+  students whose teacher enabled it on the class roster (**Roster → Give H3**). Everyone else builds H3 graphs by
+  hand from the allowlisted H3 nodes, which is the actual exercise.
+
+Revoking the grant hides the H3 template and its graph again but never deletes a placed workspace file; the student
+keeps whatever they already received. Grants are stored per student per class and vanish with the class.
+
+Hand-building an H3 graph is genuinely fiddly — it samples through `SamplerCustomAdvanced` rather than `KSampler` —
+so keep this note where students can find it: H3 constrains video length to the model's block grid, so valid frame
+counts are `17k + 5` (5, 22, 39, 56, 73, …); 2 seconds at 24fps snaps to 56 frames via a math node, and the turbo LoRA
+(`minimax_h3_fl2v_turbo_8step`) is what makes a clip finish while a student watches instead of tying up a GPU.
+
+After editing a starter or upgrading ComfyUI, verify it before committing:
 
 ```bash
-scripts/build-starters.py            # defaults to /opt/comfyui
-git diff --stat apps/gateway/src/starters/
+scripts/build-starters.py            # defaults to http://127.0.0.1:8188
 ```
 
-The script repoints the template at the weights `deploy/models/minimax-h3.json` actually fetches, enables the turbo LoRA
-(8 sampling steps rather than roughly 20), drops the template's note cards, and then verifies every node type in both
-starters against a live worker's `/object_info` and against `COMFY_ALLOWED_NODES`. A starter referencing a blocked or
+The script checks every node type in all three starters against a live worker's `/object_info` and against
+`COMFY_ALLOWED_NODES`, and checks every loader filename against `deploy/models/`. A starter referencing a blocked or
 absent node fails at submit time with an error a student cannot act on, so that check gates the commit.
-
-H3 constrains video length to the model's block grid: valid frame counts are `17k + 5`, so 5, 22, 39, 56, 73, and so on.
-The starter asks for 2 seconds and the graph's math node snaps that to 56 frames at 24fps. A student who wires a length
-in by hand needs to respect the same grid.
 
 ## Completion, recovery and auditing
 
@@ -329,6 +340,7 @@ one administrator's shell history:
 ```bash
 scripts/fetch-models.sh --check minimax-h3     # verify every URL first, download nothing
 scripts/fetch-models.sh minimax-h3 flux-schnell
+scripts/fetch-models.sh wan-t2v-1.3b           # ~10 GB video example; H3 stays for hand-built graphs
 ```
 
 Each entry pins a URL, destination under `<comfy-dir>/models/`, byte size and SHA256.
@@ -362,6 +374,26 @@ credentials or query.
 Workers can equally be added through **Admin → Workers**; the manifest path exists so a
 freshly imaged GPU host needs no clicking. Health is polled every second, so a correctly
 registered instance turns `ONLINE` almost immediately.
+
+### Releasing VRAM: immediate unload and idle scale-to-zero
+
+ComfyUI keeps model weights in VRAM after a job finishes. Two mechanisms, on two hosts, return it:
+
+1. **Immediate unload (management host, automatic).** The scheduler POSTs
+   `/free` (`unload_models` + `free_memory`) to the worker the moment a platform job reaches a terminal
+   state — completed jobs free before archival even starts, since output downloads need no models. The call is
+   best-effort and never fails the job; it is skipped while another platform job still needs the worker or while
+   the worker reports external work. Expect a card to drop from tens of GB to its ~300MiB CUDA context right after
+   each job, and expect the next job on that card to pay a model-reload of tens of seconds.
+2. **Idle scale-to-zero (GPU host, opt-in).** That ~300MiB is the CUDA context plus PyTorch's allocator: it exists
+   from process start with no model loaded, and no flag or `/free` call removes it — only stopping the process
+   reaches zero. `scripts/comfyui-idle-reaper.sh` does that: it polls each running `comfyui@*` unit's `/queue`,
+   and after `--idle-seconds` (default 600) of continuous emptiness it frees once more and `systemctl stop`s the
+   unit. A stopped worker reads as `OFFLINE` in the gateway; queued platform jobs wait and dispatch when the unit
+   is started again (`sudo systemctl start 'comfyui@gpu*'`). Pass `--free-only` to unload idle models without
+   stopping (keeps the baseline, instant wake), or `--dry-run` to inspect. The reaper only manages `comfyui@*`
+   units; a hand-started `python main.py` holding gigabytes is reported by `nvidia-smi`, never touched — kill it
+   by hand and check `CUDA_VISIBLE_DEVICES` isolation if one process spans cards.
 
 ### After provisioning
 
@@ -491,6 +523,13 @@ Replace the example worker IP. Then repeat both checks through the public hostna
 - **Class deletion reports paths it could not remove:** the rows are already gone. Fix the filesystem permission or lock and delete the named paths by hand; nothing re-creates them.
 - **No metadata worker:** register a healthy backend at least once; workflows cannot be validated against a worker that has never supplied node metadata. Previously cached metadata permits queueing while that worker reconnects.
 - **Queued jobs:** inspect worker health, external work, tags and active quotas. Capability tags do not install models.
+- **VRAM still held after a job:** the scheduler frees unconditionally on terminal state, so a stuck allocation means
+  the worker did not get the call (stopped unit, firewall) or a non-platform process holds it — `nvidia-smi` names the
+  PID. A manual `python main.py` alongside the systemd units is the usual suspect; stop it, do not add more workers
+  around it.
+- **Idle workers hold ~300MiB each:** that is the CUDA context, present with no model loaded. Run
+  `scripts/comfyui-idle-reaper.sh` on the GPU host to stop idle units entirely, or accept it on cards dedicated
+  to the lab.
 - **LOST:** inspect the worker's private queue; do not automatically resubmit an ambiguous dispatch.
 - **Archive failed:** check free disk space and limits, restore worker history/output access, and use Retry archival.
 - **Unsupported node/API:** review it and implement a narrowly authorized adapter. Do not restore the original unrestricted proxy.

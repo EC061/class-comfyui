@@ -1,0 +1,23 @@
+[
+  {
+    "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/diffusion_models/wan2.1_t2v_1.3B_fp16.safetensors",
+    "dest": "diffusion_models",
+    "file": "wan2.1_t2v_1.3B_fp16.safetensors",
+    "bytes": 2838303560,
+    "note": "Wan 2.1 text-to-video, 1.3B. The seeded video example (2s, 832x480, ~10 steps, minutes per clip on an A6000). fp16 is small enough as-is; no quantized build needed. Apache-2.0."
+  },
+  {
+    "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+    "dest": "text_encoders",
+    "file": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+    "bytes": 6735906897,
+    "note": "UMT5-XXL text encoder, fp8-scaled. Shared by every Wan workflow; the fp16 build is 11 GB and buys nothing in class."
+  },
+  {
+    "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors",
+    "dest": "vae",
+    "file": "wan_2.1_vae.safetensors",
+    "bytes": 253815318,
+    "note": "Wan 2.1 video VAE. Required."
+  }
+]
