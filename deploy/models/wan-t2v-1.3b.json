@@ -4,6 +4,7 @@
     "dest": "diffusion_models",
     "file": "wan2.1_t2v_1.3B_fp16.safetensors",
     "bytes": 2838303560,
+    "sha256": "be531024cd9018cb5b48c40cfbb6a6191645b1c792eb8bf4f8c1c6e10f924dc5",
     "note": "Wan 2.1 text-to-video, 1.3B. The seeded video example (2s, 832x480, ~10 steps, minutes per clip on an A6000). fp16 is small enough as-is; no quantized build needed. Apache-2.0."
   },
   {
@@ -11,6 +12,7 @@
     "dest": "text_encoders",
     "file": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
     "bytes": 6735906897,
+    "sha256": "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68",
     "note": "UMT5-XXL text encoder, fp8-scaled. Shared by every Wan workflow; the fp16 build is 11 GB and buys nothing in class."
   },
   {
@@ -18,6 +20,7 @@
     "dest": "vae",
     "file": "wan_2.1_vae.safetensors",
     "bytes": 253815318,
+    "sha256": "2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b",
     "note": "Wan 2.1 video VAE. Required."
   }
 ]

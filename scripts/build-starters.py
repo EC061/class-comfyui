@@ -23,8 +23,15 @@ STARTERS = ["image-flux.json", "video-wan-t2v-1.3b.json", "video-minimax-h3.json
 
 
 def node_types(g):
-    """Every node type in the graph."""
-    return {n.get("type") for n in g.get("nodes", []) if n.get("type")}
+    """Every node type in the graph, including inside subgraph definitions."""
+    out = set()
+    for n in g.get("nodes", []):
+        out.add(n.get("type"))
+    for sg in g.get("definitions", {}).get("subgraphs", []):
+        out.update(n.get("type") for n in sg.get("nodes", []))
+        out.discard(None)
+    # Subgraph instances are typed by UUID; those are not real node classes.
+    return {t for t in out if t and "-" not in t}
 
 
 def main():

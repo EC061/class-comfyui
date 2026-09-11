@@ -67,7 +67,13 @@ done
 
 command -v curl >/dev/null || { echo "error: curl is required" >&2; exit 1; }
 command -v systemctl >/dev/null || { echo "error: systemctl is required" >&2; exit 1; }
-[ "$DRY_RUN" = 1 ] || mkdir -p "$STATE_DIR"
+if [ "$DRY_RUN" = 1 ]; then
+  # Track idle clocks in memory only: same decisions as a live run, no residue.
+  STATE_DIR="$(mktemp -d)"
+  trap 'rm -rf "$STATE_DIR"' EXIT
+else
+  mkdir -p "$STATE_DIR"
+fi
 
 # Running units this script may manage.
 mapfile -t MANAGED < <(systemctl list-units --type=service --state=running 'comfyui@*' --no-legend --no-pager | awk '{print $1}' | sed 's/^comfyui@//; s/\.service$//')
