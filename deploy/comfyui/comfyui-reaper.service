@@ -1,0 +1,16 @@
+[Unit]
+Description=ComfyUI idle VRAM reaper (free-only: workers stay online)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Installed with @REPO@ replaced by the checkout path, e.g.:
+#   sed "s|@REPO@|$HOME/class-comfyui|" deploy/comfyui/comfyui-reaper.service |
+#     sudo tee /etc/systemd/system/comfyui-reaper.service
+ExecStart=@REPO@/scripts/comfyui-idle-reaper.sh --free-only --idle-seconds 600
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

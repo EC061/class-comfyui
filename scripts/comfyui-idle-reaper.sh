@@ -62,6 +62,9 @@ run() {
     "$@"
   fi
 }
+# Unit control needs root. Under the persistent systemd unit we already are
+# root; interactively, sudo covers it.
+if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -149,7 +152,7 @@ while true; do
         active|activating|reloading) continue ;;
       esac
       log "$inst: platform work waiting, starting comfyui@$inst"
-      run sudo systemctl start "comfyui@$inst"
+      run $SUDO systemctl start "comfyui@$inst"
       rm -f "$STATE_DIR/$inst"
     done
   fi
@@ -179,7 +182,7 @@ while true; do
             date +%s >"$state"
           else
             log "$inst: stopping comfyui@$inst (a queued job will wake it)"
-            run sudo systemctl stop "comfyui@$inst"
+            run $SUDO systemctl stop "comfyui@$inst"
             rm -f "$state"
           fi
         else
