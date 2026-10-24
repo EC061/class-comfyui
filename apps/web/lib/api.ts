@@ -30,6 +30,7 @@ import {
   PasswordSchema,
   ClassCreateSchema,
   WorkerCreateSchema,
+  WorkerUpdateSchema,
   GRANTS_PATH,
   GrantSchema,
   canonicalEmail,
@@ -796,7 +797,7 @@ export async function handleApi(req: Request): Promise<Response> {
       limit("invitations", user.id, 2, 300000);
       const c = db.get("classes", inviteMatch[1]);
       if (!c?.active || !c.signupEnabled) fail(403, "Class signup unavailable");
-      const input = z.object({ signupUrl: z.string().url().max(1000) }).parse(b),
+      const input = z.object({ signupUrl: z.url().max(1000) }).parse(b),
         supplied = new URL(input.signupUrl),
         parts = supplied.pathname.split("/"),
         raw = parts.at(-1)!;
@@ -1079,7 +1080,7 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
   if (wMatch && (method === "PATCH" || method === "DELETE")) {
     const w = db.get("workers", wMatch[1]);
     if (!w) fail(404, "Worker not found");
-    const input = method === "DELETE" ? { enabled: false } : WorkerCreateSchema.partial().parse(b);
+    const input = method === "DELETE" ? { enabled: false } : WorkerUpdateSchema.parse(b);
     if ("baseUrl" in input && input.baseUrl) input.baseUrl = workerUrl(input.baseUrl);
     if (db.list("jobs", "worker_id=? AND status IN ('RUNNING','DISPATCHING')", [w.id]).length && "baseUrl" in input)
       fail(409, "Wait for active jobs before changing worker URL");
