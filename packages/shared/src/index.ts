@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const EmailSchema = z.string().trim().toLowerCase().pipe(z.string().email().max(320)).transform(canonicalEmail);
+export const EmailSchema = z.string().trim().toLowerCase().pipe(z.email().max(320)).transform(canonicalEmail);
 
 /**
  * University-issued addresses appear on rosters under the campus subdomain
@@ -37,16 +37,32 @@ export const ClassCreateSchema = z.object({
     .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "slug must be kebab-case"),
 });
 
-export const WorkerCreateSchema = z.object({
+const WorkerFieldsSchema = z.object({
   name: z.string().min(1).max(100),
-  baseUrl: z.string().url(),
-  enabled: z.boolean().default(true),
-  gpuName: z.string().max(100).default(""),
-  vramMb: z.coerce.number().int().nonnegative().default(0),
-  architecture: z.string().max(100).default(""),
-  tags: z.array(z.string().max(50)).default([]),
-  maxConcurrentJobs: z.coerce.number().int().min(1).max(16).default(1),
+  baseUrl: z.url(),
+  enabled: z.boolean(),
+  gpuName: z.string().max(100),
+  vramMb: z.coerce.number().int().nonnegative(),
+  architecture: z.string().max(100),
+  tags: z.array(z.string().max(50)),
+  maxConcurrentJobs: z.coerce.number().int().min(1).max(16),
 });
+
+export const WorkerCreateSchema = WorkerFieldsSchema.extend({
+  enabled: WorkerFieldsSchema.shape.enabled.default(true),
+  gpuName: WorkerFieldsSchema.shape.gpuName.default(""),
+  vramMb: WorkerFieldsSchema.shape.vramMb.default(0),
+  architecture: WorkerFieldsSchema.shape.architecture.default(""),
+  tags: WorkerFieldsSchema.shape.tags.default([]),
+  maxConcurrentJobs: WorkerFieldsSchema.shape.maxConcurrentJobs.default(1),
+});
+
+/**
+ * PATCH body: only the fields that were sent. Built from the default-free shape
+ * because zod 4 applies `.default()` inside `.partial()`, which would reset every
+ * omitted field (e.g. toggling `enabled` would wipe tags and concurrency).
+ */
+export const WorkerUpdateSchema = WorkerFieldsSchema.partial();
 
 export const JobStatusSchema = z.enum(["QUEUED", "DISPATCHING", "RUNNING", "COMPLETED", "FAILED", "CANCELLED", "LOST"]);
 

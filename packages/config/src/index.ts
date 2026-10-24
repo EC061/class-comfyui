@@ -1,18 +1,10 @@
 import { z } from "zod";
-const canonical = z
-  .string()
-  .url()
-  .refine((v) => {
-    const u = new URL(v);
-    return (
-      ["http:", "https:"].includes(u.protocol) &&
-      !u.username &&
-      !u.password &&
-      u.pathname === "/" &&
-      !u.search &&
-      !u.hash
-    );
-  }, "Must be an HTTP(S) origin without path, credentials, query or fragment");
+const canonical = z.url().refine((v) => {
+  const u = new URL(v);
+  return (
+    ["http:", "https:"].includes(u.protocol) && !u.username && !u.password && u.pathname === "/" && !u.search && !u.hash
+  );
+}, "Must be an HTTP(S) origin without path, credentials, query or fragment");
 const positive = (n: number) => z.coerce.number().int().positive().default(n);
 const EnvSchema = z.object({
   NODE_ENV: z.enum(["production", "development", "test"]).default("development"),
@@ -30,7 +22,7 @@ const EnvSchema = z.object({
   SMTP_PASSWORD: z.string().default(""),
   SMTP_SECURE: z.enum(["true", "false"]).default("false"),
   SMTP_FROM_NAME: z.string().default("ComfyUI Lab"),
-  SMTP_FROM_EMAIL: z.string().email().default("noreply@example.edu"),
+  SMTP_FROM_EMAIL: z.email().default("noreply@example.edu"),
   AUDIT_DATA_DIR: z.string().default("./data/audit"),
   UPLOAD_DATA_DIR: z.string().default("./data/uploads"),
   AUDIT_RETENTION_ENABLED: z.enum(["true", "false"]).default("false"),

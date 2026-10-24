@@ -904,6 +904,28 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     expect(getDb().userByEmail("student1@example.edu")?.globalRole).toBe("ADMIN");
     expect((await api("/admin/metrics", undefined, s)).status).toBe(200);
   });
+  it("updates only the worker fields a PATCH sends", async () => {
+    const a = await admin();
+    const created = await api(
+      "/workers",
+      { name: "GPU", baseUrl: mock.url, gpuName: "RTX 6000", vramMb: 49152, tags: ["video"], maxConcurrentJobs: 4 },
+      a
+    );
+    expect(created.status).toBe(201);
+    const id = (await created.json()).worker.id;
+    // The admin page's enable toggle sends only `enabled`; nothing else may reset to its default.
+    expect((await api(`/workers/${id}`, { enabled: false }, a, "PATCH")).status).toBe(200);
+    const w = getDb().get("workers", id)!;
+    expect(w).toMatchObject({
+      enabled: false,
+      healthStatus: "DISABLED",
+      gpuName: "RTX 6000",
+      vramMb: 49152,
+      tags: ["video"],
+      maxConcurrentJobs: 4,
+    });
+    expect((await api(`/workers/${id}`, { maxConcurrentJobs: 0 }, a, "PATCH")).status).toBe(400);
+  });
   it("refuses to delete a class while its jobs are queued or running", async () => {
     const a = await admin(),
       c = await createClass(a);
