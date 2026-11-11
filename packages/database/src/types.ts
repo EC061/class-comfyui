@@ -21,6 +21,12 @@ export interface ClassRow {
   description: string;
   slug: string;
   active: boolean;
+  /** When true, students keep dashboard/history access but cannot open or use the ComfyUI workspace. */
+  paused?: boolean;
+  /** When true, all students in this class receive the H3 example workflows by default (including before signup). */
+  h3Video?: boolean;
+  /** Internal hidden workspace row used when administrators open ComfyUI directly without a student account. */
+  system?: boolean;
   signupEnabled: boolean;
   signupTokenVersion: number;
   createdAt: string;
@@ -36,6 +42,8 @@ export interface Enrollment {
   lastName: string;
   role: Role;
   status: "INVITED" | "ACTIVE" | "ARCHIVED";
+  /** Per-student H3 grant override; works even before the student registers an account. */
+  h3Video?: boolean;
 }
 export interface SignupToken {
   id: string;
@@ -86,6 +94,9 @@ export interface Worker {
   healthStatus: "ONLINE" | "BUSY" | "OFFLINE" | "DISABLED";
   lastAssignedAt: number;
   externalBusy: boolean;
+  externalBusyReason?: string | null;
+  vramUsedMb?: number | null;
+  vramFreeMb?: number | null;
   nodeDefinitions?: Record<string, any>;
   // Reported by the worker's /system_stats during health polling. Surfaced to the
   // workspace so its frontend can version-check nodes instead of guessing.

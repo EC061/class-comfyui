@@ -7,10 +7,14 @@ import {
   getDb,
   audit,
   activeMembership,
+  fairQueuedJobs,
   type Verification,
   type User,
+  type Worker,
+  type ClassRow,
   type Enrollment,
   type Role,
+  type Job,
 } from "@class-comfyui/database";
 import { getEnv, appUrl } from "@class-comfyui/config";
 import {
@@ -31,6 +35,7 @@ import {
   ClassCreateSchema,
   WorkerCreateSchema,
   WorkerUpdateSchema,
+  ADMIN_WORKSPACE_SLUG,
   GRANTS_PATH,
   GrantSchema,
   canonicalEmail,
@@ -48,7 +53,7 @@ import {
   signupInviteEmail,
 } from "./mailer";
 import { generateSignupUrl, validateSignupToken, setSignupEnabled } from "./signup";
-import { purgeClass, ActiveJobsError } from "./purge";
+import { purgeClass, purgeEnrollment, ActiveJobsError } from "./purge";
 class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -62,6 +67,15 @@ function fail(status: number, message: string, code?: string): never {
   throw new ApiError(status, message, code);
 }
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { "Cache-Control": "no-store" } });
+function publicUser(u: User | null | undefined) {
+  if (!u) return null;
+  const { passwordHash: _omitted, ...safe } = u;
+  return safe;
+}
+function publicWorker(w: Worker) {
+  const { nodeDefinitions: _omitted, ...safe } = w;
+  return safe;
+}
 function limit(action: string, id: string, n = 10, ms = 60000) {
   if (!checkRateLimit(action, id, n, ms)) fail(429, "Too many requests. Try again later.");
 }
@@ -171,9 +185,17 @@ async function register(req: Request, b: Record<string, any>) {
   const input = RegisterSchema.parse(b),
     env = getEnv(),
     ip = clientIp(req.headers);
-  limit("register-ip", ip, 20, 300000);
+  // Campus Wi-Fi puts all 30+ students behind a shared NAT IP, so IP buckets
+  // accommodate a full classroom burst while per-email buckets stay strict.
+  limit("register-ip", ip, 150, 300000);
   limit("register-email", input.email, 5, 300000);
-  if (input.adminCode) limit("admin-register", ip, 5, 300000);
+  if (input.adminCode) {
+    limit("admin-register", ip, 5, 300000);
+    if (!checkAdminCode(input.adminCode, env.ADMIN_REGISTRATION_CODE)) {
+      audit("ADMIN_CODE_FAILED", { metadata: { email: input.email, ip, source: "register" } });
+      fail(403, "Incorrect administrator registration code");
+    }
+  }
   // Hashing is deliberately expensive, so it happens before the writer transaction.
   const passwordHash = await hashPassword(input.password);
   const raw = newVerificationToken();
@@ -192,8 +214,6 @@ async function register(req: Request, b: Record<string, any>) {
       rosterFirst = "",
       rosterLast = "";
     if (input.adminCode) {
-      if (!checkAdminCode(input.adminCode, env.ADMIN_REGISTRATION_CODE))
-        fail(403, "Incorrect administrator registration code");
       role = "ADMIN";
     } else if (input.classSlug || input.signupToken) {
       if (!input.classSlug || !input.signupToken) fail(403, "A valid class signup link is required");
@@ -255,7 +275,7 @@ async function register(req: Request, b: Record<string, any>) {
 /** The one email confirmation in an account's life: it activates and signs in. */
 function activate(req: Request, b: Record<string, any>) {
   const input = z.object({ email: EmailSchema, token: TokenSchema }).parse(b);
-  limit("verification", clientIp(req.headers), 120);
+  limit("verification", clientIp(req.headers), 180);
   return getDb().transaction(() => {
     const db = getDb(),
       row = db.get("verifications", hashToken(input.token));
@@ -315,8 +335,9 @@ function activate(req: Request, b: Record<string, any>) {
 let decoy: Promise<string> | undefined;
 
 async function login(req: Request, b: Record<string, any>) {
-  const input = z.object({ email: EmailSchema, password: z.string().min(1).max(200) }).parse(b);
-  limit("login-ip", clientIp(req.headers), 60, 300000);
+  const input = z.object({ email: EmailSchema, password: z.string().min(1).max(200) }).parse(b),
+    ip = clientIp(req.headers);
+  limit("login-ip", ip, 200, 300000);
   limit("login-email", input.email, 10, 300000);
   const db = getDb(),
     u = db.userByEmail(input.email);
@@ -325,7 +346,10 @@ async function login(req: Request, b: Record<string, any>) {
     input.password,
     usable ? u!.passwordHash : await (decoy ??= hashPassword(randomToken()))
   );
-  if (!usable || !ok) fail(401, "Incorrect email or password");
+  if (!usable || !ok) {
+    audit("LOGIN_FAILED", { actorId: u?.id ?? null, metadata: { email: input.email, ip } });
+    fail(401, "Incorrect email or password");
+  }
   if (u!.status === "DISABLED") fail(403, "Account unavailable");
   if (u!.status === "PENDING")
     fail(403, "Confirm your email address to activate this account, then sign in.", "PENDING");
@@ -334,6 +358,7 @@ async function login(req: Request, b: Record<string, any>) {
     if (!fresh || fresh.status !== "ACTIVE") fail(403, "Account unavailable");
     fresh.lastLoginAt = new Date().toISOString();
     db.put("users", fresh);
+    audit("LOGIN_SUCCEEDED", { actorId: fresh.id, targetId: fresh.id }, db);
     return sessionResponse(fresh);
   });
 }
@@ -419,51 +444,119 @@ async function confirmPasswordReset(req: Request, b: Record<string, any>) {
   });
 }
 
-function shapedJobs(user: User, url: URL) {
+function shapedJobs(user: User, url: URL, precomputedQueue?: Job[]) {
   const db = getDb();
-  let jobs = db.list(
-    "jobs",
-    user.globalRole === "ADMIN" ? "1" : "user_id=?",
-    user.globalRole === "ADMIN" ? [] : [user.id]
-  );
-  for (const [key, field] of [
-    ["classId", "classId"],
-    ["userId", "userId"],
-    ["status", "status"],
-    ["workerId", "workerId"],
-  ] as const) {
-    const v = url.searchParams.get(key);
-    if (v) jobs = jobs.filter((j) => j[field] === v);
-  }
   const jobId = url.searchParams.get("jobId");
-  if (jobId) jobs = jobs.filter((j) => j.id === jobId);
+  const fairQueue = precomputedQueue ?? fairQueuedJobs(db, getEnv().MAX_ACTIVE_JOBS_PER_USER);
+  const queuePosById = new Map<string, number>();
+  fairQueue.forEach((qj, idx) => queuePosById.set(qj.id, idx + 1));
+
   const q = (url.searchParams.get("q") || "").toLowerCase(),
     from = url.searchParams.get("from"),
     to = url.searchParams.get("to"),
     type = url.searchParams.get("outputType");
+
+  let jobs: Job[];
+  if (jobId) {
+    const single = db.get("jobs", jobId);
+    jobs = single && (user.globalRole === "ADMIN" || single.userId === user.id) ? [single] : [];
+  } else {
+    const clauses: string[] = [];
+    const params: (string | number | null)[] = [];
+    if (user.globalRole !== "ADMIN") {
+      clauses.push("user_id=?");
+      params.push(user.id);
+    }
+    for (const [paramName, col] of [
+      ["classId", "class_id"],
+      ["userId", "user_id"],
+      ["status", "status"],
+      ["workerId", "worker_id"],
+    ] as const) {
+      const v = url.searchParams.get(paramName);
+      if (v) {
+        clauses.push(`${col}=?`);
+        params.push(v);
+      }
+    }
+    if (from) {
+      clauses.push("submitted_at>=?");
+      params.push(from);
+    }
+    if (to) {
+      clauses.push("submitted_at<=?");
+      params.push(to + "T23:59:59.999Z");
+    }
+    const whereSql = clauses.length ? clauses.join(" AND ") : "1";
+    const sqlLimit = q || type ? 2000 : 500;
+    const rawRows = db.sql
+      .prepare(
+        `SELECT json_remove(data,'$.promptJson','$.submittedPromptJson','$.workflowJson','$.history') AS data FROM jobs WHERE ${whereSql} ORDER BY submitted_at DESC LIMIT ?`
+      )
+      .all(...params, sqlLimit) as Array<{ data: string }>;
+    jobs = rawRows.map((r) => JSON.parse(r.data) as Job);
+  }
+
+  const workerNames = new Map<string, string | null>();
+  const userEmails = new Map<string, string | undefined>();
+  const getWorkerName = (wid: string | null) => {
+    if (!wid) return null;
+    if (!workerNames.has(wid)) workerNames.set(wid, db.get("workers", wid)?.name ?? null);
+    return workerNames.get(wid)!;
+  };
+  const getEmail = (uid: string) => {
+    if (!userEmails.has(uid)) userEmails.set(uid, db.get("users", uid)?.email);
+    return userEmails.get(uid);
+  };
+
+  if (q) {
+    jobs = jobs.filter((j) => `${j.id} ${j.orgDefinedId} ${getEmail(j.userId) ?? ""}`.toLowerCase().includes(q));
+  }
+  if (!type) {
+    jobs = jobs.slice(0, 500);
+  }
+
+  const outputsByJobId = new Map<string, ReturnType<typeof db.list<"outputs">>>();
+  if (jobs.length > 0) {
+    const ids = jobs.map((j) => j.id);
+    const placeholders = ids.map(() => "?").join(",");
+    for (const o of db.list("outputs", `job_id IN (${placeholders})`, ids)) {
+      const arr = outputsByJobId.get(o.jobId);
+      if (arr) arr.push(o);
+      else outputsByJobId.set(o.jobId, [o]);
+    }
+  }
+
   return jobs
-    .sort((a, b) => b.submittedAt.localeCompare(a.submittedAt))
-    .filter((j) => !from || j.submittedAt >= from)
-    .filter((j) => !to || j.submittedAt <= to + "T23:59:59.999Z")
     .map((j) => ({
       ...j,
+      ...(jobId
+        ? {}
+        : {
+            promptJson: undefined,
+            submittedPromptJson: undefined,
+            workflowJson: undefined,
+          }),
       leaseOwner: undefined,
       extraData: undefined,
       history: undefined,
-      workerName: j.workerId ? db.get("workers", j.workerId)?.name : null,
-      email: db.get("users", j.userId)?.email,
-      outputs: db
-        .list("outputs", "job_id=?", [j.id])
-        .map((o) => ({ ...o, storagePath: undefined, url: `/api/outputs/${o.id}` })),
+      queuePosition: j.status === "QUEUED" ? (queuePosById.get(j.id) ?? null) : null,
+      workerName: getWorkerName(j.workerId),
+      email: getEmail(j.userId),
+      outputs: (outputsByJobId.get(j.id) || []).map((o) => ({
+        ...o,
+        storagePath: undefined,
+        url: `/api/outputs/${o.id}`,
+      })),
     }))
-    .filter((j) => !q || `${j.id} ${j.orgDefinedId} ${j.email}`.toLowerCase().includes(q))
     .filter((j) => !type || j.outputs.some((o) => o.mimeType.startsWith(type)))
     .slice(0, 500);
 }
 function rosterPreview(user: User, b: Record<string, any>) {
   const input = z.object({ classId: z.string(), csv: z.string().min(1).max(5_000_000) }).parse(b),
-    db = getDb();
-  if (!db.get("classes", input.classId)) fail(404, "Class not found");
+    db = getDb(),
+    cls = db.get("classes", input.classId);
+  if (!cls || cls.system) fail(404, "Class not found");
   const { rows, errors } = parseRosterCsv(input.csv);
   if (errors.length) fail(400, errors.join("; "));
   const existing = db.list("enrollments", "class_id=?", [input.classId]);
@@ -519,7 +612,7 @@ function rosterCommit(user: User, b: Record<string, any>) {
     if (batch.summary.invalidCount || batch.summary.duplicateCount)
       fail(400, "Fix invalid and duplicate rows before importing");
     const c = db.get("classes", batch.classId);
-    if (!c) fail(404, "Class not found");
+    if (!c || c.system) fail(404, "Class not found");
     let created = 0,
       updated = 0;
     for (const r of batch.rows) {
@@ -548,8 +641,11 @@ function rosterCommit(user: User, b: Record<string, any>) {
           e.lastName !== r.lastName;
         if (changed) updated++;
         if (e.rosterEmail !== r.email) {
+          db.deleteWhere("gateway_sessions", "json_extract(data,'$.enrollmentId')=?", [e.id]);
+          db.deleteWhere("workspace_tickets", "json_extract(data,'$.enrollmentId')=?", [e.id]);
           e.userId = null;
           e.status = "INVITED";
+          delete e.h3Video;
         }
         Object.assign(e, {
           rosterEmail: r.email,
@@ -566,6 +662,8 @@ function rosterCommit(user: User, b: Record<string, any>) {
       if (!e || e.classId !== c.id) fail(409, "Roster changed; preview again");
       e.status = "ARCHIVED";
       db.put("enrollments", e);
+      db.deleteWhere("gateway_sessions", "json_extract(data,'$.enrollmentId')=?", [e.id]);
+      db.deleteWhere("workspace_tickets", "json_extract(data,'$.enrollmentId')=?", [e.id]);
       audit("ENROLLMENT_ARCHIVED", { actorId: user.id, classId: c.id, targetId: id });
     }
     batch.status = "COMMITTED";
@@ -613,27 +711,32 @@ export async function handleApi(req: Request): Promise<Response> {
     const user = currentUser(req);
     if (p === "/api/auth/session") {
       const enrollments = user
-        ? db.list("enrollments", "user_id=?", [user.id]).map((e) => {
-            const c = db.get("classes", e.classId);
-            return {
-              ...e,
-              classSlug: c?.slug,
-              className: c?.name,
-              courseCode: c?.courseCode,
-              term: c?.term,
-              classActive: c?.active,
-            };
-          })
+        ? db
+            .list("enrollments", "user_id=?", [user.id])
+            .map((e) => {
+              const c = db.get("classes", e.classId);
+              if (c?.system) return null;
+              return {
+                ...e,
+                classSlug: c?.slug,
+                className: c?.name,
+                courseCode: c?.courseCode,
+                term: c?.term,
+                classActive: c?.active,
+                classPaused: Boolean(c?.paused),
+              };
+            })
+            .filter((v): v is NonNullable<typeof v> => v !== null)
         : [];
-      return json({ user: user ?? null, enrollments });
+      return json({ user: publicUser(user), enrollments });
     }
     if (!user) fail(401, "Authentication required");
     // Joining a second class needs no new email confirmation: the account's address
     // is already proven, and the roster plus signup link still gate eligibility.
-    if (p === "/api/enroll" && method === "POST")
+    if (p === "/api/enroll" && method === "POST") {
+      const input = z.object({ classSlug: z.string().max(100), signupToken: TokenSchema }).parse(b);
+      limit("enroll", user.id, 10, 300000);
       return db.transaction(() => {
-        const input = z.object({ classSlug: z.string().max(100), signupToken: TokenSchema }).parse(b);
-        limit("enroll", user.id, 10, 300000);
         const valid = validateSignupToken(input.classSlug, input.signupToken);
         if (!valid.ok) fail(403, "Invalid or disabled signup link");
         const e = db
@@ -648,15 +751,19 @@ export async function handleApi(req: Request): Promise<Response> {
         audit("ENROLLMENT_JOINED", { actorId: user.id, classId: valid.classId!, targetId: e.id });
         return json({ ok: true, classId: valid.classId! });
       });
+    }
     // Lets an existing signed-in account claim administrator rights with the code,
     // so becoming an administrator never needs a second account.
-    if (p === "/api/auth/admin-code" && method === "POST")
+    if (p === "/api/auth/admin-code" && method === "POST") {
+      const input = z.object({ adminCode: z.string().min(1).max(1000) }).parse(b),
+        ip = clientIp(req.headers);
+      limit("admin-elevate-ip", ip, 5, 300000);
+      limit("admin-elevate", user.id, 5, 300000);
+      if (!checkAdminCode(input.adminCode, getEnv().ADMIN_REGISTRATION_CODE)) {
+        audit("ADMIN_CODE_FAILED", { actorId: user.id, targetId: user.id, metadata: { ip, source: "admin-code" } });
+        fail(403, "Incorrect administrator registration code");
+      }
       return db.transaction(() => {
-        const input = z.object({ adminCode: z.string().min(1).max(1000) }).parse(b);
-        limit("admin-elevate-ip", clientIp(req.headers), 5, 300000);
-        limit("admin-elevate", user.id, 5, 300000);
-        if (!checkAdminCode(input.adminCode, getEnv().ADMIN_REGISTRATION_CODE))
-          fail(403, "Incorrect administrator registration code");
         const u = db.get("users", user.id);
         if (!u || u.status !== "ACTIVE") fail(403, "Account unavailable");
         if (u.globalRole !== "ADMIN") {
@@ -666,40 +773,79 @@ export async function handleApi(req: Request): Promise<Response> {
         }
         return json({ ok: true, role: u.globalRole });
       });
-    if (p === "/api/workspace/session" && method === "POST")
+    }
+    if (p === "/api/workspace/session" && method === "POST") {
+      const input = z.object({ classId: z.string().min(1).optional() }).parse(b);
+      limit("workspace", user.id, 60);
       return db.transaction(() => {
-        const input = z.object({ classId: z.string() }).parse(b);
-        limit("workspace", user.id, 20);
-        const e = activeMembership(db, user.id, input.classId);
-        if (!e) fail(403, "No active class enrollment");
+        const actor = db.get("users", user.id);
+        if (!actor || actor.status !== "ACTIVE") fail(403, "Account unavailable");
+        let e: Enrollment | undefined;
+        if (!input.classId) {
+          if (actor.globalRole !== "ADMIN") fail(400, "classId is required");
+          e = ensureAdminWorkspace(db, actor);
+        } else {
+          const cls = db.get("classes", input.classId);
+          const enrolled = db
+            .list("enrollments", "class_id=? AND user_id=?", [input.classId, actor.id])
+            .find((v) => v.status === "ACTIVE");
+          if (cls?.active && cls.paused && actor.globalRole !== "ADMIN" && enrolled) {
+            fail(403, "Access to ComfyUI for this class is currently paused by your instructor.", "CLASS_PAUSED");
+          }
+          e = activeMembership(db, actor.id, input.classId);
+          if (!e) fail(403, "No active class enrollment");
+        }
         const env = getEnv(),
           jti = randomUUID();
         db.put("workspace_tickets", {
           id: jti,
-          userId: user.id,
+          userId: actor.id,
           classId: e.classId,
           enrollmentId: e.id,
           expiresAt: Date.now() + env.WORKSPACE_TOKEN_TTL_SECONDS * 1000,
           consumedAt: null,
         });
         const token = signWorkspaceToken(
-          { sub: user.id, classId: e.classId, enrollmentId: e.id, jti, ttlSeconds: env.WORKSPACE_TOKEN_TTL_SECONDS },
+          { sub: actor.id, classId: e.classId, enrollmentId: e.id, jti, ttlSeconds: env.WORKSPACE_TOKEN_TTL_SECONDS },
           env.WORKSPACE_JWT_SECRET
         );
         return json({ url: appUrl(env.COMFY_PUBLIC_URL, `/auth/exchange?token=${encodeURIComponent(token)}`) });
       });
-    if (p === "/api/jobs" && method === "GET") return json({ jobs: shapedJobs(user, url) });
+    }
+    if (p === "/api/jobs" && method === "GET") {
+      const fairQueue = fairQueuedJobs(db, getEnv().MAX_ACTIVE_JOBS_PER_USER);
+      const availableGpus = db
+        .list("workers")
+        .filter((w) => w.enabled && ["ONLINE", "BUSY"].includes(w.healthStatus) && !w.externalBusy).length;
+      const runningJobs = Number(
+        (
+          db.sql.prepare("SELECT COUNT(*) AS cnt FROM jobs WHERE status IN ('DISPATCHING','RUNNING')").get() as {
+            cnt: number;
+          }
+        )?.cnt || 0
+      );
+      return json({
+        jobs: shapedJobs(user, url, fairQueue),
+        queueSummary: {
+          availableGpus,
+          runningJobs,
+          queuedJobs: fairQueue.length,
+        },
+      });
+    }
     const retryMatch = p.match(/^\/api\/jobs\/([^/]+)\/archive$/);
-    if (retryMatch && method === "POST")
+    if (retryMatch && method === "POST") {
+      limit("archive-retry", user.id, 5, 300000);
       return db.transaction(() => {
         const j = db.get("jobs", retryMatch[1]);
         if (!j || (user.globalRole !== "ADMIN" && j.userId !== user.id)) fail(404, "Job not found");
         if (j.status !== "COMPLETED" || j.archiveStatus !== "FAILED") fail(409, "Only failed archives can be retried");
-        limit("archive-retry", user.id, 5, 300000);
         j.archiveStatus = "ARCHIVING";
         db.put("jobs", j);
+        audit("ARCHIVE_RETRY_REQUESTED", { actorId: user.id, classId: j.classId, targetId: j.id });
         return json({ ok: true });
       });
+    }
     const jobMatch = p.match(/^\/api\/jobs\/([^/]+)$/);
     if (jobMatch) {
       const j = db.get("jobs", jobMatch[1]);
@@ -714,8 +860,23 @@ export async function handleApi(req: Request): Promise<Response> {
           if (current.status === "QUEUED") {
             current.status = "CANCELLED";
             current.completedAt = new Date().toISOString();
-          } else if (["RUNNING", "DISPATCHING"].includes(current.status)) current.cancelRequested = true;
-          db.put("jobs", current);
+            db.put("jobs", current);
+            audit("JOB_CANCELLED", {
+              actorId: user.id,
+              classId: current.classId,
+              targetId: current.id,
+              metadata: { status: "CANCELLED", source: "web_api" },
+            });
+          } else if (["RUNNING", "DISPATCHING"].includes(current.status) && !current.cancelRequested) {
+            current.cancelRequested = true;
+            db.put("jobs", current);
+            audit("JOB_CANCEL_REQUESTED", {
+              actorId: user.id,
+              classId: current.classId,
+              targetId: current.id,
+              metadata: { source: "web_api" },
+            });
+          }
           return json({ ok: true });
         });
     }
@@ -761,19 +922,27 @@ export async function handleApi(req: Request): Promise<Response> {
     }
     if (user.globalRole !== "ADMIN") fail(403, "Administrator required");
     if (p === "/api/admin/metrics" && method === "GET") {
-      const jobs = db.list("jobs"),
-        today = new Date().toISOString().slice(0, 10);
+      const allWorkers = db.list("workers"),
+        todayPrefix = new Date().toISOString().slice(0, 10) + "%";
+      const scalar = (sql: string, ...params: (string | number | null)[]) =>
+        Number((db.sql.prepare(sql).get(...params) as { cnt: number } | undefined)?.cnt || 0);
       return json({
-        activeClasses: db.list("classes").filter((c) => c.active).length,
+        activeClasses: db.list("classes").filter((c) => c.active && !c.system).length,
         students: db.list("users").filter((u) => u.globalRole === "STUDENT" && u.status === "ACTIVE").length,
-        pending: db.list("enrollments").filter((e) => !e.userId && e.status === "INVITED").length,
-        queued: jobs.filter((j) => j.status === "QUEUED").length,
-        active: jobs.filter((j) => ["RUNNING", "DISPATCHING"].includes(j.status)).length,
-        workers: db.list("workers").length,
-        gpus: db.list("workers").filter((w) => w.enabled && ["ONLINE", "BUSY"].includes(w.healthStatus)).length,
-        jobsToday: jobs.filter((j) => j.submittedAt.startsWith(today)).length,
-        failures: jobs.filter((j) => ["FAILED", "LOST"].includes(j.status)).length,
-        outputsToday: db.list("outputs").filter((o) => db.get("jobs", o.jobId)?.completedAt?.startsWith(today)).length,
+        pending: db.list("enrollments").filter((e) => !e.userId && e.status === "INVITED" && e.role === "STUDENT")
+          .length,
+        queued: scalar("SELECT COUNT(*) AS cnt FROM jobs WHERE status='QUEUED'"),
+        active: scalar("SELECT COUNT(*) AS cnt FROM jobs WHERE status IN ('RUNNING','DISPATCHING')"),
+        workers: allWorkers.length,
+        gpus: allWorkers.filter((w) => w.enabled && ["ONLINE", "BUSY"].includes(w.healthStatus) && !w.externalBusy)
+          .length,
+        externalBusyGpus: allWorkers.filter((w) => w.enabled && w.externalBusy).length,
+        jobsToday: scalar("SELECT COUNT(*) AS cnt FROM jobs WHERE submitted_at LIKE ?", todayPrefix),
+        failures: scalar("SELECT COUNT(*) AS cnt FROM jobs WHERE status IN ('FAILED','LOST')"),
+        outputsToday: scalar(
+          "SELECT COUNT(o.id) AS cnt FROM outputs o JOIN jobs j ON j.id=o.job_id WHERE json_extract(j.data,'$.completedAt') LIKE ?",
+          todayPrefix
+        ),
       });
     }
     if (p === "/api/roster/preview" && method === "POST") return db.transaction(() => rosterPreview(user, b));
@@ -796,7 +965,7 @@ export async function handleApi(req: Request): Promise<Response> {
     if (inviteMatch && method === "POST") {
       limit("invitations", user.id, 2, 300000);
       const c = db.get("classes", inviteMatch[1]);
-      if (!c?.active || !c.signupEnabled) fail(403, "Class signup unavailable");
+      if (!c?.active || c.system || !c.signupEnabled) fail(403, "Class signup unavailable");
       const input = z.object({ signupUrl: z.url().max(1000) }).parse(b),
         supplied = new URL(input.signupUrl),
         parts = supplied.pathname.split("/"),
@@ -833,12 +1002,39 @@ export async function handleApi(req: Request): Promise<Response> {
       audit("INVITATIONS_SENT", { actorId: user.id, classId: c.id, targetId: c.id, metadata: { sent, failed } });
       return json({ ok: failed === 0, sent, failed });
     }
+    // Permanent enrollment deletion also cleans up stored class files on disk, so it
+    // runs outside the synchronous administrative write transaction below.
+    const enrollmentDeleteMatch = p.match(/^\/api\/admin\/classes\/([^/]+)\/enrollments(?:\/([^/]+))?$/);
+    if (enrollmentDeleteMatch && method === "DELETE") {
+      const actor = db.get("users", user.id);
+      if (actor?.globalRole !== "ADMIN" || actor.status !== "ACTIVE") fail(403, "Administrator required");
+      const c = db.get("classes", enrollmentDeleteMatch[1]);
+      if (!c || c.system) fail(404, "Class not found");
+      const enrollmentId = enrollmentDeleteMatch[2] || z.object({ id: z.string().min(1) }).parse(b).id;
+      limit("enrollment-delete", user.id, 60, 60000);
+      let result;
+      try {
+        result = await purgeEnrollment(c.id, enrollmentId, user.id);
+      } catch (e) {
+        if (e instanceof ActiveJobsError) fail(409, e.message, "ACTIVE_JOBS");
+        if (e instanceof Error && e.message === "FORBIDDEN") fail(403, "Administrator required");
+        throw e;
+      }
+      if (!result) fail(404, "Enrollment not found");
+      return json({
+        ok: !result.failures.length,
+        deleted: result.rows,
+        filesDeleted: result.filesDeleted,
+        directoriesDeleted: result.directoriesDeleted,
+        failures: result.failures,
+      });
+    }
     // Permanent class deletion touches the filesystem, so it cannot run inside the
     // single administrative write transaction below.
     const purgeMatch = p.match(/^\/api\/admin\/classes\/([^/]+)$/);
     if (purgeMatch && method === "DELETE") {
       const c = db.get("classes", purgeMatch[1]);
-      if (!c) fail(404, "Class not found");
+      if (!c || c.system) fail(404, "Class not found");
       const input = z.object({ confirm: z.string().max(200) }).parse(b);
       // Typing the slug is the confirmation: this destroys student work irreversibly.
       if (input.confirm !== c.slug) fail(400, `Type the class slug "${c.slug}" to confirm permanent deletion`);
@@ -880,6 +1076,58 @@ export async function handleApi(req: Request): Promise<Response> {
     return json({ error: "Request failed" }, 500);
   }
 }
+function ensureAdminWorkspace(db: ReturnType<typeof getDb>, actor: User): Enrollment {
+  const now = new Date().toISOString();
+  let cls = db.list("classes", "slug=?", [ADMIN_WORKSPACE_SLUG])[0];
+  if (!cls) {
+    cls = db.put("classes", {
+      id: randomUUID(),
+      slug: ADMIN_WORKSPACE_SLUG,
+      name: "Administrator Workspace",
+      courseCode: "ADMIN",
+      term: "Internal",
+      description: "Direct ComfyUI workspace for administrators",
+      active: true,
+      paused: false,
+      h3Video: true,
+      system: true,
+      signupEnabled: false,
+      signupTokenVersion: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+  } else if (!cls.active || cls.paused || !cls.system || !cls.h3Video) {
+    Object.assign(cls, { active: true, paused: false, system: true, h3Video: true, updatedAt: now });
+    db.put("classes", cls);
+  }
+  const orgId = `admin-${actor.id.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 24)}`;
+  let enrollment =
+    db.list("enrollments", "class_id=? AND user_id=?", [cls.id, actor.id])[0] ??
+    db.list("enrollments", "class_id=? AND email=?", [cls.id, actor.email])[0];
+  if (!enrollment) {
+    enrollment = {
+      id: randomUUID(),
+      classId: cls.id,
+      userId: actor.id,
+      rosterEmail: actor.email,
+      orgDefinedId: orgId,
+      firstName: actor.firstName || "Admin",
+      lastName: actor.lastName || "User",
+      role: "INSTRUCTOR",
+      status: "ACTIVE",
+      h3Video: true,
+    };
+  } else {
+    Object.assign(enrollment, {
+      userId: actor.id,
+      rosterEmail: actor.email,
+      role: "INSTRUCTOR",
+      status: "ACTIVE",
+      h3Video: true,
+    });
+  }
+  return db.put("enrollments", enrollment);
+}
 function readGrants(userId: string, classId: string) {
   const row = getDb().list("user_data", "user_id=? AND class_id=? AND path=?", [userId, classId, GRANTS_PATH])[0];
   if (!row?.content) return { h3Video: false };
@@ -904,6 +1152,14 @@ function setGrant(userId: string, classId: string, h3Video: boolean) {
   });
   return h3Video;
 }
+function effectiveEnrollmentH3(c: ClassRow, e: Enrollment): boolean {
+  if (c.system) return true;
+  if (e.userId && getDb().get("users", e.userId)?.globalRole === "ADMIN") return true;
+  if (typeof e.h3Video === "boolean") return e.h3Video;
+  if (c.h3Video) return true;
+  if (e.userId) return readGrants(e.userId, c.id).h3Video;
+  return false;
+}
 function adminRoute(user: User, p: string, method: string, b: Record<string, any>, url: URL) {
   const db = getDb();
   const actor = db.get("users", user.id);
@@ -911,10 +1167,19 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
   if (p === "/api/admin/classes") {
     if (method === "GET")
       return json({
-        classes: db.list("classes").map((c) => {
-          const e = db.list("enrollments", "class_id=?", [c.id]);
-          return { ...c, enrolled: e.length, registered: e.filter((v) => v.userId && v.status === "ACTIVE").length };
-        }),
+        classes: db
+          .list("classes")
+          .filter((c) => !c.system)
+          .map((c) => {
+            const e = db.list("enrollments", "class_id=?", [c.id]);
+            return {
+              ...c,
+              paused: Boolean(c.paused),
+              h3Video: Boolean(c.h3Video),
+              enrolled: e.length,
+              registered: e.filter((v) => v.userId && v.status === "ACTIVE").length,
+            };
+          }),
       });
     if (method === "POST") {
       const input = ClassCreateSchema.parse(b),
@@ -923,6 +1188,8 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
           ...input,
           id: randomUUID(),
           active: true,
+          paused: false,
+          h3Video: Boolean(input.h3Video),
           signupEnabled: false,
           signupTokenVersion: 0,
           createdAt: now,
@@ -935,7 +1202,7 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
   const clsMatch = p.match(/^\/api\/admin\/classes\/([^/]+)(?:\/(signup|enrollments))?$/);
   if (clsMatch) {
     const c = db.get("classes", clsMatch[1]);
-    if (!c) fail(404, "Class not found");
+    if (!c || c.system) fail(404, "Class not found");
     if (clsMatch[2] === "signup") {
       if (method === "POST")
         return json({ ...generateSignupUrl(c.id, user.id), raw: undefined, signupEnabled: true }, 201);
@@ -954,6 +1221,74 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
         tokenCreatedAt: token?.createdAt,
       });
     }
+    if (clsMatch[2] === "enrollments" && method === "POST") {
+      const input = z
+        .object({
+          email: EmailSchema,
+          firstName: z.string().trim().max(100).default(""),
+          lastName: z.string().trim().max(100).default(""),
+          orgDefinedId: z.string().trim().max(64).default(""),
+          h3Video: z.boolean().optional(),
+        })
+        .parse(b);
+      const existingByEmail = db.list("enrollments", "class_id=? AND email=?", [c.id, input.email])[0];
+      if (existingByEmail)
+        fail(
+          409,
+          existingByEmail.status === "ARCHIVED"
+            ? "A student with this email is archived on this roster — click Reactivate in the roster table instead"
+            : "A student with this email is already on the roster for this class"
+        );
+      let orgDefinedId = input.orgDefinedId.replace(/^#+/, "").trim();
+      if (orgDefinedId) {
+        if (!/^[a-zA-Z0-9._-]{1,64}$/.test(orgDefinedId))
+          fail(400, "Student ID may only contain letters, digits, '.', '_', or '-'");
+        if (db.list("enrollments", "class_id=? AND org_id=?", [c.id, orgDefinedId]).length)
+          fail(409, "Another student in this class already has that student ID");
+      } else {
+        do {
+          orgDefinedId = `manual-${randomUUID().slice(0, 8)}`;
+        } while (db.list("enrollments", "class_id=? AND org_id=?", [c.id, orgDefinedId]).length > 0);
+      }
+      const existingUser = db.userByEmail(input.email);
+      const attachedUser =
+        existingUser && existingUser.status === "ACTIVE" && existingUser.emailVerifiedAt ? existingUser : null;
+      const e: Enrollment = {
+        id: randomUUID(),
+        classId: c.id,
+        userId: attachedUser?.id ?? null,
+        rosterEmail: input.email,
+        orgDefinedId,
+        firstName: input.firstName || attachedUser?.firstName || "",
+        lastName: input.lastName || attachedUser?.lastName || "",
+        role: "STUDENT",
+        status: attachedUser ? "ACTIVE" : "INVITED",
+        ...(input.h3Video !== undefined ? { h3Video: input.h3Video } : {}),
+      };
+      db.put("enrollments", e);
+      if (attachedUser && input.h3Video !== undefined) {
+        setGrant(attachedUser.id, c.id, input.h3Video);
+      }
+      audit("ENROLLMENT_ADDED", {
+        actorId: user.id,
+        classId: c.id,
+        targetId: e.id,
+        metadata: { email: e.rosterEmail, orgDefinedId: e.orgDefinedId },
+      });
+      return json(
+        {
+          enrollment: {
+            ...e,
+            lastLogin: attachedUser?.lastLoginAt ?? null,
+            accountStatus: attachedUser?.status ?? "PENDING",
+            h3Video: effectiveEnrollmentH3(c, e),
+            jobs: 0,
+            outputs: 0,
+          },
+        },
+        201
+      );
+    }
     if (clsMatch[2] === "enrollments" && method === "PATCH") {
       const input = z
           .object({
@@ -966,8 +1301,13 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
         e = db.get("enrollments", input.id);
       if (!e || e.classId !== c.id) fail(404, "Enrollment not found");
       if (input.status !== undefined) {
-        e.status = input.status;
+        const linkedUser = e.userId ? db.get("users", e.userId) : undefined;
+        e.status = input.status === "ARCHIVED" ? "ARCHIVED" : linkedUser?.status === "ACTIVE" ? "ACTIVE" : "INVITED";
         db.put("enrollments", e);
+        if (input.status === "ARCHIVED") {
+          db.deleteWhere("gateway_sessions", "json_extract(data,'$.enrollmentId')=?", [e.id]);
+          db.deleteWhere("workspace_tickets", "json_extract(data,'$.enrollmentId')=?", [e.id]);
+        }
         audit(input.status === "ARCHIVED" ? "ENROLLMENT_ARCHIVED" : "ENROLLMENT_REACTIVATED", {
           actorId: user.id,
           classId: c.id,
@@ -976,33 +1316,46 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
       }
       let h3Video: boolean | undefined;
       if (input.h3Video !== undefined) {
-        // The H3 example is seeded into the student's workspace, so the grant
-        // needs a registered account to attach to — not just a roster row.
-        if (!e.userId) fail(409, "Student must register before receiving the H3 example");
-        h3Video = setGrant(e.userId, c.id, input.h3Video);
+        e.h3Video = input.h3Video;
+        db.put("enrollments", e);
+        if (e.userId) setGrant(e.userId, c.id, input.h3Video);
+        h3Video = input.h3Video;
         audit("GRANT_UPDATED", {
           actorId: user.id,
           classId: c.id,
-          targetId: e.userId,
-          metadata: { h3Video },
+          targetId: e.userId ?? e.id,
+          metadata: { enrollmentId: e.id, h3Video },
         });
       }
       return json({ enrollment: e, ...(h3Video !== undefined ? { h3Video } : {}) });
     }
-    if (method === "GET")
+    if (method === "GET") {
+      const jobCounts = new Map<string, number>();
+      for (const r of db.sql
+        .prepare("SELECT enrollment_id, COUNT(*) AS cnt FROM jobs WHERE class_id=? GROUP BY enrollment_id")
+        .all(c.id) as Array<{ enrollment_id: string; cnt: number }>) {
+        jobCounts.set(r.enrollment_id, Number(r.cnt));
+      }
+      const outputCounts = new Map<string, number>();
+      for (const r of db.sql
+        .prepare(
+          "SELECT j.enrollment_id AS enrollment_id, COUNT(o.id) AS cnt FROM jobs j JOIN outputs o ON o.job_id=j.id WHERE j.class_id=? GROUP BY j.enrollment_id"
+        )
+        .all(c.id) as Array<{ enrollment_id: string; cnt: number }>) {
+        outputCounts.set(r.enrollment_id, Number(r.cnt));
+      }
       return json({
-        class: c,
+        class: { ...c, paused: Boolean(c.paused), h3Video: Boolean(c.h3Video) },
         enrollments: db.list("enrollments", "class_id=?", [c.id]).map((e) => ({
           ...e,
           lastLogin: e.userId ? db.get("users", e.userId)?.lastLoginAt : null,
           accountStatus: e.userId ? db.get("users", e.userId)?.status : "PENDING",
-          h3Video: e.userId ? readGrants(e.userId, c.id).h3Video : false,
-          jobs: db.list("jobs", "enrollment_id=?", [e.id]).length,
-          outputs: db
-            .list("jobs", "enrollment_id=?", [e.id])
-            .reduce((n, j) => n + db.list("outputs", "job_id=?", [j.id]).length, 0),
+          h3Video: effectiveEnrollmentH3(c, e),
+          jobs: jobCounts.get(e.id) || 0,
+          outputs: outputCounts.get(e.id) || 0,
         })),
       });
+    }
     // DELETE is permanent removal and is handled before this transaction; archiving
     // a class is `PATCH { active: false }`.
     if (method === "PATCH") {
@@ -1013,12 +1366,44 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
           term: z.string().min(1).max(50).optional(),
           description: z.string().max(2000).optional(),
           active: z.boolean().optional(),
+          paused: z.boolean().optional(),
+          h3Video: z.boolean().optional(),
         })
         .parse(b);
+      const wasPaused = Boolean(c.paused);
+      const wasH3 = Boolean(c.h3Video);
       Object.assign(c, input, { updatedAt: new Date().toISOString() });
       db.put("classes", c);
-      audit(c.active ? "CLASS_UPDATED" : "CLASS_ARCHIVED", { actorId: user.id, classId: c.id, targetId: c.id });
-      return json({ ok: true, class: c });
+      if (input.h3Video !== undefined && Boolean(c.h3Video) !== wasH3) {
+        for (const e of db.list("enrollments", "class_id=?", [c.id])) {
+          if (e.h3Video !== undefined) {
+            delete e.h3Video;
+            db.put("enrollments", e);
+          }
+          if (e.userId) setGrant(e.userId, c.id, input.h3Video);
+        }
+      }
+      if (!c.active || c.paused) {
+        db.deleteWhere("gateway_sessions", "json_extract(data,'$.classId')=?", [c.id]);
+        db.deleteWhere("workspace_tickets", "class_id=?", [c.id]);
+      }
+      if (input.paused !== undefined && Boolean(c.paused) !== wasPaused) {
+        audit(c.paused ? "CLASS_PAUSED" : "CLASS_RESUMED", { actorId: user.id, classId: c.id, targetId: c.id });
+      }
+      if (input.h3Video !== undefined && Boolean(c.h3Video) !== wasH3) {
+        audit(c.h3Video ? "CLASS_H3_ENABLED" : "CLASS_H3_DISABLED", {
+          actorId: user.id,
+          classId: c.id,
+          targetId: c.id,
+        });
+      }
+      if (
+        (input.paused === undefined || Boolean(c.paused) === wasPaused) &&
+        (input.h3Video === undefined || Boolean(c.h3Video) === wasH3)
+      ) {
+        audit(c.active ? "CLASS_UPDATED" : "CLASS_ARCHIVED", { actorId: user.id, classId: c.id, targetId: c.id });
+      }
+      return json({ ok: true, class: { ...c, paused: Boolean(c.paused), h3Video: Boolean(c.h3Video) } });
     }
   }
   if (p === "/api/admin/users") {
@@ -1027,7 +1412,8 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
       return json({
         users: db
           .list("users")
-          .filter((u) => !q || `${u.email} ${u.firstName} ${u.lastName}`.toLowerCase().includes(q)),
+          .filter((u) => !q || `${u.email} ${u.firstName} ${u.lastName}`.toLowerCase().includes(q))
+          .map((u) => publicUser(u)),
       });
     }
     if (method === "PATCH") {
@@ -1055,12 +1441,17 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
       // two-step way around activation.
       if (u.status === "ACTIVE" && !u.emailVerifiedAt) u.status = "PENDING";
       db.put("users", u);
+      if (u.status === "DISABLED") {
+        db.deleteWhere("sessions", "user_id=?", [u.id]);
+        db.deleteWhere("gateway_sessions", "user_id=?", [u.id]);
+        db.deleteWhere("workspace_tickets", "user_id=?", [u.id]);
+      }
       audit(u.status === "DISABLED" ? "USER_DISABLED" : "USER_ENABLED", { actorId: user.id, targetId: u.id });
-      return json({ user: u });
+      return json({ user: publicUser(u) });
     }
   }
   if (p === "/api/workers") {
-    if (method === "GET") return json({ workers: db.list("workers") });
+    if (method === "GET") return json({ workers: db.list("workers").map(publicWorker) });
     if (method === "POST") {
       const input = WorkerCreateSchema.parse(b),
         w = db.put("workers", {
@@ -1073,7 +1464,7 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
           externalBusy: false,
         });
       audit("WORKER_CREATED", { actorId: user.id, targetId: w.id, metadata: { name: w.name } });
-      return json({ worker: w }, 201);
+      return json({ worker: publicWorker(w) }, 201);
     }
   }
   const wMatch = p.match(/^\/api\/workers\/([^/]+)$/);
@@ -1092,7 +1483,7 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
       targetId: w.id,
       metadata: { name: w.name },
     });
-    return json({ ok: true, worker: w });
+    return json({ ok: true, worker: publicWorker(w) });
   }
   fail(404, "Route not found");
 }

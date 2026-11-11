@@ -56,6 +56,9 @@ export class LabDatabase {
           `UPDATE users SET data=json_set(data,'$.passwordHash',''); DELETE FROM verifications; PRAGMA user_version=${SCHEMA_VERSION};`
         );
       }
+      this.sql.exec(
+        `CREATE INDEX IF NOT EXISTS jobs_user_started ON jobs(user_id, json_extract(data,'$.startedAt')); CREATE INDEX IF NOT EXISTS jobs_enrollment ON jobs(enrollment_id);`
+      );
     });
   }
   transaction<T>(fn: () => T): T {
@@ -157,11 +160,76 @@ function redact(value: unknown): unknown {
     );
   return value;
 }
-export function activeMembership(db: LabDatabase, userId: string, classId: string, enrollmentId?: string) {
+export function activeMembership(
+  db: LabDatabase,
+  userId: string,
+  classId: string,
+  enrollmentId?: string,
+  opts?: { allowPaused?: boolean }
+) {
   const u = db.get("users", userId),
     c = db.get("classes", classId);
   if (!u || u.status !== "ACTIVE" || !c?.active) return undefined;
+  if (c.system && u.globalRole !== "ADMIN") return undefined;
+  if (!opts?.allowPaused && c.paused && u.globalRole !== "ADMIN") return undefined;
   return db
     .list("enrollments", "class_id=? AND user_id=?", [classId, userId])
     .find((e) => e.status === "ACTIVE" && (!enrollmentId || e.id === enrollmentId));
+}
+/**
+ * Returns QUEUED jobs in true round-robin least-recently-served fair scheduling order,
+ * using the `jobs_user_started` covering expression index without reading historical job blobs.
+ */
+export function fairQueuedJobs(db = getDb(), maxActivePerUser = 1): Tables["jobs"][] {
+  const queued = db.list("jobs", "status='QUEUED' ORDER BY submitted_at ASC");
+  if (queued.length <= 1) return queued;
+  const userIds = [...new Set(queued.map((j) => j.userId))];
+  const placeholders = userIds.map(() => "?").join(",");
+  const rows = db.sql
+    .prepare(
+      `SELECT user_id, MAX(json_extract(data,'$.startedAt')) AS last_started FROM jobs indexed by jobs_user_started WHERE user_id IN (${placeholders}) AND json_extract(data,'$.startedAt') IS NOT NULL GROUP BY user_id`
+    )
+    .all(...userIds) as Array<{ user_id: string; last_started: string | null }>;
+  const lastRun = new Map<string, number>();
+  for (const r of rows) {
+    if (r.last_started) lastRun.set(r.user_id, Date.parse(r.last_started) || 0);
+  }
+  const activeRows = db.sql
+    .prepare(
+      `SELECT user_id, COUNT(*) AS cnt FROM jobs WHERE status IN ('DISPATCHING','RUNNING') AND user_id IN (${placeholders}) GROUP BY user_id`
+    )
+    .all(...userIds) as Array<{ user_id: string; cnt: number }>;
+  const activeByUser = new Map<string, number>();
+  for (const r of activeRows) activeByUser.set(r.user_id, Number(r.cnt));
+
+  const perUserSeen = new Map<string, number>();
+  const roundByJobId = new Map<string, number>();
+  const cap = Math.max(1, maxActivePerUser);
+  for (const j of queued) {
+    const ord = perUserSeen.get(j.userId) || 0;
+    perUserSeen.set(j.userId, ord + 1);
+    const blocked = (activeByUser.get(j.userId) || 0) >= cap ? 1 : 0;
+    roundByJobId.set(j.id, blocked + ord);
+  }
+  return queued.sort(
+    (a, b) =>
+      (roundByJobId.get(a.id) || 0) - (roundByJobId.get(b.id) || 0) ||
+      (lastRun.get(a.userId) || 0) - (lastRun.get(b.userId) || 0) ||
+      a.submittedAt.localeCompare(b.submittedAt) ||
+      a.id.localeCompare(b.id)
+  );
+}
+/**
+ * Fast indexed count of QUEUED/DISPATCHING/RUNNING jobs keyed by `${userId}:${classId}`
+ * so 1 Hz WebSocket status ticks never parse archived workflow JSON.
+ */
+export function activeJobCountsBySession(db = getDb()): Map<string, number> {
+  const rows = db.sql
+    .prepare(
+      "SELECT user_id, class_id, COUNT(*) AS cnt FROM jobs WHERE status IN ('QUEUED','DISPATCHING','RUNNING') GROUP BY user_id, class_id"
+    )
+    .all() as Array<{ user_id: string; class_id: string; cnt: number }>;
+  const counts = new Map<string, number>();
+  for (const r of rows) counts.set(`${r.user_id}:${r.class_id}`, Number(r.cnt));
+  return counts;
 }

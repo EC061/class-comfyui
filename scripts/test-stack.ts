@@ -11,11 +11,12 @@ async function main() {
   const dir = mkdtempSync(path.join(tmpdir(), "comfy-e2e-")),
     messages: any[] = [];
   const children: ChildProcess[] = [];
+  const gatewayPort = process.env.E2E_GATEWAY_PORT || "18091";
   const env = {
     ...process.env,
     NODE_ENV: "production",
     PUBLIC_URL: "http://localhost:13000",
-    COMFY_PUBLIC_URL: "http://localhost:18081",
+    COMFY_PUBLIC_URL: `http://localhost:${gatewayPort}`,
     SQLITE_PATH: path.join(dir, "lab.sqlite"),
     AUDIT_DATA_DIR: path.join(dir, "audit"),
     UPLOAD_DATA_DIR: path.join(dir, "uploads"),
@@ -28,7 +29,7 @@ async function main() {
     SMTP_USER: "",
     SMTP_PASSWORD: "",
     PORT: "13000",
-    GATEWAY_PORT: "18081",
+    GATEWAY_PORT: gatewayPort,
     HOSTNAME: "127.0.0.1",
   };
   const smtp = new SMTPServer({

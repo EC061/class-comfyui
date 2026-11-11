@@ -46,5 +46,21 @@
     "bytes": 1956192992,
     "sha256": "c396a9a06f58399e9df9754b18299818d84a2ddd371724ba48fe4a41221437dc",
     "note": "4-step variant, 768p-tuned. Faster still and lower quality than the 8-step; useful for a quick iterate-then-finalize loop in class."
+  },
+  {
+    "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+    "dest": "diffusion_models",
+    "file": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+    "bytes": 20970379616,
+    "sha256": "9255f52b6677845ad238f20dfaafa94727053694127ab7f255c048f0f9365779",
+    "note": "REF2VA: multi-reference-to-video with audio (<Picture 1>, <Picture 2>, <Picture 3>, etc.). int8_convrot for Ampere RTX A6000 GPUs."
+  },
+  {
+    "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+    "dest": "loras",
+    "file": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+    "bytes": 1956193000,
+    "sha256": "5b9ab5ade15d0775676d01a907268a69a1468dc6033b3b0d3ded5502f3ebb84c",
+    "note": "4-step turbo distillation LoRA for the REF2VA reference-to-video base."
   }
 ]

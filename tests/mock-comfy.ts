@@ -13,9 +13,14 @@ export async function mockComfy(port = 0) {
     delay = 150,
     fail = false;
   let failView = false;
+  let vramTotal = 49152 * 1024 * 1024;
+  let vramFree = 48640 * 1024 * 1024;
+  let torchVramTotal = 128 * 1024 * 1024;
+  let torchVramFree = 108 * 1024 * 1024;
   let maxRunning = 0;
   const submissions: any[] = [];
   const frees: any[] = [];
+  const uploads: string[] = [];
   const timers = new Set<ReturnType<typeof setTimeout>>();
   app.use((_req, res, next) => {
     if (!online) {
@@ -24,7 +29,20 @@ export async function mockComfy(port = 0) {
     }
     next();
   });
-  app.get("/system_stats", (_req, res) => res.json({ system: {}, devices: [{ name: "Mock A6000" }] }));
+  app.get("/system_stats", (_req, res) =>
+    res.json({
+      system: { comfyui_version: "0.3.26", python_version: "3.12.7" },
+      devices: [
+        {
+          name: "Mock A6000",
+          vram_total: vramTotal,
+          vram_free: vramFree,
+          torch_vram_total: torchVramTotal,
+          torch_vram_free: torchVramFree,
+        },
+      ],
+    })
+  );
   app.get("/queue", (_req, res) =>
     res.json({ queue_running: [...running.values()].map((j, i) => [i, j.id, j.prompt]), queue_pending: [] })
   );
@@ -35,11 +53,48 @@ export async function mockComfy(port = 0) {
         output: [],
         output_node: true,
       },
+      PreviewImage: {
+        input: { required: { images: ["IMAGE"] } },
+        output: [],
+        output_node: true,
+      },
       LoadImage: {
         input: { required: { image: [["secret-worker-image.png"], { image_upload: true }] } },
         output: ["IMAGE"],
       },
       EmptyLatentImage: { input: { required: {} }, output: ["LATENT"] },
+      VAEDecode: { input: { required: { samples: ["LATENT"] } }, output: ["IMAGE"] },
+      MiniMaxH3ReferenceToVideo: {
+        input: {
+          required: { prompt: ["STRING"] },
+          optional: { mode: ["COMBO", { options: ["fast", "quality"] }] },
+        },
+        output: ["CONDITIONING", "LATENT"],
+      },
+      SaveVideo: {
+        input: { required: { video: ["VIDEO"], filename_prefix: ["STRING"] } },
+        output: [],
+        output_node: true,
+      },
+      ComfySwitchNode: {
+        input: { required: { switch: ["BOOLEAN"] }, optional: { on_false: ["*"], on_true: ["*"] } },
+        output: ["*"],
+      },
+      PrimitiveBoolean: {
+        input: { required: { value: ["BOOLEAN"] } },
+        output: ["BOOLEAN"],
+      },
+      PrimitiveInt: {
+        input: { required: { value: ["INT"] } },
+        output: ["INT"],
+      },
+      TextGenerate: {
+        input: {
+          required: { prompt: ["STRING"] },
+          optional: { device: [["cuda", "cpu"]] },
+        },
+        output: ["STRING"],
+      },
     })
   );
   app.get("/history/:id", (req, res) =>
@@ -64,26 +119,70 @@ export async function mockComfy(port = 0) {
       const name = Buffer.concat(chunks)
         .toString()
         .match(/filename="([^"]+)"/)?.[1];
+      if (name) uploads.push(name);
       res.json({ name, subfolder: "", type: "input" });
     });
   });
   app.post("/prompt", (req, res) => {
+    const promptObj = (req.body.prompt || {}) as Record<string, any>;
+    for (const [nid, node] of Object.entries(promptObj)) {
+      for (const [k, v] of Object.entries((node?.inputs || {}) as Record<string, any>)) {
+        if (Array.isArray(v) && v.length === 2 && typeof v[0] === "string" && typeof v[1] === "number") {
+          if (!promptObj[v[0]]) {
+            res.status(400).json({
+              error: { type: "invalid_prompt", message: `Dangling link ${nid}.${k} -> ${v[0]}` },
+              node_errors: { [nid]: { errors: [{ type: "exception_during_inner_validation", details: v[0] }] } },
+            });
+            return;
+          }
+        }
+      }
+    }
     const id = randomUUID(),
       job = { id, prompt: req.body.prompt };
     submissions.push(req.body);
     running.set(id, job);
     maxRunning = Math.max(maxRunning, running.size);
-    for (const client of wss.clients)
-      client.send(JSON.stringify({ type: "executing", data: { prompt_id: id, node: "1" } }));
+    for (const client of wss.clients) {
+      client.send(
+        JSON.stringify({ type: "execution_cached", data: { prompt_id: id, nodes: ["2"], timestamp: Date.now() } })
+      );
+      client.send(JSON.stringify({ type: "executing", data: { prompt_id: id, node: "1", display_node: "1" } }));
+      client.send(
+        JSON.stringify({
+          type: "progress_state",
+          data: {
+            prompt_id: id,
+            nodes: {
+              "1": {
+                value: 1,
+                max: 2,
+                state: "running",
+                node_id: "1",
+                prompt_id: id,
+                display_node_id: "1",
+              },
+            },
+          },
+        })
+      );
+    }
     const shouldFail = fail;
     const timer = setTimeout(() => {
       timers.delete(timer);
       running.delete(id);
+      const imageOutNodes = Object.entries((req.body.prompt || {}) as Record<string, any>)
+        .filter(([, n]) => ["SaveImage", "PreviewImage"].includes(n?.class_type))
+        .map(([k]) => k);
+      const outputs: Record<string, any> = {};
+      if (!shouldFail) {
+        for (const nid of imageOutNodes.length ? imageOutNodes : ["1"]) {
+          outputs[nid] = { images: [{ filename: "shared-name.png", subfolder: "", type: "output" }] };
+        }
+      }
       history[id] = {
         prompt: [0, id, req.body.prompt, {}, []],
-        outputs: shouldFail
-          ? {}
-          : { "1": { images: [{ filename: "shared-name.png", subfolder: "", type: "output" }] } },
+        outputs,
         status: {
           completed: !shouldFail,
           status_str: shouldFail ? "error" : "success",
@@ -112,7 +211,7 @@ export async function mockComfy(port = 0) {
   });
   app.get("/private", (_req, res) => res.json({ secret: "must never be proxied" }));
   app.get("/", (_req, res) =>
-    res.type("html").send("<!doctype html><title>Mock ComfyUI</title><h1>Mock ComfyUI worker</h1>")
+    res.type("html").send("<!doctype html><title>Mock ComfyUI</title><body><h1>Mock ComfyUI worker</h1></body>")
   );
   await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
   const address = server.address() as { port: number };
@@ -121,6 +220,7 @@ export async function mockComfy(port = 0) {
     url: `http://127.0.0.1:${address.port}`,
     submissions,
     frees,
+    uploads,
     get maxRunning() {
       return maxRunning;
     },
@@ -135,6 +235,18 @@ export async function mockComfy(port = 0) {
     },
     set failView(v: boolean) {
       failView = v;
+    },
+    set vramTotal(v: number) {
+      vramTotal = v;
+    },
+    set vramFree(v: number) {
+      vramFree = v;
+    },
+    set torchVramTotal(v: number) {
+      torchVramTotal = v;
+    },
+    set torchVramFree(v: number) {
+      torchVramFree = v;
     },
     async close() {
       for (const t of timers) clearTimeout(t);

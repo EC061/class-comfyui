@@ -34,6 +34,7 @@ const EnvSchema = z.object({
   WORKSPACE_TOKEN_TTL_SECONDS: z.coerce.number().int().min(1).max(60).default(60),
   JOB_TIMEOUT_SECONDS: positive(7200),
   WORKER_REQUEST_TIMEOUT_MS: positive(30000),
+  WORKER_EXTERNAL_VRAM_THRESHOLD_MB: positive(1536),
   MAX_UPLOAD_MB: positive(100),
   MAX_ARCHIVE_MB: positive(20480),
   MAX_USER_STORAGE_MB: positive(2048),

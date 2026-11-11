@@ -1,5 +1,5 @@
 import express from "express";
-import { getDb, type Job, type JobStatus, type Session } from "@class-comfyui/database";
+import { getDb, audit, type Job, type JobStatus, type Session } from "@class-comfyui/database";
 
 // The frontend's Jobs panel polls GET /api/jobs on an interval and logs a hard
 // error on any non-200, so an unanswered route is a permanent console-error loop
@@ -59,8 +59,30 @@ function execution(job: Job) {
   if (start === undefined && job.startedAt) start = Date.parse(job.startedAt);
   if (end === undefined && job.completedAt) end = Date.parse(job.completedAt);
   // Our own failures carry a message rather than the worker's error dict. The
-  // panel reads the message, so give it one under the same key.
-  if (!error && job.error) error = { exception_message: job.error };
+  // panel reads the message, so give it one under the same key with the
+  // required ComfyUI ExecutionError schema fields.
+  if (!error && job.error) {
+    error = {
+      node_id: "",
+      node_type: "",
+      exception_message: job.error,
+      exception_type: job.status,
+      traceback: [],
+      executed: [],
+    };
+  } else if (error) {
+    error = {
+      ...error,
+      node_id: typeof error.node_id === "string" ? error.node_id : String(error.node_id ?? ""),
+      node_type: typeof error.node_type === "string" ? error.node_type : String(error.node_type ?? ""),
+      exception_message:
+        typeof error.exception_message === "string" ? error.exception_message : String(error.exception_message ?? ""),
+      exception_type:
+        typeof error.exception_type === "string" ? error.exception_type : String(error.exception_type ?? job.status),
+      traceback: Array.isArray(error.traceback) ? error.traceback.map(String) : [],
+      executed: Array.isArray(error.executed) ? error.executed.map(String) : [],
+    };
+  }
   return { start, end, error };
 }
 
@@ -95,7 +117,7 @@ function prune<T extends Record<string, unknown>>(job: T) {
   return Object.fromEntries(Object.entries(job).filter(([, v]) => v !== undefined && v !== null));
 }
 
-function serialize(job: Job) {
+function serialize(job: Job, includeDetail = false): Record<string, unknown> {
   // The worker reads workflow_id from extra_data.extra_pnginfo.workflow.id. We
   // store that same object as workflowJson and keep extraData empty, so its id is
   // the identical value. create_time deliberately differs: the worker takes the
@@ -104,22 +126,25 @@ function serialize(job: Job) {
   const created = Date.parse(job.submittedAt),
     rawId = (job.workflowJson as { id?: unknown } | null)?.id,
     workflowId = typeof rawId === "string" ? rawId : undefined;
-  // A queued job has no execution timestamps and no outputs, exactly as the
-  // worker's normalize_queue_item reports it.
-  if (!["COMPLETED", "FAILED", "CANCELLED", "LOST"].includes(job.status))
+  // A queued or running job has no outputs yet, matching normalize_queue_item.
+  // Running jobs include execution_start_time so active timers can render.
+  if (!["COMPLETED", "FAILED", "CANCELLED", "LOST"].includes(job.status)) {
+    const start = job.startedAt ? Date.parse(job.startedAt) : undefined;
     return prune({
       id: job.id,
       status: COMFY_STATUS[job.status],
       // Our queue tuples already use the submit time in ComfyUI's priority slot.
       priority: created,
       create_time: created,
+      execution_start_time: start,
       outputs_count: 0,
       previewable_outputs_count: 0,
       workflow_id: workflowId,
     });
+  }
   const { start, end, error } = execution(job),
     o = outputs(job);
-  return prune({
+  const base = prune({
     id: job.id,
     status: COMFY_STATUS[job.status],
     priority: created,
@@ -132,6 +157,20 @@ function serialize(job: Job) {
     preview_output: o.preview,
     workflow_id: workflowId,
   });
+  if (!includeDetail) return base;
+  return {
+    ...base,
+    outputs: job.history?.outputs ?? {},
+    execution_status: job.history?.status ?? {},
+    execution_meta: job.history?.meta ?? {},
+    workflow: {
+      prompt: job.submittedPromptJson ?? job.promptJson,
+      extra_data: {
+        create_time: created,
+        extra_pnginfo: job.workflowJson ? { workflow: job.workflowJson } : {},
+      },
+    },
+  };
 }
 
 type Serialized = ReturnType<typeof serialize>;
@@ -144,6 +183,35 @@ function sortKey(job: Serialized, sortBy: string) {
   const start = (job.execution_start_time as number) ?? 0,
     end = (job.execution_end_time as number) ?? 0;
   return end && start ? end - start : 0;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function cancelOwnedJob(s: Session, jobId: string): boolean {
+  const db = getDb();
+  return db.transaction(() => {
+    const job = db.get("jobs", jobId);
+    if (!job || job.userId !== s.userId || job.classId !== s.classId) return false;
+    if (job.status === "QUEUED") {
+      job.status = "CANCELLED";
+      job.completedAt = new Date().toISOString();
+      job.error = "Job cancelled";
+      db.put("jobs", job);
+      audit(
+        "JOB_CANCELLED",
+        { actorId: s.userId, classId: s.classId!, targetId: job.id, metadata: { status: "CANCELLED" } },
+        db
+      );
+      return true;
+    }
+    if ((job.status === "DISPATCHING" || job.status === "RUNNING") && !job.cancelRequested) {
+      job.cancelRequested = true;
+      db.put("jobs", job);
+      audit("JOB_CANCEL_REQUESTED", { actorId: s.userId, classId: s.classId!, targetId: job.id }, db);
+      return true;
+    }
+    return job.status === "DISPATCHING" || job.status === "RUNNING";
+  });
 }
 
 export function installJobs(app: express.Express) {
@@ -200,7 +268,7 @@ export function installJobs(app: express.Express) {
       if (offset < 0) offset = 0;
     }
 
-    let jobs = ownJobs(res.locals.session as Session).map(serialize);
+    let jobs = ownJobs(res.locals.session as Session).map((j) => serialize(j, false));
     if (statusFilter) jobs = jobs.filter((j) => statusFilter!.includes(j.status as string));
     if (query.workflow_id) jobs = jobs.filter((j) => j.workflow_id === query.workflow_id);
 
@@ -213,5 +281,49 @@ export function installJobs(app: express.Express) {
       jobs: page,
       pagination: { offset, limit, total, has_more: offset + page.length < total },
     });
+  });
+
+  app.post("/jobs/cancel", (req, res) => {
+    const jobIds = req.body && typeof req.body === "object" ? (req.body as { job_ids?: unknown }).job_ids : undefined;
+    if (!Array.isArray(jobIds)) {
+      res.status(400).json({ error: "job_ids must be a list" });
+      return;
+    }
+    const invalidIds = jobIds.filter((id) => typeof id !== "string" || !UUID_RE.test(id));
+    if (invalidIds.length > 0) {
+      res.status(400).json({
+        error: "job_ids contains invalid id(s)",
+        invalid_ids: invalidIds.map((id) => (typeof id === "string" ? id : String(id))),
+      });
+      return;
+    }
+    const s = res.locals.session as Session;
+    let cancelled = false;
+    for (const id of jobIds as string[]) {
+      if (cancelOwnedJob(s, id)) cancelled = true;
+    }
+    res.json({ cancelled });
+  });
+
+  app.post("/jobs/:id/cancel", (req, res) => {
+    const s = res.locals.session as Session,
+      id = req.params.id,
+      job = id ? getDb().get("jobs", id) : undefined;
+    if (!job || job.userId !== s.userId || job.classId !== s.classId) {
+      res.status(404).json({ error: "Job not found" });
+      return;
+    }
+    const cancelled = cancelOwnedJob(s, id);
+    res.json({ cancelled });
+  });
+
+  app.get("/jobs/:id", (req, res) => {
+    const s = res.locals.session as Session,
+      job = getDb().get("jobs", req.params.id);
+    if (!job || job.userId !== s.userId || job.classId !== s.classId) {
+      res.status(404).json({ error: "Job not found" });
+      return;
+    }
+    res.json(serialize(job, true));
   });
 }

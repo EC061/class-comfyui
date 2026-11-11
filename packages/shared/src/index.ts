@@ -25,11 +25,14 @@ export const PasswordSchema = z
   .min(12, "Password must be at least 12 characters")
   .max(200, "Password must be at most 200 characters");
 
+export const ADMIN_WORKSPACE_SLUG = "__admin-workspace__";
+
 export const ClassCreateSchema = z.object({
   name: z.string().min(1).max(200),
   courseCode: z.string().min(1).max(50),
   term: z.string().min(1).max(50),
   description: z.string().max(2000).default(""),
+  h3Video: z.boolean().default(false),
   slug: z
     .string()
     .min(1)

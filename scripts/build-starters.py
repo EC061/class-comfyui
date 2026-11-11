@@ -19,17 +19,28 @@ import urllib.request
 WORKER = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8188"
 REPO = pathlib.Path(__file__).resolve().parent.parent
 OUT = REPO / "apps/gateway/src/starters"
-STARTERS = ["image-flux.json", "video-wan-t2v-1.3b.json", "video-minimax-h3.json"]
+STARTERS = [
+    "image-flux.json",
+    "image-qwen-2.1-turbo.json",
+    "image-qwen-2.1-turbo-edit.json",
+    "video-wan-t2v-1.3b.json",
+    "video-minimax-h3.json",
+    "video-qwen-minimax-h3.json",
+]
+
+
+def all_nodes(g):
+    """Every node dict in the graph, including inside subgraph definitions."""
+    nodes = list(g.get("nodes", []))
+    for sg in g.get("definitions", {}).get("subgraphs", []):
+        nodes.extend(sg.get("nodes", []))
+    return nodes
 
 
 def node_types(g):
     """Every node type in the graph, including inside subgraph definitions."""
-    out = set()
-    for n in g.get("nodes", []):
-        out.add(n.get("type"))
-    for sg in g.get("definitions", {}).get("subgraphs", []):
-        out.update(n.get("type") for n in sg.get("nodes", []))
-        out.discard(None)
+    out = {n.get("type") for n in all_nodes(g)}
+    out.discard(None)
     # Subgraph instances are typed by UUID; those are not real node classes.
     return {t for t in out if t and "-" not in t}
 
@@ -78,9 +89,8 @@ def main():
         for e in json.loads(manifest.read_text()):
             manifests.append(e["file"])
     for name, g in graphs.items():
-        text = json.dumps(g)
-        for loader in ("CheckpointLoaderSimple", "UNETLoader", "CLIPLoader", "VAELoader"):
-            for n in [x for x in g.get("nodes", []) if x.get("type") == loader]:
+        for loader in ("CheckpointLoaderSimple", "UNETLoader", "CLIPLoader", "VAELoader", "LoraLoader", "LoraLoaderModelOnly"):
+            for n in [x for x in all_nodes(g) if x.get("type") == loader]:
                 for w in n.get("widgets_values", []) or []:
                     if isinstance(w, str) and w.endswith(".safetensors") and w not in manifests:
                         bad = True

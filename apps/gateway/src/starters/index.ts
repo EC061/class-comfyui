@@ -5,20 +5,23 @@
 // most stock templates want models we have not downloaded, and the api_*
 // templates are built on cloud API nodes the allowlist denies on purpose. So
 // instead of exposing that gallery we place a small, curated set into each
-// workspace: one image starter and one small-video starter. The MiniMax-H3
-// weights stay downloaded and their nodes stay allowlisted, but H3 graphs are
-// for students to build by hand rather than a seeded example.
+// workspace: base image and small-video starters for everyone, plus MiniMax-H3
+// examples gated on a teacher roster grant so students without the grant build
+// H3 graphs by hand.
 import imageFlux from "./image-flux.json";
+import imageQwenTurbo from "./image-qwen-2.1-turbo.json";
+import imageQwenTurboEdit from "./image-qwen-2.1-turbo-edit.json";
 import videoWan from "./video-wan-t2v-1.3b.json";
 import videoMiniMaxH3 from "./video-minimax-h3.json";
+import videoQwenMiniMaxH3 from "./video-qwen-minimax-h3.json";
 import { getDb, type Session } from "@class-comfyui/database";
 import { saveUserData } from "../userdata";
 import { getGrants } from "./grants";
 
-// The marker records which starters have already been placed. Bump VERSION to
-// push a revised starter to everyone; leave it alone and a student who deletes
-// or edits a starter keeps that decision, because the path stays in the marker.
-const VERSION = 2;
+// The marker records which starters have already been placed. Bump VERSION when
+// adding new starters; a student who deletes or edits an already-seeded starter
+// keeps that decision, because paths already in the marker are never rewritten.
+const VERSION = 4;
 export const STARTERS_MARKER = "__starters__";
 
 // `template` is the entry the frontend's template browser renders; `name` is
@@ -62,6 +65,48 @@ export const STARTERS: Starter[] = [
     },
   },
   {
+    path: "workflows/1b - Image (Qwen 2.1 Turbo).json",
+    workflow: imageQwenTurbo,
+    category: { title: "Image", type: "image", icon: "icon-[lucide--image]" },
+    template: {
+      name: "class_image_qwen_2_1_turbo",
+      title: "Image (Qwen 2.1 Turbo)",
+      description:
+        "Text to image on Qwen Image 2.1 Turbo (8 steps, native typography and RGBA support) with an optional Qwen 3.5 9B prompt enhancer (`refine_prompt` + `thinking_mode`).",
+      mediaType: "image",
+      mediaSubtype: "webp",
+      tags: ["Image", "Text to Image"],
+      models: ["Qwen-Image-2.1"],
+      thumbnail: [],
+      username: "This class",
+      openSource: true,
+      searchRank: 1,
+      usage: 0,
+      date: "2026-11-09",
+    },
+  },
+  {
+    path: "workflows/1c - Image Edit (Qwen 2.1 Turbo).json",
+    workflow: imageQwenTurboEdit,
+    category: { title: "Image", type: "image", icon: "icon-[lucide--image]" },
+    template: {
+      name: "class_image_qwen_2_1_turbo_edit",
+      title: "Image Edit (Qwen 2.1 Turbo)",
+      description:
+        "Instruction-based image editing on Qwen Image 2.1 Turbo (8 steps, up to 10 reference images) with an optional Qwen 3.5 9B edit prompt enhancer. Upload an image in LoadImage first.",
+      mediaType: "image",
+      mediaSubtype: "webp",
+      tags: ["Image", "Image to Image", "Image Edit"],
+      models: ["Qwen-Image-2.1"],
+      thumbnail: [],
+      username: "This class",
+      openSource: true,
+      searchRank: 2,
+      usage: 0,
+      date: "2026-11-09",
+    },
+  },
+  {
     path: "workflows/2 - Video (Wan 1.3B).json",
     workflow: videoWan,
     category: { title: "Video", type: "video", icon: "icon-[lucide--video]" },
@@ -77,7 +122,7 @@ export const STARTERS: Starter[] = [
       thumbnail: [],
       username: "This class",
       openSource: true,
-      searchRank: 1,
+      searchRank: 3,
       usage: 0,
       date: "2026-09-11",
     },
@@ -99,16 +144,38 @@ export const STARTERS: Starter[] = [
       thumbnail: [],
       username: "This class",
       openSource: true,
-      searchRank: 2,
+      searchRank: 4,
       usage: 0,
       date: "2026-09-10",
     },
   },
+  {
+    path: "workflows/2b - Text to Image to Video (Qwen 2.1 + MiniMax H3).json",
+    workflow: videoQwenMiniMaxH3,
+    category: { title: "Video", type: "video", icon: "icon-[lucide--video]" },
+    grant: "h3Video",
+    template: {
+      name: "class_video_qwen_minimax_h3",
+      title: "Text to Image to Video (Qwen 2.1 + MiniMax H3)",
+      description:
+        "Generates multiple reference images (<Picture 1>, <Picture 2>, <Picture 3>, up to 6+) with Qwen Image 2.1 Turbo (with prompt enhancer) and composes them into a video with synchronized audio using MiniMax H3 Reference-to-Video (4-step turbo). Shown when your teacher enables H3.",
+      mediaType: "image",
+      mediaSubtype: "webp",
+      tags: ["Video", "Text to Video", "Reference to Video", "Audio"],
+      models: ["Qwen-Image-2.1", "MiniMax-H3"],
+      thumbnail: [],
+      username: "This class",
+      openSource: true,
+      searchRank: 5,
+      usage: 0,
+      date: "2026-11-09",
+    },
+  },
 ];
 
-/** Starters one student may receive: the base pair plus any granted examples. */
+/** Starters one student may receive: the base starters plus any granted examples. */
 export function eligibleStarters(session: Session) {
-  const grants = getGrants(session.userId, session.classId!);
+  const grants = getGrants(session.userId, session.classId!, session.enrollmentId);
   return STARTERS.filter((s) => !s.grant || grants[s.grant]);
 }
 
@@ -157,10 +224,12 @@ export function seedStarters(session: Session) {
           console.warn(`starters: ${starter.path} is empty, skipping`);
           continue;
         }
-        if (marker.seeded.includes(starter.path) || existing.has(starter.path)) continue;
-        saveUserData(session, starter.path, JSON.stringify(starter.workflow));
+        if (marker.seeded.includes(starter.path)) continue;
+        if (!existing.has(starter.path)) {
+          saveUserData(session, starter.path, JSON.stringify(starter.workflow));
+          placed.push(starter.path);
+        }
         marker.seeded.push(starter.path);
-        placed.push(starter.path);
       }
       marker.version = VERSION;
       saveUserData(session, STARTERS_MARKER, JSON.stringify(marker));

@@ -5,35 +5,40 @@ import { Jobs } from "@/components/jobs";
 
 type Tab = "Overview" | "Roster" | "Signup" | "Jobs" | "Outputs" | "Activity" | "Settings";
 
+interface ClassDetailInfo {
+  id: string;
+  name: string;
+  courseCode: string;
+  term: string;
+  slug: string;
+  active: boolean;
+  paused?: boolean;
+  h3Video?: boolean;
+  signupEnabled: boolean;
+  description: string;
+}
+
+interface EnrollmentRow {
+  id: string;
+  rosterEmail: string;
+  orgDefinedId: string;
+  firstName: string;
+  lastName: string;
+  status: string;
+  userId: string | null;
+  lastLogin?: string;
+  jobs?: number;
+  outputs?: number;
+  accountStatus?: string;
+  h3Video?: boolean;
+}
+
 export default function ClassDetail({ params: asyncParams }: { params: Promise<{ id: string }> }) {
   const params = use(asyncParams);
   const [tab, setTab] = useState<Tab>("Overview");
-  const [cls, setCls] = useState<{
-    id: string;
-    name: string;
-    courseCode: string;
-    term: string;
-    slug: string;
-    active: boolean;
-    signupEnabled: boolean;
-    description: string;
-  } | null>(null);
-  const [enrollments, setEnrollments] = useState<
-    Array<{
-      id: string;
-      rosterEmail: string;
-      orgDefinedId: string;
-      firstName: string;
-      lastName: string;
-      status: string;
-      userId: string | null;
-      lastLogin?: string;
-      jobs?: number;
-      outputs?: number;
-      accountStatus?: string;
-      h3Video?: boolean;
-    }>
-  >([]);
+  const [cls, setCls] = useState<ClassDetailInfo | null>(null);
+  const [enrollments, setEnrollments] = useState<EnrollmentRow[]>([]);
+  const [headerMsg, setHeaderMsg] = useState<string | null>(null);
 
   async function load() {
     const r = await fetch(`/api/admin/classes/${params.id}`);
@@ -44,17 +49,80 @@ export default function ClassDetail({ params: asyncParams }: { params: Promise<{
     }
   }
   useEffect(() => {
-    load();
+    void load();
   }, []);
 
   if (!cls) return <p>Loading…</p>;
   const tabs: Tab[] = ["Overview", "Roster", "Signup", "Jobs", "Outputs", "Activity", "Settings"];
 
+  async function togglePause() {
+    if (!cls) return;
+    setHeaderMsg(null);
+    const r = await fetch(`/api/admin/classes/${cls.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paused: !cls.paused }),
+    });
+    if (!r.ok) setHeaderMsg((await r.json()).error ?? "Could not update class access");
+    await load();
+  }
+
+  async function toggleClassH3() {
+    if (!cls) return;
+    setHeaderMsg(null);
+    const r = await fetch(`/api/admin/classes/${cls.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ h3Video: !cls.h3Video }),
+    });
+    if (!r.ok) setHeaderMsg((await r.json()).error ?? "Could not update H3 setting");
+    await load();
+  }
+
   return (
     <div className="grid gap-4">
-      <h1 className="text-xl font-bold">
-        {cls.courseCode} — {cls.term}
-      </h1>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <h1 className="text-xl font-bold">
+            {cls.courseCode} — {cls.term}
+          </h1>
+          <span
+            className={`rounded px-2 py-0.5 text-xs font-semibold ${
+              !cls.active
+                ? "bg-slate-200 text-slate-700"
+                : cls.paused
+                  ? "bg-amber-100 text-amber-800"
+                  : "bg-emerald-100 text-emerald-800"
+            }`}
+          >
+            {!cls.active ? "Archived" : cls.paused ? "Access disabled" : "Access enabled"}
+          </span>
+          {cls.h3Video && (
+            <span className="rounded bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-800">
+              H3 enabled for all
+            </span>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button type="button" className="btn-secondary" onClick={toggleClassH3}>
+            {cls.h3Video ? "Disable H3 for all students" : "Enable H3 for all students"}
+          </button>
+          {cls.active && (
+            <button
+              type="button"
+              className={cls.paused ? "btn" : "btn-secondary border-amber-300 text-amber-900 hover:bg-amber-50"}
+              onClick={togglePause}
+            >
+              {cls.paused ? "Enable class access" : "Disable class access"}
+            </button>
+          )}
+        </div>
+      </div>
+      {headerMsg && (
+        <p role="alert" className="text-sm text-red-600">
+          {headerMsg}
+        </p>
+      )}
       <div className="flex flex-wrap gap-1">
         {tabs.map((t) => (
           <button key={t} onClick={() => setTab(t)} className={`nav-link border ${tab === t ? "nav-link-active" : ""}`}>
@@ -65,14 +133,26 @@ export default function ClassDetail({ params: asyncParams }: { params: Promise<{
       {tab === "Overview" && (
         <div className="card text-sm">
           <p>
-            <strong>{cls.name}</strong> · {cls.slug} · {cls.active ? "active" : "archived"}
+            <strong>{cls.name}</strong> · {cls.slug} ·{" "}
+            {!cls.active ? "archived" : cls.paused ? "student access disabled" : "active"}
           </p>
           <p className="mt-2">
-            Enrolled: {enrollments.length} · Registered: {enrollments.filter((e) => e.userId).length}
+            Enrolled: {enrollments.length} · Registered: {enrollments.filter((e) => e.userId).length} · Pending signup:{" "}
+            {enrollments.filter((e) => !e.userId && e.status !== "ARCHIVED").length}
+          </p>
+          <p className="mt-2 text-slate-600">
+            H3 example workflows:{" "}
+            <strong>
+              {cls.h3Video
+                ? "Enabled for all students (including students who have not signed up yet)"
+                : "Per-student grant only"}
+            </strong>
           </p>
         </div>
       )}
-      {tab === "Roster" && <RosterTab classId={cls.id} enrollments={enrollments} reload={load} />}
+      {tab === "Roster" && (
+        <RosterTab cls={cls} classId={cls.id} enrollments={enrollments} reload={load} toggleClassH3={toggleClassH3} />
+      )}
       {tab === "Signup" && <SignupTab classId={cls.id} />}
       {tab === "Jobs" && <JobsTab classId={cls.id} />}
       {tab === "Outputs" && <JobsTab classId={cls.id} outputsOnly />}
@@ -83,26 +163,17 @@ export default function ClassDetail({ params: asyncParams }: { params: Promise<{
 }
 
 function RosterTab({
+  cls,
   classId,
   enrollments,
   reload,
+  toggleClassH3,
 }: {
+  cls: ClassDetailInfo;
   classId: string;
-  enrollments: Array<{
-    id: string;
-    rosterEmail: string;
-    orgDefinedId: string;
-    firstName: string;
-    lastName: string;
-    status: string;
-    userId: string | null;
-    lastLogin?: string;
-    jobs?: number;
-    outputs?: number;
-    accountStatus?: string;
-    h3Video?: boolean;
-  }>;
+  enrollments: EnrollmentRow[];
   reload: () => void;
+  toggleClassH3: () => Promise<void>;
 }) {
   const [csv, setCsv] = useState("");
   const [importId, setImportId] = useState<string | null>(null);
@@ -120,6 +191,17 @@ function RosterTab({
   } | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [previewing, setPreviewing] = useState(false);
+
+  const [newStudent, setNewStudent] = useState({
+    email: "",
+    firstName: "",
+    lastName: "",
+    orgDefinedId: "",
+  });
+  const [addingStudent, setAddingStudent] = useState(false);
+  const [studentMsg, setStudentMsg] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   // Preview automatically as the CSV changes; the last edit wins.
   useEffect(() => {
@@ -168,6 +250,7 @@ function RosterTab({
       clearTimeout(timer);
     };
   }, [classId, csv]);
+
   async function doImport() {
     const r = await fetch("/api/roster/import", {
       method: "POST",
@@ -182,8 +265,145 @@ function RosterTab({
     }
   }
 
+  async function addStudent(e: React.FormEvent) {
+    e.preventDefault();
+    if (!newStudent.email.trim()) return;
+    setAddingStudent(true);
+    setStudentMsg(null);
+    try {
+      const r = await fetch(`/api/admin/classes/${classId}/enrollments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newStudent),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setStudentMsg(j.error ?? "Could not add student");
+      } else {
+        setStudentMsg(`Added ${j.enrollment?.rosterEmail ?? newStudent.email}`);
+        setNewStudent({ email: "", firstName: "", lastName: "", orgDefinedId: "" });
+        reload();
+      }
+    } catch {
+      setStudentMsg("Could not reach server to add student");
+    } finally {
+      setAddingStudent(false);
+    }
+  }
+
+  async function deleteStudent(enrollmentId: string) {
+    setDeletingId(enrollmentId);
+    setStudentMsg(null);
+    try {
+      const r = await fetch(`/api/admin/classes/${classId}/enrollments/${enrollmentId}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setStudentMsg(j.error ?? "Could not delete student");
+      } else {
+        const failCount = Array.isArray(j.failures) ? j.failures.length : 0;
+        setStudentMsg(
+          failCount > 0
+            ? `Removed student from roster (${failCount} disk path${failCount === 1 ? "" : "s"} could not be deleted)`
+            : "Removed student from roster"
+        );
+        setConfirmDeleteId(null);
+        reload();
+      }
+    } catch {
+      setStudentMsg("Could not reach server to delete student");
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
   return (
     <div className="grid gap-4">
+      <div className="card flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="font-bold">H3 example workflows</h2>
+          <p className="text-xs text-slate-600">
+            {cls.h3Video
+              ? "Enabled for every student in this class — including students who have not signed up yet and any students added later."
+              : "Currently disabled by default. Enable here to unlock MiniMax-H3 workflows for all students even before they create accounts, or grant per student below."}
+          </p>
+        </div>
+        <button type="button" className="btn" onClick={toggleClassH3}>
+          {cls.h3Video ? "Disable H3 for all" : "Enable H3 for all"}
+        </button>
+      </div>
+
+      <div className="card">
+        <h2 className="font-bold">Add student</h2>
+        <p className="text-xs text-slate-600">
+          Add an individual student without uploading a CSV. Student ID is optional and auto-generated if left blank.
+        </p>
+        <form onSubmit={addStudent} className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-4">
+          <div>
+            <label className="label" htmlFor="add-student-email">
+              Student email
+            </label>
+            <input
+              id="add-student-email"
+              type="email"
+              required
+              className="input"
+              placeholder="student@university.edu"
+              value={newStudent.email}
+              onChange={(e) => setNewStudent({ ...newStudent, email: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className="label" htmlFor="add-student-first">
+              First name
+            </label>
+            <input
+              id="add-student-first"
+              className="input"
+              placeholder="First name"
+              value={newStudent.firstName}
+              onChange={(e) => setNewStudent({ ...newStudent, firstName: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className="label" htmlFor="add-student-last">
+              Last name
+            </label>
+            <input
+              id="add-student-last"
+              className="input"
+              placeholder="Last name"
+              value={newStudent.lastName}
+              onChange={(e) => setNewStudent({ ...newStudent, lastName: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className="label" htmlFor="add-student-org-id">
+              Student ID (optional)
+            </label>
+            <input
+              id="add-student-org-id"
+              className="input"
+              placeholder="Auto if blank"
+              value={newStudent.orgDefinedId}
+              onChange={(e) => setNewStudent({ ...newStudent, orgDefinedId: e.target.value })}
+            />
+          </div>
+          <div className="md:col-span-4">
+            <button type="submit" className="btn" disabled={addingStudent}>
+              {addingStudent ? "Adding…" : "Add student"}
+            </button>
+          </div>
+        </form>
+        {studentMsg && (
+          <p role="status" className="mt-2 text-sm">
+            {studentMsg}
+          </p>
+        )}
+      </div>
+
       <div className="card">
         <h2 className="font-bold">Upload roster</h2>
         <p className="text-xs text-slate-600">
@@ -270,6 +490,7 @@ function RosterTab({
           </p>
         )}
       </div>
+
       <div className="card overflow-x-auto">
         <table className="data">
           <thead>
@@ -303,20 +524,16 @@ function RosterTab({
                 </td>
                 <td>
                   <button
+                    type="button"
                     className="btn-secondary"
-                    disabled={!e.userId}
-                    title={
-                      e.userId
-                        ? "Seed the MiniMax-H3 example workflow into this student's workspace and template browser"
-                        : "Available once the student registers"
-                    }
+                    title="Enable or revoke the MiniMax-H3 example workflows for this student (works before or after signup)"
                     onClick={async () => {
                       const r = await fetch(`/api/admin/classes/${classId}/enrollments`, {
                         method: "PATCH",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ id: e.id, h3Video: !e.h3Video }),
                       });
-                      if (!r.ok) setMsg((await r.json()).error);
+                      if (!r.ok) setStudentMsg((await r.json()).error);
                       else reload();
                     }}
                   >
@@ -324,20 +541,46 @@ function RosterTab({
                   </button>
                 </td>
                 <td>
-                  <button
-                    className="btn-secondary"
-                    onClick={async () => {
-                      const r = await fetch(`/api/admin/classes/${classId}/enrollments`, {
-                        method: "PATCH",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ id: e.id, status: e.status === "ARCHIVED" ? "INVITED" : "ARCHIVED" }),
-                      });
-                      if (!r.ok) setMsg((await r.json()).error);
-                      else reload();
-                    }}
-                  >
-                    {e.status === "ARCHIVED" ? "Reactivate" : "Archive"}
-                  </button>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={async () => {
+                        const r = await fetch(`/api/admin/classes/${classId}/enrollments`, {
+                          method: "PATCH",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ id: e.id, status: e.status === "ARCHIVED" ? "INVITED" : "ARCHIVED" }),
+                        });
+                        if (!r.ok) setStudentMsg((await r.json()).error);
+                        else reload();
+                      }}
+                    >
+                      {e.status === "ARCHIVED" ? "Reactivate" : "Archive"}
+                    </button>
+                    {confirmDeleteId === e.id ? (
+                      <>
+                        <button
+                          type="button"
+                          disabled={deletingId === e.id}
+                          className="btn bg-red-700 hover:bg-red-800"
+                          onClick={() => deleteStudent(e.id)}
+                        >
+                          {deletingId === e.id ? "Deleting…" : "Confirm delete"}
+                        </button>
+                        <button type="button" className="btn-secondary" onClick={() => setConfirmDeleteId(null)}>
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn-secondary border-red-300 text-red-700 hover:bg-red-50"
+                        onClick={() => setConfirmDeleteId(e.id)}
+                      >
+                        Delete
+                      </button>
+                    )}
+                  </div>
                 </td>
               </tr>
             ))}
@@ -364,7 +607,7 @@ function SignupTab({ classId }: { classId: string }) {
     if (r.ok) setInfo(await r.json());
   }
   useEffect(() => {
-    load();
+    void load();
   }, []);
 
   async function regen() {
@@ -372,7 +615,7 @@ function SignupTab({ classId }: { classId: string }) {
     const j = await r.json();
     if (r.ok) {
       setUrl(j.url);
-      load();
+      void load();
     } else setMsg(j.error);
   }
   async function toggle(enabled: boolean) {
@@ -381,7 +624,7 @@ function SignupTab({ classId }: { classId: string }) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled }),
     });
-    if (r.ok) load();
+    if (r.ok) void load();
   }
   async function emailStudents() {
     if (!url) {
@@ -457,7 +700,7 @@ function JobsTab({ classId, outputsOnly }: { classId: string; outputsOnly?: bool
 function ActivityTab({ classId }: { classId: string }) {
   const [events, setEvents] = useState<Array<{ id: string; type: string; createdAt: string }>>([]);
   useEffect(() => {
-    fetch(`/api/audit?classId=${classId}`).then(async (r) => {
+    void fetch(`/api/audit?classId=${classId}`).then(async (r) => {
       if (r.ok) setEvents((await r.json()).events ?? []);
     });
   }, [classId]);
@@ -484,6 +727,8 @@ function SettingsTab({
     name: string;
     slug: string;
     active: boolean;
+    paused?: boolean;
+    h3Video?: boolean;
     courseCode?: string;
     term?: string;
     description?: string;
@@ -512,6 +757,16 @@ function SettingsTab({
       body: JSON.stringify({ active: !cls.active }),
     });
     if (!r.ok) setMessage((await r.json()).error);
+    reload();
+  }
+  async function togglePause() {
+    const r = await fetch("/api/admin/classes/" + cls.id, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paused: !cls.paused }),
+    });
+    if (!r.ok) setMessage((await r.json()).error);
+    else setMessage(cls.paused ? "Class access enabled" : "Class access disabled");
     reload();
   }
   return (
@@ -546,11 +801,24 @@ function SettingsTab({
         </label>
         <button className="btn">Save class</button>
       </form>
-      <button className="btn-secondary" onClick={toggle}>
-        {cls.active ? "Archive class" : "Reactivate class"}
-      </button>
+      <div className="flex flex-wrap gap-2">
+        {cls.active && (
+          <button
+            type="button"
+            className={cls.paused ? "btn" : "btn-secondary border-amber-300 text-amber-900 hover:bg-amber-50"}
+            onClick={togglePause}
+          >
+            {cls.paused ? "Enable student ComfyUI access" : "Disable student ComfyUI access"}
+          </button>
+        )}
+        <button type="button" className="btn-secondary" onClick={toggle}>
+          {cls.active ? "Archive class" : "Reactivate class"}
+        </button>
+      </div>
       <p className="mt-1 text-xs text-slate-500">
-        Archiving keeps every record and revokes workspace access. Nothing is erased.
+        Disabling access blocks students from opening ComfyUI (and closes active student workspace sessions) while
+        keeping the class and their past job history visible on their dashboard. Archiving hides the class completely.
+        Nothing is erased.
       </p>
       <p role="status">{message}</p>
       <DangerZone cls={cls} />

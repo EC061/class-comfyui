@@ -11,6 +11,7 @@ export function Jobs({
   outputsOnly?: boolean;
 }) {
   const [jobs, setJobs] = useState<any[]>([]),
+    [summary, setSummary] = useState<{ availableGpus: number; runningJobs: number; queuedJobs: number } | null>(null),
     [q, setQ] = useState(""),
     [status, setStatus] = useState(""),
     [from, setFrom] = useState(""),
@@ -23,8 +24,11 @@ export function Jobs({
       const r = await fetch(
         "/api/jobs?" + new URLSearchParams({ classId, userId, q, status, from, to, workerId: worker, outputType: type })
       );
-      if (r.ok) setJobs((await r.json()).jobs);
-      else setMessage("Unable to load jobs");
+      if (r.ok) {
+        const d = await r.json();
+        setJobs(d.jobs);
+        if (d.queueSummary) setSummary(d.queueSummary);
+      } else setMessage("Unable to load jobs");
     };
     void load();
     const timer = setInterval(load, 3000);
@@ -32,7 +36,15 @@ export function Jobs({
   }, [classId, userId, q, status, from, to, worker, type]);
   return (
     <div className="card">
-      <h2 className="text-xl font-bold">{outputsOnly ? "Outputs" : "Jobs"}</h2>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-xl font-bold">{outputsOnly ? "Outputs" : "Jobs"}</h2>
+        {!outputsOnly && summary && (
+          <p className="text-xs text-slate-600" role="status">
+            Class GPUs available: <strong>{summary.availableGpus}</strong> · Running:{" "}
+            <strong>{summary.runningJobs}</strong> · Queued: <strong>{summary.queuedJobs}</strong>
+          </p>
+        )}
+      </div>
       <div className="my-3 grid gap-2 md:grid-cols-3">
         <input
           aria-label="Search jobs"
@@ -97,10 +109,11 @@ export function Jobs({
                     <p>{j.orgDefinedId}</p>
                   </td>
                   <td>
-                    {j.status}
+                    {j.status === "QUEUED" && j.queuePosition ? `QUEUED (#${j.queuePosition} in queue)` : j.status}
                     <p className="text-xs">{j.archiveStatus}</p>
+                    {j.error && <p className="text-xs text-red-700">{j.error}</p>}
                   </td>
-                  <td>{j.workerName || "Waiting"}</td>
+                  <td>{j.workerName || (j.status === "QUEUED" ? "Queued for next free GPU" : "Waiting")}</td>
                   <td>
                     {j.outputs.map((o: any) => (
                       <a key={o.id} className="block underline" href={o.url}>

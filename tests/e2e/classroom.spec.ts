@@ -1,6 +1,7 @@
 import { test, expect, type Page, type APIRequestContext } from "@playwright/test";
 const base = "http://localhost:13000",
-  comfy = "http://localhost:18081";
+  gatewayPort = process.env.E2E_GATEWAY_PORT || "18091",
+  comfy = `http://localhost:${gatewayPort}`;
 async function mailLink(request: APIRequestContext, email: string) {
   let url = "";
   await expect
@@ -57,6 +58,23 @@ test("administrator and two isolated students complete the production flow; data
   await expect(page).toHaveURL(/\/admin\/classes\/[0-9a-f-]{36}$/);
   const classId = page.url().split("/").at(-1)!;
   await page.getByRole("button", { name: "Roster", exact: true }).click();
+  // Enable H3 for all students BEFORE any student registers, and verify manual Add/Delete student buttons.
+  await page.getByRole("button", { name: "Enable H3 for all", exact: true }).click();
+  await expect(page.getByText("H3 enabled for all")).toBeVisible();
+  await page.getByLabel("Student email").fill("tempstudent@example.edu");
+  await page.getByLabel("First name").fill("Temp");
+  await page.getByLabel("Last name").fill("Student");
+  await page.getByRole("button", { name: "Add student", exact: true }).click();
+  await expect(page.getByRole("cell", { name: "tempstudent@example.edu" })).toBeVisible();
+  const tempRow = page.locator("tr", { hasText: "tempstudent@example.edu" });
+  await tempRow.getByRole("button", { name: "Delete", exact: true }).click();
+  await tempRow.getByRole("button", { name: "Confirm delete", exact: true }).click();
+  await expect(page.getByRole("cell", { name: "tempstudent@example.edu" })).toHaveCount(0);
+  // Verify Disable / Enable class access button right in the class header.
+  await page.getByRole("button", { name: "Disable class access", exact: true }).click();
+  await expect(page.getByText("Access disabled")).toBeVisible();
+  await page.getByRole("button", { name: "Enable class access", exact: true }).click();
+  await expect(page.getByText("Access enabled")).toBeVisible();
   await page.getByLabel("Roster CSV file").setInputFiles({
     name: "fabricated.csv",
     mimeType: "text/csv",
@@ -123,17 +141,23 @@ test("administrator and two isolated students complete the production flow; data
       return (await r.json()).workers[0].healthStatus;
     })
     .toBe("ONLINE");
+  // Administrator can open ComfyUI directly with a single button click without a student account.
+  await page.goto("/");
+  await page.getByRole("button", { name: "Open ComfyUI" }).first().click();
+  await expect(page).toHaveURL(comfy + "/");
+  await expect(page.getByRole("heading", { name: "Mock ComfyUI worker" })).toBeVisible();
+  await page.goto(base + "/");
   for (const p of students) {
     await p.getByRole("button", { name: "Open ComfyUI" }).click();
     await expect(p).toHaveURL(comfy + "/");
     await expect(p.getByRole("heading", { name: "Mock ComfyUI worker" })).toBeVisible();
   }
   for (const p of students)
-    await p.evaluate(() => {
+    await p.evaluate((port) => {
       (window as any).events = [];
-      const ws = new WebSocket("ws://localhost:18081/ws");
+      const ws = new WebSocket(`ws://localhost:${port}/ws`);
       ws.onmessage = (e) => (window as any).events.push(JSON.parse(e.data));
-    });
+    }, gatewayPort);
   const workflow = {
     prompt: {
       "1": { class_type: "SaveImage", inputs: { images: ["2", 0], filename_prefix: "output" } },

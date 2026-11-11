@@ -193,13 +193,13 @@ The management dashboard issues a signed, 60-second workspace ticket tied to use
 - Save-node prefixes are rewritten into the job's unique worker directory. API prompt and workflow JSON remain associated with the submitting user.
 - Only vetted frontend assets, model catalogs, and explicit APIs are served. Global mutation APIs, ComfyUI Manager install APIs, arbitrary custom routes, and unapproved node classes are denied.
 
-**A shared ComfyUI Python process is not an OS sandbox for arbitrary custom nodes.** `COMFY_ALLOWED_NODES` is an explicit allowlist of reviewed built-in nodes covering SDXL/Flux image generation, Z-Image-Turbo image generation, Wan 2.1 video generation, and local MiniMax-H3 video+audio, plus the `ModelSampling*` patch family (pure timestep math, no files or network). The sampling nodes are listed because the frontend's own default workflow wires `ModelSamplingAuraFlow`: without the listing it renders as a red "missing node" even though every worker supports it natively. It is default-deny, which matters more than usual now that ComfyUI ships cloud API nodes: `MiniMaxH3ImageToVideo` runs on this lab's GPUs, while the near-identically named `ComfyCloudMiniMaxH3ImageToVideoNode`, `Minimax*Node` and `MinimaxHailuo03*` send student prompts and images to a paid third-party service. Only the local variants are listed, and the same reasoning applies to the Veo, Sora, Kling and Runway nodes. Review a custom node's filesystem/network/subprocess behavior before adding it. Never enable arbitrary file readers, shell execution, or server administration nodes for students. If a course requires untrusted Python/custom nodes, run separate worker containers/VMs per trust boundary. Keep the same reviewed node/model set on interchangeable workers; model or node incompatibility is a visible failed job, not a silent retry.
+**A shared ComfyUI Python process is not an OS sandbox for arbitrary custom nodes.** `COMFY_ALLOWED_NODES` is an explicit allowlist of reviewed built-in nodes covering SDXL/Flux image generation, Z-Image-Turbo image generation, Qwen Image 2.1 Turbo generation/editing (plus its local Qwen 3.5 prompt enhancer), Wan 2.1 video generation, and local MiniMax-H3 video+audio, plus the `ModelSampling*` patch family (pure timestep math, no files or network). The sampling nodes are listed because the frontend's own default workflow wires `ModelSamplingAuraFlow`: without the listing it renders as a red "missing node" even though every worker supports it natively. It is default-deny, which matters more than usual now that ComfyUI ships cloud API nodes: `MiniMaxH3ImageToVideo` runs on this lab's GPUs, while the near-identically named `ComfyCloudMiniMaxH3ImageToVideoNode`, `Minimax*Node` and `MinimaxHailuo03*` send student prompts and images to a paid third-party service. Only the local variants are listed, and the same reasoning applies to the Veo, Sora, Kling and Runway nodes. Review a custom node's filesystem/network/subprocess behavior before adding it. Never enable arbitrary file readers, shell execution, or server administration nodes for students. If a course requires untrusted Python/custom nodes, run separate worker containers/VMs per trust boundary. Keep the same reviewed node/model set on interchangeable workers; model or node incompatibility is a visible failed job, not a silent retry.
 
 The managed endpoints include `/prompt`, `/ws`, `/queue`, `/interrupt`, `/history`, `/view`, `/upload/image`, `/object_info`, `/system_stats`, `/settings`, `/userdata`, and `/v2/userdata` (also under `/api/` where applicable). Arbitrary extension APIs, upload-mask editing, and worker-global history deletion are not exposed. Frontend builds that require additional APIs need an explicitly authorized adapter, not transparent fallback proxying. Do not reuse one browser profile for different students; browser-local caches/extensions are outside server-side isolation.
 
 ## Starter workflows
 
-`apps/gateway/src/starters/` holds a curated pair that reaches students two ways: it is written into each student's
+`apps/gateway/src/starters/` holds a curated set that reaches students two ways: it is written into each student's
 workspace under `workflows/` the first time they open it, and it is the entire contents of the template browser. Existing
 students pick up new starters on their next visit, so distributing one never requires recreating a class.
 
@@ -211,23 +211,34 @@ stock template's graph is a 404. Only static media (thumbnails, the model-filter
 forwarded to the worker.
 
 A student who deletes or edits a starter keeps that decision: the `__starters__` marker records each path once placed,
-and seeding never rewrites a path it has already offered. Bump `VERSION` in `apps/gateway/src/starters/index.ts` to push
-a revision to everyone.
+and seeding never rewrites a path it has already offered. Bump `VERSION` in `apps/gateway/src/starters/index.ts` when adding new starters so existing workspaces evaluate the updated starter list.
 
-The set is one image and two video examples, with the image starter first so it is the default students see:
+The set includes three image starters and three video starters, with the Flux image starter first so it is the default students see:
 
 - **Image (Flux)**: hand-authored text-to-image on `flux1-schnell-fp8` (4 steps). Every student receives it.
+- **Image (Qwen 2.1 Turbo)**: text-to-image on `qwen_image_2.1_turbo_int8_convrot` (8 steps, native typography and RGBA
+  support) with an optional local Qwen 3.5 9B prompt enhancer (`qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot`). Every
+  student receives it.
+- **Image Edit (Qwen 2.1 Turbo)**: instruction-based image editing on `qwen_image_2.1_turbo_int8_convrot` (8 steps, up to
+  10 reference images) with an optional local Qwen 3.5 9B edit prompt enhancer
+  (`qwen3.5_9b_qwen_image_2.1_pe_i2i.int8_convrot`). Every student receives it.
 - **Video (Wan 2.1 1.3B)**: text-to-video on `wan2.1_t2v_1.3B_fp16` plus the UMT5 fp8 text encoder and Wan VAE
   (`deploy/models/wan-t2v-1.3b.json`, ~10 GB total, a few minutes per 2-second 832x480 clip at 10 steps).
   It is adapted from ComfyUI's official Wan T2V example, so it tracks the frontend's serialization. Every student
   receives it.
 - **Video with audio (MiniMax H3)**: text-to-video with synchronized audio on the lab's own MiniMax-H3 weights with
-  the turbo LoRA enabled (8 steps). This one is **gated**: it is seeded and shown in the template browser only for
-  students whose teacher enabled it on the class roster (**Roster → Give H3**). Everyone else builds H3 graphs by
-  hand from the allowlisted H3 nodes, which is the actual exercise.
+  the turbo LoRA enabled (8 steps). This one is **gated**: teachers can enable it class-wide (**Enable H3 for all
+  students**, when creating a class or at any time — including before students sign up) or per student (**Roster → Give
+  H3**, before or after signup). Administrators also have all starters unlocked directly via **Open ComfyUI**.
+- **Text to Image to Video (Qwen 2.1 + MiniMax H3)**: generates multiple reference images (`<Picture 1>`, `<Picture 2>`,
+  `<Picture 3>`, expandable up to 6+) with Qwen Image 2.1 Turbo (with prompt enhancer) and composes them into a video
+  with synchronized audio using `MiniMaxH3ReferenceToVideo` (4-step turbo). Gated on the same class-wide or per-student
+  H3 toggle.
 
-Revoking the grant hides the H3 template and its graph again but never deletes a placed workspace file; the student
-keeps whatever they already received. Grants are stored per student per class and vanish with the class.
+Revoking the grant hides the H3 templates and their graphs again but never deletes a placed workspace file; the student
+keeps whatever they already received. Teachers can also add or delete individual students directly with buttons on the
+class **Roster** tab, and disable or re-enable student ComfyUI access per class (**Disable class access** / **Enable
+class access**).
 
 Hand-building an H3 graph is genuinely fiddly — it samples through `SamplerCustomAdvanced` rather than `KSampler` —
 so keep this note where students can find it: H3 constrains video length to the model's block grid, so valid frame
@@ -240,7 +251,7 @@ After editing a starter or upgrading ComfyUI, verify it before committing:
 scripts/build-starters.py            # defaults to http://127.0.0.1:8188
 ```
 
-The script checks every node type in all three starters against a live worker's `/object_info` and against
+The script checks every node type in all six starters against a live worker's `/object_info` and against
 `COMFY_ALLOWED_NODES`, and checks every loader filename against `deploy/models/`. A starter referencing a blocked or
 absent node fails at submit time with an error a student cannot act on, so that check gates the commit.
 
@@ -340,6 +351,7 @@ one administrator's shell history:
 ```bash
 scripts/fetch-models.sh --check minimax-h3     # verify every URL first, download nothing
 scripts/fetch-models.sh minimax-h3 flux-schnell
+scripts/fetch-models.sh qwen-image-2.1         # ~36 GB; Qwen Image 2.1 Turbo + Qwen3-VL 8B + T2I/I2I prompt enhancers
 scripts/fetch-models.sh wan-t2v-1.3b           # ~10 GB video example; H3 stays for hand-built graphs
 scripts/fetch-models.sh z-image-turbo          # ~21 GB; makes the frontend's own default workflow run as-is
 ```

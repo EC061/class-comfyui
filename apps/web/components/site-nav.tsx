@@ -1,6 +1,7 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { OpenComfyButton } from "./open-comfy-button";
 
 const adminLinks = [
   ["/admin/classes", "Classes"],
@@ -40,6 +41,7 @@ export function SiteNav({ user }: { user: { email: string; globalRole: string } 
           ))}
           {user && (
             <>
+              {user.globalRole === "ADMIN" && <OpenComfyButton className="btn ml-1 py-1.5 text-sm" />}
               <span className="px-2 text-slate-500">
                 {user.email}
                 {user.globalRole === "ADMIN" && <span className="ml-1 font-semibold text-slate-700">· admin</span>}

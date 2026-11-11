@@ -134,6 +134,80 @@ except Exception:
   [ "${n:-0}" -gt 0 ]
 }
 
+EXTERNAL_VRAM_THRESHOLD_MB="${WORKER_EXTERNAL_VRAM_THRESHOLD_MB:-1536}"
+
+resolve_gpu_idx() {
+  local inst="$1" idx=""
+  idx="$(grep -E '^CUDA_VISIBLE_DEVICES=' "$ENV_DIR/$inst.env" 2>/dev/null | tail -1 | cut -d= -f2- | cut -d, -f1 | tr -d '[:space:]' || true)"
+  if [ -z "$idx" ]; then
+    idx="$(systemctl show -p Environment --value "comfyui@$inst.service" 2>/dev/null | tr ' ' '\n' | grep -E '^CUDA_VISIBLE_DEVICES=' | tail -1 | cut -d= -f2- | cut -d, -f1 | tr -d '[:space:]' || true)"
+  fi
+  if [ -z "$idx" ] && [[ "$inst" =~ ^gpu([0-9]+)$ ]]; then
+    idx="${BASH_REMATCH[1]}"
+  fi
+  [[ "$idx" =~ ^[0-9]+$ ]] && printf '%s' "$idx"
+}
+
+external_gpu_index_busy() {
+  # Returns 0 (true) when a stopped unit's GPU has any compute process or
+  # >EXTERNAL_VRAM_THRESHOLD_MB allocated, failing closed on unknown GPU index.
+  local gpu_idx="$1" apps used
+  [[ "$gpu_idx" =~ ^[0-9]+$ ]] || return 0
+  command -v nvidia-smi >/dev/null || return 1
+  apps="$(nvidia-smi -i "$gpu_idx" --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | tr -d '[:space:]')" || return 0
+  [ -n "$apps" ] && return 0
+  used="$(nvidia-smi -i "$gpu_idx" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '[:space:]')" || return 0
+  [[ "$used" =~ ^[0-9]+$ ]] || return 0
+  [ "$used" -gt "$EXTERNAL_VRAM_THRESHOLD_MB" ]
+}
+
+external_worker_busy() {
+  # Returns 0 (true) when ANY non-ComfyUI GPU workload (e.g. VLLM::EngineCore)
+  # occupies the card, while allowing ComfyUI's own cached PyTorch models to be freed.
+  local port="$1" inst="$2" body gpu_idx main_pid apps total_used
+  body="$(curl -fsS -m 10 "http://127.0.0.1:$port/system_stats" 2>/dev/null)" || return 0
+  if EXTERNAL_VRAM_THRESHOLD_MB="$EXTERNAL_VRAM_THRESHOLD_MB" python3 -c '
+import json, os, sys
+threshold = int(os.environ.get("EXTERNAL_VRAM_THRESHOLD_MB", "1536")) * 1024 * 1024
+d = (json.load(sys.stdin).get("devices") or [{}])[0]
+tot, free = int(d.get("vram_total") or 0), int(d.get("vram_free") or 0)
+tt, tf = d.get("torch_vram_total"), d.get("torch_vram_free")
+if tot <= 0:
+    sys.exit(1)
+torch_active = max(0, int(tt) - int(tf)) if tt is not None and tf is not None else 0
+non_comfy = max(0, (tot - free) - torch_active)
+sys.exit(0 if non_comfy > threshold else 1)
+' <<<"$body"; then
+    return 0
+  fi
+  command -v nvidia-smi >/dev/null || return 1
+  gpu_idx="$(resolve_gpu_idx "$inst" || true)"
+  [[ "$gpu_idx" =~ ^[0-9]+$ ]] || return 0
+  main_pid="$(systemctl show -p MainPID --value "comfyui@$inst.service" 2>/dev/null | tr -d '[:space:]' || true)"
+  apps="$(nvidia-smi -i "$gpu_idx" --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null)" || return 0
+  total_used="$(nvidia-smi -i "$gpu_idx" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '[:space:]')" || return 0
+  [[ "$total_used" =~ ^[0-9]+$ ]] || return 0
+  MAIN_PID="${main_pid:-0}" TOTAL_USED="$total_used" THRESHOLD_MB="$EXTERNAL_VRAM_THRESHOLD_MB" python3 -c '
+import os, sys
+main_pid = os.environ["MAIN_PID"]
+total_used = int(os.environ["TOTAL_USED"])
+threshold = int(os.environ["THRESHOLD_MB"])
+comfy_used = 0
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line:
+        continue
+    parts = [p.strip() for p in line.split(",")]
+    pid = parts[0]
+    mem = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    if main_pid and main_pid != "0" and pid == main_pid:
+        comfy_used += mem
+    else:
+        sys.exit(0)
+sys.exit(0 if (total_used - comfy_used) > threshold else 1)
+' <<<"$apps"
+}
+
 free_unit() {
   local port="$1"
   if [ "$DRY_RUN" = 1 ]; then
@@ -151,6 +225,11 @@ while true; do
       case "$(unit_state "$inst")" in
         active|activating|reloading) continue ;;
       esac
+      gpu_idx="$(resolve_gpu_idx "$inst" || true)"
+      if external_gpu_index_busy "$gpu_idx"; then
+        log "$inst (gpu ${gpu_idx:-unknown}): external GPU process active or GPU index unknown, leaving stopped"
+        continue
+      fi
       log "$inst: platform work waiting, starting comfyui@$inst"
       run $SUDO systemctl start "comfyui@$inst"
       rm -f "$STATE_DIR/$inst"
@@ -169,12 +248,20 @@ while true; do
     fi
     state="$STATE_DIR/$inst"
     if queue_empty "$port"; then
+      if external_worker_busy "$port" "$inst"; then
+        rm -f "$state"
+        continue
+      fi
       idle_for=0
       if [ -f "$state" ]; then idle_for=$(( $(date +%s) - $(cat "$state") )); fi
       if [ ! -f "$state" ]; then
         date +%s >"$state"
         log "$inst (port $port): queue empty, idle clock started"
       elif [ "$idle_for" -ge "$IDLE_SECONDS" ]; then
+        if external_worker_busy "$port" "$inst"; then
+          rm -f "$state"
+          continue
+        fi
         log "$inst (port $port): idle ${idle_for}s, freeing VRAM"
         if free_unit "$port"; then
           if [ "$FREE_ONLY" = 1 ]; then

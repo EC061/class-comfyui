@@ -420,6 +420,15 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     expect(done.preview_output.filename).toBe(bo.fileName);
     expect(done.preview_output.nodeId).toBeTruthy();
     expect(done).not.toHaveProperty("execution_error");
+    // Detail endpoint (/api/jobs/:id) returns outputs, execution_status, and workflow for owner only.
+    const detailRes = await gw("/jobs/" + aid, undefined, ga);
+    expect(detailRes.status).toBe(200);
+    const detail = await detailRes.json();
+    expect(detail.id).toBe(aid);
+    expect(detail.outputs).toBeTruthy();
+    expect(detail.execution_status).toMatchObject({ status_str: "success", completed: true });
+    expect((await gw("/jobs/" + bid, undefined, ga)).status).toBe(404);
+    expect((await gw("/jobs/" + aid + "/cancel", {}, gb)).status).toBe(404);
     // A status the worker would reject must not silently return everything.
     expect((await gw("/jobs?status=finished", undefined, ga)).status).toBe(400);
     expect((await gw("/jobs?sort_by=user_id", undefined, ga)).status).toBe(400);
@@ -438,6 +447,8 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     // Starter workflows are seeded on workspace entry, so the directory is not
     // empty for a student who has never saved anything.
     expect(paths).toContain("1 - Image (Flux).json");
+    expect(paths).toContain("1b - Image (Qwen 2.1 Turbo).json");
+    expect(paths).toContain("1c - Image Edit (Qwen 2.1 Turbo).json");
     expect(paths).toContain("2 - Video (Wan 1.3B).json");
     // The seeding marker shares the user_data table with the student's files but
     // must never surface as one.
@@ -447,16 +458,30 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     // submit time on a missing model or a denied node.
     const templates = await (await gw("/templates/index.json", undefined, ga)).json();
     const names = templates.flatMap((c: any) => c.templates.map((t: any) => t.name));
-    expect(names).toEqual(["class_image_flux", "class_video_wan_t2v_1_3b"]);
+    expect(names).toEqual([
+      "class_image_flux",
+      "class_image_qwen_2_1_turbo",
+      "class_image_qwen_2_1_turbo_edit",
+      "class_video_wan_t2v_1_3b",
+    ]);
     const graph = await gw("/templates/class_image_flux.json", undefined, ga);
     expect(graph.status).toBe(200);
     expect((await graph.json()).nodes.length).toBeGreaterThan(0);
+    const qwenGraph = await gw("/templates/class_image_qwen_2_1_turbo.json", undefined, ga);
+    expect(qwenGraph.status).toBe(200);
+    expect((await qwenGraph.json()).nodes.length).toBeGreaterThan(0);
+    const qwenEditGraph = await gw("/templates/class_image_qwen_2_1_turbo_edit.json", undefined, ga);
+    expect(qwenEditGraph.status).toBe(200);
+    expect((await qwenEditGraph.json()).nodes.length).toBeGreaterThan(0);
     const videoGraph = await gw("/templates/class_video_wan_t2v_1_3b.json", undefined, ga);
     expect(videoGraph.status).toBe(200);
     expect((await videoGraph.json()).nodes.length).toBeGreaterThan(0);
     expect((await gw("/templates/image_z_image_turbo.json", undefined, ga)).status).toBe(404);
     expect(await (await gw("/api/workflow_templates", undefined, ga)).json()).toEqual({});
     expect((await gw("/templates/index.json")).status).toBe(401);
+    // Default queue progress settings are enabled out of the box.
+    expect(await (await gw("/api/settings/Comfy.Queue.QPOV2", undefined, ga)).json()).toBe(true);
+    expect(await (await gw("/api/settings/Comfy.Queue.ShowRunProgressBar", undefined, ga)).json()).toBe(true);
     const settings = await fetch(gatewayUrl + "/api/settings/theme", {
       method: "POST",
       headers: { Cookie: ga, Origin: process.env.COMFY_PUBLIC_URL! },
@@ -476,6 +501,20 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
 
     expect((await gw("/userdata/workflows/test.json", undefined, gb)).status).toBe(404);
     expect(messages.some((m) => m.data?.prompt_id === bid)).toBe(false);
+    // Frontend 1.58.5 relies on execution_start, execution_cached, progress_state (with rewritten node prompt_id), and executed (with display_node).
+    expect(messages.some((m) => m.type === "execution_start" && m.data?.prompt_id === aid)).toBe(true);
+    expect(messages.some((m) => m.type === "execution_cached" && m.data?.prompt_id === aid)).toBe(true);
+    const progressState = messages.find((m) => m.type === "progress_state" && m.data?.prompt_id === aid);
+    expect(progressState).toBeTruthy();
+    expect(progressState.data.nodes["1"].prompt_id).toBe(aid);
+    const executedMsg = messages.find((m) => m.type === "executed" && m.data?.prompt_id === aid);
+    expect(executedMsg).toBeTruthy();
+    expect(executedMsg.data.display_node).toBe("1");
+    ws.send(JSON.stringify({ type: "feature_flags", data: { supports_preview_metadata: true } }));
+    await waitFor(
+      () => messages.find((m) => m.type === "feature_flags"),
+      (v) => Boolean(v)
+    );
     expect((await gw("/private", undefined, ga)).status).toBe(404);
     expect((await gw("/queue", { clear: true }, ga, "https://evil.example.com")).status).toBe(403);
     expect((await gw("/queue", { clear: true }, ga, null)).status).toBe(403);
@@ -629,10 +668,14 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     const mine = enrollments.find((e) => e.userId === getDb().userByEmail("student1@example.edu")?.id)!;
     const pending = enrollments.find((e) => !e.userId)!;
     expect(mine.h3Video).toBe(false);
-    // A grant needs a registered account, not just a roster row.
-    expect(
-      (await api(`/admin/classes/${c.id}/enrollments`, { id: pending.id, h3Video: true }, a, "PATCH")).status
-    ).toBe(409);
+    // Teachers can grant H3 to an enrollment even before the student registers; once
+    // that student signs up, H3 is ready on their very first ComfyUI visit.
+    const preGrant = await api(`/admin/classes/${c.id}/enrollments`, { id: pending.id, h3Video: true }, a, "PATCH");
+    expect(preGrant.status).toBe(200);
+    expect((await preGrant.json()).h3Video).toBe(true);
+    const bob = await student(c, url, pending.rosterEmail);
+    const gBob = await workspace(bob, c.id);
+    expect((await gw("/templates/class_video_minimax_h3.json", undefined, gBob)).status).toBe(200);
     // A student cannot grant themselves the example.
     expect((await api(`/admin/classes/${c.id}/enrollments`, { id: mine.id, h3Video: true }, alice)).status).toBe(403);
     const ga = await workspace(alice, c.id);
@@ -640,27 +683,72 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
       (await (await gw("/templates/index.json", undefined, cookie)).json()).flatMap((cat: any) =>
         cat.templates.map((t: any) => t.name)
       );
-    expect(await names(ga)).toEqual(["class_image_flux", "class_video_wan_t2v_1_3b"]);
+    expect(await names(ga)).toEqual([
+      "class_image_flux",
+      "class_image_qwen_2_1_turbo",
+      "class_image_qwen_2_1_turbo_edit",
+      "class_video_wan_t2v_1_3b",
+    ]);
     expect((await gw("/templates/class_video_minimax_h3.json", undefined, ga)).status).toBe(404);
+    expect((await gw("/templates/class_video_qwen_minimax_h3.json", undefined, ga)).status).toBe(404);
     const grant = await api(`/admin/classes/${c.id}/enrollments`, { id: mine.id, h3Video: true }, a, "PATCH");
     expect(grant.status).toBe(200);
     expect((await grant.json()).h3Video).toBe(true);
-    // The grant lands on the next workspace entry, without touching the base pair.
+    // The grant lands on the next workspace entry, without touching the base starters.
     const gb = await workspace(alice, c.id);
-    expect(await names(gb)).toEqual(["class_image_flux", "class_video_wan_t2v_1_3b", "class_video_minimax_h3"]);
+    expect(await names(gb)).toEqual([
+      "class_image_flux",
+      "class_image_qwen_2_1_turbo",
+      "class_image_qwen_2_1_turbo_edit",
+      "class_video_wan_t2v_1_3b",
+      "class_video_minimax_h3",
+      "class_video_qwen_minimax_h3",
+    ]);
     const graph = await gw("/templates/class_video_minimax_h3.json", undefined, gb);
     expect(graph.status).toBe(200);
     expect((await graph.json()).nodes.length).toBeGreaterThan(0);
+    const qwenH3Graph = await gw("/templates/class_video_qwen_minimax_h3.json", undefined, gb);
+    expect(qwenH3Graph.status).toBe(200);
+    expect((await qwenH3Graph.json()).nodes.length).toBeGreaterThan(0);
     const files = (await (await gw("/api/userdata?dir=workflows&recurse=true", undefined, gb)).json()) as string[];
     expect(files).toContain("2 - Video with audio (MiniMax H3).json");
+    expect(files).toContain("2b - Text to Image to Video (Qwen 2.1 + MiniMax H3).json");
     // Revoking hides the template and its graph but never deletes placed work.
     expect((await api(`/admin/classes/${c.id}/enrollments`, { id: mine.id, h3Video: false }, a, "PATCH")).status).toBe(
       200
     );
-    expect(await names(gb)).toEqual(["class_image_flux", "class_video_wan_t2v_1_3b"]);
+    expect(await names(gb)).toEqual([
+      "class_image_flux",
+      "class_image_qwen_2_1_turbo",
+      "class_image_qwen_2_1_turbo_edit",
+      "class_video_wan_t2v_1_3b",
+    ]);
     expect((await gw("/templates/class_video_minimax_h3.json", undefined, gb)).status).toBe(404);
+    expect((await gw("/templates/class_video_qwen_minimax_h3.json", undefined, gb)).status).toBe(404);
     const kept = (await (await gw("/api/userdata?dir=workflows&recurse=true", undefined, gb)).json()) as string[];
     expect(kept).toContain("2 - Video with audio (MiniMax H3).json");
+    expect(kept).toContain("2b - Text to Image to Video (Qwen 2.1 + MiniMax H3).json");
+    // A starter version bump never overwrites a student's edited starter (whether
+    // already listed in marker.seeded or pre-existing on disk before seeding).
+    await gw("/userdata/workflows/1%20-%20Image%20(Flux).json", { nodes: ["student-custom-edit"] }, gb);
+    await gw("/userdata/workflows/1b%20-%20Image%20(Qwen%202.1%20Turbo).json", { nodes: ["student-qwen-edit"] }, gb);
+    const markerRow = getDb().list("user_data", "user_id=? AND class_id=? AND path=?", [
+      mine.userId,
+      c.id,
+      "__starters__",
+    ])[0]!;
+    markerRow.content = JSON.stringify({
+      version: 2,
+      seeded: ["workflows/1 - Image (Flux).json", "workflows/2 - Video (Wan 1.3B).json"],
+    });
+    getDb().put("user_data", markerRow);
+    const gc = await workspace(alice, c.id);
+    const editedFlux = await (await gw("/userdata/workflows/1%20-%20Image%20(Flux).json", undefined, gc)).json();
+    expect(editedFlux).toEqual({ nodes: ["student-custom-edit"] });
+    const editedQwen = await (
+      await gw("/userdata/workflows/1b%20-%20Image%20(Qwen%202.1%20Turbo).json", undefined, gc)
+    ).json();
+    expect(editedQwen).toEqual({ nodes: ["student-qwen-edit"] });
   });
   it("keeps jobs queued while worker is offline, reconnects without duplicates, records execution and archive failures separately", async () => {
     const a = await admin(),
@@ -685,6 +773,12 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
       (v) => v === "OFFLINE"
     );
     expect(getDb().get("jobs", id)?.status).toBe("QUEUED");
+    // Cancel via /jobs/:id/cancel while worker is offline and job is QUEUED
+    const toCancelRes = await gw("/prompt", prompt, g);
+    expect(toCancelRes.status).toBe(200);
+    const cancelId = (await toCancelRes.json()).prompt_id;
+    expect((await gw("/jobs/" + cancelId + "/cancel", {}, g)).status).toBe(200);
+    expect(getDb().get("jobs", cancelId)?.status).toBe("CANCELLED");
     mock.online = true;
     await waitFor(
       () => getDb().get("jobs", id)?.archiveStatus,
@@ -699,6 +793,15 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
       (v) => v === "FAILED"
     );
     expect(getDb().get("jobs", fid)?.archiveStatus).toBe("PENDING");
+    const failedJob = await (await gw("/jobs/" + fid, undefined, g)).json();
+    expect(failedJob.status).toBe("failed");
+    expect(failedJob.execution_error).toMatchObject({
+      node_id: expect.any(String),
+      node_type: expect.any(String),
+      exception_message: expect.any(String),
+      exception_type: expect.any(String),
+      traceback: expect.any(Array),
+    });
     mock.fail = false;
     mock.failView = true;
     const third = await gw("/prompt", prompt, g);
@@ -1077,5 +1180,590 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
       )
     );
     expect(getDb().sql.prepare("SELECT count FROM rate_limits WHERE id='parallel'").get()?.count).toBe(60);
+  });
+  it("skips unwired MiniMax H3 during candidate image generation, caches unchanged image branches across runs, and forwards partial_execution_targets", async () => {
+    const a = await admin(),
+      c = await createClass(a);
+    await roster(a, c.id);
+    const s = await student(c, await signup(a, c));
+    await api("/workers", { name: "GPU", baseUrl: mock.url }, a);
+    const w = getDb().list("workers")[0];
+    w.healthStatus = "ONLINE";
+    getDb().put("workers", w);
+    scheduler = new Scheduler();
+    scheduler.start();
+    const g = await workspace(s, c.id);
+
+    // Stage 1: two candidate image branches (with ComfySwitchNode refine_prompt=false)
+    // + unwired MiniMaxH3ReferenceToVideo (with ComfySwitchNode turbo_mode=true).
+    const stage1Prompt: Record<string, any> = {
+      "8": { class_type: "TextGenerate", inputs: { prompt: "unused enhancer" } },
+      "9": {
+        class_type: "ComfySwitchNode",
+        inputs: { switch: false, on_false: "raw prompt 1", on_true: ["8", 0] },
+      },
+      "10": { class_type: "EmptyLatentImage", inputs: { seed: 101, text: ["9", 0] } },
+      "11": { class_type: "VAEDecode", inputs: { samples: ["10", 0] } },
+      "12": { class_type: "PreviewImage", inputs: { images: ["11", 0] } },
+      "20": { class_type: "EmptyLatentImage", inputs: { seed: 202 } },
+      "21": { class_type: "VAEDecode", inputs: { samples: ["20", 0] } },
+      "22": { class_type: "PreviewImage", inputs: { images: ["21", 0] } },
+      "37": { class_type: "PrimitiveInt", inputs: { value: 20 } },
+      "38": { class_type: "PrimitiveInt", inputs: { value: 4 } },
+      "39": { class_type: "PrimitiveBoolean", inputs: { value: true } },
+      "36": {
+        class_type: "ComfySwitchNode",
+        inputs: { switch: ["39", 0], on_false: ["37", 0], on_true: ["38", 0] },
+      },
+      "40": { class_type: "MiniMaxH3ReferenceToVideo", inputs: { prompt: "hero video", steps: ["36", 0] } },
+      "50": { class_type: "SaveVideo", inputs: { video: ["40", 0], filename_prefix: "video" } },
+    };
+    const r1 = await gw("/prompt", { prompt: stage1Prompt }, g);
+    expect(r1.status).toBe(200);
+    const id1 = (await r1.json()).prompt_id;
+    await waitFor(
+      () => getDb().get("jobs", id1)?.archiveStatus,
+      (v) => v === "COMPLETE"
+    );
+    // Unwired MiniMaxH3ReferenceToVideo ("40") and SaveVideo ("50") were pruned,
+    // and inactive TextGenerate ("8") was pruned with its dangling link removed from ComfySwitchNode ("9").
+    expect(mock.submissions[0].prompt["40"]).toBeUndefined();
+    expect(mock.submissions[0].prompt["50"]).toBeUndefined();
+    expect(mock.submissions[0].prompt["8"]).toBeUndefined();
+    expect(mock.submissions[0].prompt["9"].inputs.on_true).toBeUndefined();
+    expect(mock.submissions[0].prompt["11"].class_type).toBe("VAEDecode");
+    expect(mock.submissions[0].prompt["21"].class_type).toBe("VAEDecode");
+
+    // Stage 2: change seed on candidate 2 ("20") only; candidate 1 ("11") is cached via LoadImage.
+    const stage2Prompt = structuredClone(stage1Prompt);
+    stage2Prompt["20"].inputs.seed = 999;
+    const r2 = await gw("/prompt", { prompt: stage2Prompt, partial_execution_targets: ["22"] }, g);
+    expect(r2.status).toBe(200);
+    const id2 = (await r2.json()).prompt_id;
+    await waitFor(
+      () => getDb().get("jobs", id2)?.archiveStatus,
+      (v) => v === "COMPLETE"
+    );
+    expect(mock.submissions[1].partial_execution_targets).toEqual(["22"]);
+    expect(mock.submissions[1].prompt["11"].class_type).toBe("LoadImage");
+    expect(mock.submissions[1].prompt["10"]).toBeUndefined();
+    expect(mock.submissions[1].prompt["21"].class_type).toBe("VAEDecode");
+
+    // Stage 3: wire both candidate previews into MiniMaxH3ReferenceToVideo; both image branches use cached LoadImage
+    // and the inactive steps branch ("37") is pruned cleanly from ComfySwitchNode ("36").
+    const stage3Prompt: Record<string, any> = structuredClone(stage2Prompt);
+    stage3Prompt["40"].inputs = {
+      prompt: "hero video",
+      steps: ["36", 0],
+      "ref_images.ref_image_0": ["12", 0],
+      "ref_images.ref_image_1": ["22", 0],
+    };
+    const r3 = await gw("/prompt", { prompt: stage3Prompt }, g);
+    expect(r3.status).toBe(200);
+    const id3 = (await r3.json()).prompt_id;
+    await waitFor(
+      () => getDb().get("jobs", id3)?.archiveStatus,
+      (v) => v === "COMPLETE"
+    );
+    expect(mock.submissions[2].prompt["40"].class_type).toBe("MiniMaxH3ReferenceToVideo");
+    expect(mock.submissions[2].prompt["50"].class_type).toBe("SaveVideo");
+    expect(mock.submissions[2].prompt["37"]).toBeUndefined();
+    expect(mock.submissions[2].prompt["36"].inputs.on_false).toBeUndefined();
+    expect(mock.submissions[2].prompt["11"].class_type).toBe("LoadImage");
+    expect(mock.submissions[2].prompt["21"].class_type).toBe("LoadImage");
+    expect(mock.submissions[2].prompt["10"]).toBeUndefined();
+    expect(mock.submissions[2].prompt["20"]).toBeUndefined();
+  });
+  it("pauses and resumes class access while keeping student dashboard, jobs, and outputs visible", async () => {
+    const a = await admin(),
+      c = await createClass(a);
+    await roster(a, c.id);
+    const s = await student(c, await signup(a, c));
+    await api("/workers", { name: "GPU", baseUrl: mock.url }, a);
+    const w = getDb().list("workers")[0];
+    w.healthStatus = "ONLINE";
+    getDb().put("workers", w);
+    scheduler = new Scheduler();
+    scheduler.start();
+
+    const g = await workspace(s, c.id);
+    const submitted = await gw("/prompt", prompt, g);
+    expect(submitted.status).toBe(200);
+    const jobId = (await submitted.json()).prompt_id;
+    await waitFor(
+      () => getDb().get("jobs", jobId)?.archiveStatus,
+      (v) => v === "COMPLETE"
+    );
+
+    // Submit a slower job, then pause access while it is in flight (M5): workspace access
+    // is blocked immediately, while the already-admitted job finishes cleanly.
+    mock.delay = 350;
+    const inFlightSub = await gw("/prompt", prompt, g);
+    expect(inFlightSub.status).toBe(200);
+    const inFlightId = (await inFlightSub.json()).prompt_id as string;
+
+    const pausedRes = await api(`/admin/classes/${c.id}`, { paused: true }, a, "PATCH");
+    expect(pausedRes.status).toBe(200);
+    expect((await pausedRes.json()).class.paused).toBe(true);
+
+    // Existing ComfyUI gateway session is immediately rejected.
+    expect((await gw("/prompt", prompt, g)).status).toBe(401);
+
+    // Clicking Open ComfyUI returns 403 with CLASS_PAUSED and a clear message.
+    const wsBlocked = await api("/workspace/session", { classId: c.id }, s);
+    expect(wsBlocked.status).toBe(403);
+    const wsBlockedJson = await wsBlocked.json();
+    expect(wsBlockedJson.code).toBe("CLASS_PAUSED");
+    expect(wsBlockedJson.error).toMatch(/paused/i);
+
+    await waitFor(
+      () => getDb().get("jobs", inFlightId)?.archiveStatus,
+      (v) => v === "COMPLETE"
+    );
+    expect(getDb().get("jobs", inFlightId)?.status).toBe("COMPLETED");
+
+    // Student can still sign in and see their enrolled class, jobs, and outputs on the dashboard.
+    const sessionRes = await api("/auth/session", undefined, s);
+    expect(sessionRes.status).toBe(200);
+    const sessionJson = await sessionRes.json();
+    expect(sessionJson.enrollments).toHaveLength(1);
+    expect(sessionJson.enrollments[0].classActive).toBe(true);
+    expect(sessionJson.enrollments[0].classPaused).toBe(true);
+
+    const jobsRes = await api("/jobs", undefined, s);
+    expect(jobsRes.status).toBe(200);
+    const jobsJson = await jobsRes.json();
+    expect(jobsJson.jobs).toHaveLength(2);
+    expect(jobsJson.jobs[0].outputs).toHaveLength(1);
+    const outRes = await api(`/outputs/${jobsJson.jobs[0].outputs[0].id}`, undefined, s);
+    expect(outRes.status).toBe(200);
+
+    // Resume access on the class: student can open ComfyUI again.
+    const resumedRes = await api(`/admin/classes/${c.id}`, { paused: false }, a, "PATCH");
+    expect(resumedRes.status).toBe(200);
+    expect((await resumedRes.json()).class.paused).toBe(false);
+    const g2 = await workspace(s, c.id);
+    expect((await gw("/prompt", prompt, g2)).status).toBe(200);
+  });
+  it("never dispatches, uploads, or calls /free on GPUs occupied by external VRAM processes and distinguishes ComfyUI PyTorch models", async () => {
+    const externalGpu = await mockComfy();
+    // Simulate VLLM::EngineCore occupying ~34 GiB of a 48 GiB RTX A6000 outside ComfyUI's PyTorch pool.
+    externalGpu.vramTotal = 49152 * 1024 * 1024;
+    externalGpu.vramFree = 14336 * 1024 * 1024;
+    externalGpu.torchVramTotal = 128 * 1024 * 1024;
+    externalGpu.torchVramFree = 108 * 1024 * 1024;
+
+    // H1 regression: clean worker holds 30 GiB of its own cached ComfyUI PyTorch weights!
+    // Must NOT be misclassified as an external GPU process.
+    mock.vramTotal = 49152 * 1024 * 1024;
+    mock.torchVramTotal = 31744 * 1024 * 1024; // 31 GiB reserved by ComfyUI PyTorch
+    mock.torchVramFree = 1024 * 1024 * 1024; // 1 GiB free inside PyTorch pool -> 30 GiB active weights
+    mock.vramFree = (16896 + 1024) * 1024 * 1024; // ~512 MiB non-PyTorch CUDA context
+
+    try {
+      const a = await admin(),
+        c = await createClass(a);
+      await roster(a, c.id);
+      const url = await signup(a, c),
+        alice = await student(c, url, "student1@example.edu"),
+        bob = await student(c, url, "student2@example.edu");
+      const rExt = await api("/workers", { name: "GPU-0-vLLM", baseUrl: externalGpu.url }, a);
+      expect(rExt.status).toBe(201);
+      const extWorkerId = (await rExt.json()).worker.id as string;
+      const rClean = await api("/workers", { name: "GPU-2-Clean", baseUrl: mock.url }, a);
+      expect(rClean.status).toBe(201);
+      const cleanWorkerId = (await rClean.json()).worker.id as string;
+
+      scheduler = new Scheduler();
+      (scheduler as any).renew();
+      await scheduler.tick();
+
+      const extAfterHealth = getDb().get("workers", extWorkerId)!;
+      expect(extAfterHealth.externalBusy).toBe(true);
+      expect(extAfterHealth.healthStatus).toBe("BUSY");
+      expect(extAfterHealth.externalBusyReason).toMatch(/External GPU process/i);
+
+      // Clean worker with 30 GiB of ComfyUI's own PyTorch weights remains ONLINE & not externalBusy (H1).
+      const cleanAfterHealth = getDb().get("workers", cleanWorkerId)!;
+      expect(cleanAfterHealth.externalBusy).toBe(false);
+      expect(cleanAfterHealth.healthStatus).toBe("ONLINE");
+
+      const metrics = await (await api("/admin/metrics", undefined, a)).json();
+      expect(metrics.gpus).toBe(1);
+      expect(metrics.externalBusyGpus).toBe(1);
+
+      // Slow clean worker so jobs queue, testing interleaved round-robin queue positions (M4).
+      mock.delay = 450;
+      const ga = await workspace(alice, c.id),
+        gb = await workspace(bob, c.id);
+      const rootHtml = await (await gw("/", undefined, ga)).text();
+      expect(rootHtml).toContain("/lab/status-widget.js");
+      expect((await gw("/lab/status")).status).toBe(401);
+
+      // Alice submits 2 queued jobs BEFORE scheduler runs; Bob submits 1 queued job.
+      // Round-robin interleaving must place Bob at #2 (ahead of Alice's 2nd job at #3).
+      const subA1 = await gw("/prompt", prompt, ga);
+      const jobA1 = (await subA1.json()).prompt_id as string;
+      const subA2 = await gw("/prompt", prompt, ga);
+      const jobA2 = (await subA2.json()).prompt_id as string;
+      const subB = await gw("/prompt", prompt, gb);
+      const jobB = (await subB.json()).prompt_id as string;
+
+      const preDispatchBobStatus = await (await gw("/lab/status", undefined, gb)).json();
+      expect(preDispatchBobStatus.totalQueued).toBe(3);
+      expect(preDispatchBobStatus.activeJobs[0].queuePosition).toBe(2);
+
+      await scheduler.tick();
+      await waitFor(
+        () => getDb().get("jobs", jobA1)?.status,
+        (v) => v === "RUNNING"
+      );
+
+      // Now jobA1 is RUNNING on Alice's slot, so Bob's jobB moves to #1 ahead of jobA2 (#2)!
+      const bobStatus = await (await gw("/lab/status", undefined, gb)).json();
+      expect(bobStatus.availableWorkers).toBe(1);
+      expect(bobStatus.totalQueued).toBe(2);
+      expect(bobStatus.activeJobs[0].id).toBe(jobB);
+      expect(bobStatus.activeJobs[0].queuePosition).toBe(1);
+
+      const bobWebJobs = await (await api("/jobs", undefined, bob)).json();
+      expect(bobWebJobs.queueSummary).toEqual({ availableGpus: 1, runningJobs: 1, queuedJobs: 2 });
+      expect(bobWebJobs.jobs[0].queuePosition).toBe(1);
+      expect(bobWebJobs.jobs[0].promptJson).toBeUndefined();
+
+      scheduler.start();
+      await waitFor(
+        () => getDb().get("jobs", jobA2)?.archiveStatus,
+        (v) => v === "COMPLETE"
+      );
+      await scheduler.stop();
+      expect(getDb().get("jobs", jobB)?.archiveStatus).toBe("COMPLETE");
+
+      // External GPU must have ZERO submissions, ZERO uploads, and ZERO /free calls!
+      expect(externalGpu.submissions).toHaveLength(0);
+      expect(externalGpu.uploads).toHaveLength(0);
+      expect(externalGpu.frees).toHaveLength(0);
+      expect(mock.submissions).toHaveLength(3);
+
+      // H2 regression: suppose VLLM::EngineCore starts MID-JOB on mock while a job is RUNNING.
+      // When that job finishes, freeIfIdle must detect the external VRAM and NEVER call POST /free!
+      const freesBeforeMidJobSpike = mock.frees.length;
+      mock.delay = 350;
+      const subMid = await gw("/prompt", prompt, ga);
+      const midJobId = (await subMid.json()).prompt_id as string;
+      const midScheduler = new Scheduler();
+      (midScheduler as any).renew();
+      await midScheduler.tick();
+      await waitFor(
+        () => getDb().get("jobs", midJobId)?.status,
+        (v) => v === "RUNNING"
+      );
+      // External process grabs 28 GiB on mock while midJobId is running!
+      mock.torchVramTotal = 4096 * 1024 * 1024;
+      mock.torchVramFree = 512 * 1024 * 1024;
+      mock.vramFree = (16000 + 512) * 1024 * 1024; // ~29.5 GiB non-ComfyUI VRAM!
+      await waitFor(
+        () => getDb().get("jobs", midJobId)?.archiveStatus,
+        (v) => v === "COMPLETE"
+      );
+      await midScheduler.stop();
+      expect(mock.frees.length).toBe(freesBeforeMidJobSpike);
+      expect(getDb().get("workers", cleanWorkerId)?.externalBusy).toBe(true);
+
+      // Reset mock back to clean, then mark it OFFLINE to test M2 (reachable externalBusy beats stopped OFFLINE for UI)
+      // and pre-dispatch race + M1 lease-loss re-queue.
+      mock.online = false;
+      const cw = getDb().get("workers", cleanWorkerId)!;
+      cw.healthStatus = "OFFLINE";
+      cw.externalBusy = false;
+      cw.nodeDefinitions = { SaveImage: { input: { required: {} }, output: [], output_node: true } };
+      getDb().put("workers", cw);
+
+      // M2: GET / still loads from reachable externalGpu (200) instead of hitting stopped mock (502)!
+      const m2Root = await gw("/", undefined, ga);
+      expect(m2Root.status).toBe(200);
+
+      // Pre-dispatch race guard: suppose externalGpu was marked clean at health(), then VLLM grabs VRAM.
+      const cleanState = getDb().get("workers", extWorkerId)!;
+      cleanState.externalBusy = false;
+      cleanState.healthStatus = "ONLINE";
+      cleanState.lastAssignedAt = 0;
+      getDb().put("workers", cleanState);
+
+      const subRace = await gw("/prompt", prompt, ga);
+      const raceJobId = (await subRace.json()).prompt_id as string;
+      const raceScheduler = new Scheduler();
+      (raceScheduler as any).leader = true;
+      const claimed = raceScheduler.claim();
+      expect(claimed?.id).toBe(raceJobId);
+      expect(claimed?.workerId).toBe(extWorkerId);
+      await (raceScheduler as any).dispatch(claimed);
+
+      expect(externalGpu.submissions).toHaveLength(0);
+      expect(externalGpu.frees).toHaveLength(0);
+      expect(getDb().get("workers", extWorkerId)?.externalBusy).toBe(true);
+      expect(getDb().get("jobs", raceJobId)?.status).toBe("QUEUED");
+      expect(getDb().get("jobs", raceJobId)?.workerId).toBeNull();
+
+      // M1 regression: if scheduler loses leadership before sending, dispatch re-queues cleanly instead of stranding DISPATCHING.
+      mock.online = true;
+      mock.vramFree = 48640 * 1024 * 1024;
+      mock.torchVramTotal = 128 * 1024 * 1024;
+      mock.torchVramFree = 108 * 1024 * 1024;
+      const cwOnline = getDb().get("workers", cleanWorkerId)!;
+      cwOnline.healthStatus = "ONLINE";
+      cwOnline.externalBusy = false;
+      getDb().put("workers", cwOnline);
+      const leaseScheduler = new Scheduler();
+      (leaseScheduler as any).leader = true;
+      const claimedM1 = leaseScheduler.claim();
+      expect(claimedM1?.id).toBe(raceJobId);
+      (leaseScheduler as any).leader = false;
+      await (leaseScheduler as any).dispatch(claimedM1);
+      expect(getDb().get("jobs", raceJobId)?.status).toBe("QUEUED");
+      expect(getDb().get("jobs", raceJobId)?.leaseOwner).toBeNull();
+    } finally {
+      await externalGpu.close();
+    }
+  });
+  it("strips passwordHash and nodeDefinitions from API responses, validates optional and V3 COMBO dropdowns, and persists failed auth/admin-code audits and rate limits", async () => {
+    const a = await admin();
+    const rosterRows = Array.from(
+      { length: 25 },
+      (_, i) => `#2000000${String(i + 1).padStart(2, "0")},Student,Num${i + 1},s${i + 1}@example.edu,#`
+    );
+    const c = await createClass(a);
+    await roster(a, c.id, rosterRows);
+    const url = await signup(a, c);
+
+    // 25 students behind a single shared campus NAT IP register concurrently without hitting 429.
+    for (let i = 1; i <= 25; i++) {
+      const regRes = await register(c, url, `s${i}@example.edu`);
+      expect(regRes.status).toBe(200);
+    }
+    const s1 = authCookie(await consume("s1@example.edu"));
+
+    // API responses never leak passwordHash or 600KB nodeDefinitions.
+    const sessJson = await (await api("/auth/session", undefined, s1)).json();
+    expect(sessJson.user.email).toBe("s1@example.edu");
+    expect("passwordHash" in sessJson.user).toBe(false);
+    const usersJson = await (await api("/admin/users", undefined, a)).json();
+    expect(usersJson.users.every((u: any) => !("passwordHash" in u))).toBe(true);
+
+    await api("/workers", { name: "GPU-Meta", baseUrl: mock.url }, a);
+    const w = getDb().list("workers")[0];
+    w.healthStatus = "ONLINE";
+    getDb().put("workers", w);
+    const g1 = await workspace(s1, c.id);
+    expect((await gw("/object_info", undefined, g1)).status).toBe(200);
+    expect(getDb().get("workers", w.id)?.nodeDefinitions).toBeTruthy();
+    const workersJson = await (await api("/workers", undefined, a)).json();
+    expect("nodeDefinitions" in workersJson.workers[0]).toBe(false);
+
+    // Optional legacy dropdown, non-string scalar bypass, and V3 COMBO dropdowns are all strictly enforced (M7).
+    const badOpt = await gw(
+      "/prompt",
+      {
+        prompt: {
+          "1": { class_type: "TextGenerate", inputs: { prompt: "hello", device: "../../etc/passwd" } },
+        },
+      },
+      g1
+    );
+    expect(badOpt.status).toBe(400);
+    expect((await badOpt.json()).error).toContain("TextGenerate.device");
+
+    const badOptNonString = await gw(
+      "/prompt",
+      {
+        prompt: {
+          "1": { class_type: "TextGenerate", inputs: { prompt: "hello", device: 999 } },
+        },
+      },
+      g1
+    );
+    expect(badOptNonString.status).toBe(400);
+
+    const badV3Combo = await gw(
+      "/prompt",
+      {
+        prompt: {
+          "1": { class_type: "MiniMaxH3ReferenceToVideo", inputs: { prompt: "hello", mode: "unapproved" } },
+        },
+      },
+      g1
+    );
+    expect(badV3Combo.status).toBe(400);
+    expect((await badV3Combo.json()).error).toContain("MiniMaxH3ReferenceToVideo.mode");
+
+    // Failed login and failed admin-code attempts persist audits and enforce rollback-proof rate limits.
+    expect((await login("s1@example.edu", "wrong-password")).status).toBe(401);
+    for (let i = 0; i < 5; i++) {
+      expect((await api("/auth/admin-code", { adminCode: "wrong-code" }, s1)).status).toBe(403);
+    }
+    expect((await api("/auth/admin-code", { adminCode: "wrong-code" }, s1)).status).toBe(429);
+
+    const auditTypes = getDb()
+      .list("audits")
+      .map((ev) => ev.type);
+    expect(auditTypes).toContain("WORKSPACE_EXCHANGED");
+    expect(auditTypes).toContain("PROMPT_REJECTED");
+    expect(auditTypes).toContain("LOGIN_FAILED");
+    expect(auditTypes).toContain("ADMIN_CODE_FAILED");
+  });
+
+  it("supports class-wide H3 before signup, manual add/delete student buttons with disk cleanup, and direct admin ComfyUI workspace access", async () => {
+    const a = await admin();
+    await api("/workers", { name: "GPU-Direct", baseUrl: mock.url }, a);
+    scheduler = new Scheduler();
+    scheduler.start();
+
+    // 1. Direct Admin ComfyUI workspace access without any student account or class enrollment.
+    const adminWsRes = await api("/workspace/session", {}, a);
+    expect(adminWsRes.status).toBe(200);
+    const adminExchangeUrl = new URL((await adminWsRes.json()).url);
+    const adminExchange = await fetch(gatewayUrl + adminExchangeUrl.pathname + adminExchangeUrl.search, {
+      redirect: "manual",
+    });
+    expect(adminExchange.status).toBe(303);
+    const gAdmin = authCookie(adminExchange);
+    const adminTemplates = (await (await gw("/templates/index.json", undefined, gAdmin)).json()).flatMap((cat: any) =>
+      cat.templates.map((t: any) => t.name)
+    );
+    expect(adminTemplates).toContain("class_video_minimax_h3");
+    expect(adminTemplates).toContain("class_video_qwen_minimax_h3");
+    const adminSeeded = (await (
+      await gw("/api/userdata?dir=workflows&recurse=true", undefined, gAdmin)
+    ).json()) as string[];
+    expect(adminSeeded).toContain("2 - Video with audio (MiniMax H3).json");
+    expect(adminSeeded).toContain("2b - Text to Image to Video (Qwen 2.1 + MiniMax H3).json");
+    const adminJobSub = await gw("/prompt", prompt, gAdmin);
+    expect(adminJobSub.status).toBe(200);
+    const adminJobId = (await adminJobSub.json()).prompt_id as string;
+    await waitFor(
+      () => getDb().get("jobs", adminJobId)?.archiveStatus,
+      (v) => v === "COMPLETE"
+    );
+
+    // Internal __admin-workspace__ never leaks into admin class listings, metrics, or session enrollments.
+    expect((await (await api("/admin/classes", undefined, a)).json()).classes).toHaveLength(0);
+    expect((await (await api("/admin/metrics", undefined, a)).json()).activeClasses).toBe(0);
+    expect((await (await api("/auth/session", undefined, a)).json()).enrollments).toHaveLength(0);
+
+    // 2. Class-wide H3 enabled BEFORE any students exist or sign up, plus manual Add student button.
+    const c = await createClass(a);
+    const enableAllRes = await api(`/admin/classes/${c.id}`, { h3Video: true }, a, "PATCH");
+    expect(enableAllRes.status).toBe(200);
+    expect((await enableAllRes.json()).class.h3Video).toBe(true);
+
+    // Add student manually without Student ID (auto-generated) BEFORE signup.
+    const addRes = await api(
+      `/admin/classes/${c.id}/enrollments`,
+      { email: "manual1@example.edu", firstName: "Maya", lastName: "Lin" },
+      a
+    );
+    expect(addRes.status).toBe(201);
+    const addedEnrollment = (await addRes.json()).enrollment;
+    expect(addedEnrollment.rosterEmail).toBe("manual1@example.edu");
+    expect(addedEnrollment.orgDefinedId).toMatch(/^manual-/);
+    expect(addedEnrollment.h3Video).toBe(true);
+
+    // Toggling unrelated class settings (e.g., paused: true/false) preserves per-student H3 overrides.
+    expect(
+      (await api(`/admin/classes/${c.id}/enrollments`, { id: addedEnrollment.id, h3Video: false }, a, "PATCH")).status
+    ).toBe(200);
+    expect((await api(`/admin/classes/${c.id}`, { paused: true, h3Video: true }, a, "PATCH")).status).toBe(200);
+    expect(getDb().get("enrollments", addedEnrollment.id)?.h3Video).toBe(false);
+    expect((await api(`/admin/classes/${c.id}`, { paused: false, h3Video: false }, a, "PATCH")).status).toBe(200);
+    expect((await api(`/admin/classes/${c.id}`, { h3Video: true }, a, "PATCH")).status).toBe(200);
+    expect(getDb().get("enrollments", addedEnrollment.id)?.h3Video).toBeUndefined();
+
+    // Duplicate email is rejected with 409.
+    expect((await api(`/admin/classes/${c.id}/enrollments`, { email: "manual1@example.edu" }, a)).status).toBe(409);
+
+    // Student signs up using the class signup link; non-admin calling /workspace/session {} gets 400.
+    const url = await signup(a, c);
+    const maya = await student(c, url, "manual1@example.edu");
+    expect((await api("/workspace/session", {}, maya)).status).toBe(400);
+
+    // On Maya's very first ComfyUI entry, H3 is already unlocked and seeded!
+    const gMaya = await workspace(maya, c.id);
+    expect((await gw("/templates/class_video_minimax_h3.json", undefined, gMaya)).status).toBe(200);
+    expect((await gw("/templates/class_video_qwen_minimax_h3.json", undefined, gMaya)).status).toBe(200);
+    const mayaFiles = (await (
+      await gw("/api/userdata?dir=workflows&recurse=true", undefined, gMaya)
+    ).json()) as string[];
+    expect(mayaFiles).toContain("2 - Video with audio (MiniMax H3).json");
+
+    // Maya submits a job so archived output files exist on disk.
+    const mayaSub = await gw("/prompt", prompt, gMaya);
+    expect(mayaSub.status).toBe(200);
+    const mayaJobId = (await mayaSub.json()).prompt_id as string;
+    await waitFor(
+      () => getDb().get("jobs", mayaJobId)?.archiveStatus,
+      (v) => v === "COMPLETE"
+    );
+    const mayaOutput = getDb().list("outputs", "job_id=?", [mayaJobId])[0]!;
+    expect(existsSync(mayaOutput.storagePath)).toBe(true);
+
+    // Adding an already-registered student to a second class (created with h3Video: true) attaches immediately!
+    const c2Res = await api(
+      "/admin/classes",
+      {
+        name: "Advanced Studio",
+        courseCode: "ARTS 4900",
+        term: "Spring 2027",
+        slug: "arts4900-spring-2027",
+        description: "",
+        h3Video: true,
+      },
+      a
+    );
+    expect(c2Res.status).toBe(201);
+    const c2 = (await c2Res.json()).class;
+    expect(c2.h3Video).toBe(true);
+    const addExistingRes = await api(
+      `/admin/classes/${c2.id}/enrollments`,
+      { email: "manual1@example.edu", orgDefinedId: "#90012345" },
+      a
+    );
+    expect(addExistingRes.status).toBe(201);
+    const attached = (await addExistingRes.json()).enrollment;
+    expect(attached.status).toBe("ACTIVE");
+    expect(attached.orgDefinedId).toBe("90012345");
+    expect(attached.h3Video).toBe(true);
+
+    // 3. Deleting an enrollment while a job is active (or mid-handoff COMPLETED + archiveStatus PENDING) returns 409 ACTIVE_JOBS.
+    await scheduler.stop();
+    const queuedSub = await gw("/prompt", prompt, gMaya);
+    expect(queuedSub.status).toBe(200);
+    const queuedJobId = (await queuedSub.json()).prompt_id as string;
+    const blockedDel = await api(`/admin/classes/${c.id}/enrollments/${addedEnrollment.id}`, undefined, a, "DELETE");
+    expect(blockedDel.status).toBe(409);
+    expect((await blockedDel.json()).code).toBe("ACTIVE_JOBS");
+
+    const handoffJob = getDb().get("jobs", queuedJobId)!;
+    handoffJob.status = "COMPLETED";
+    handoffJob.archiveStatus = "PENDING";
+    getDb().put("jobs", handoffJob);
+    expect((await api(`/admin/classes/${c.id}/enrollments/${addedEnrollment.id}`, undefined, a, "DELETE")).status).toBe(
+      409
+    );
+
+    // Mark job cancelled, then delete Maya from class 1.
+    handoffJob.status = "CANCELLED";
+    getDb().put("jobs", handoffJob);
+    const delRes = await api(`/admin/classes/${c.id}/enrollments/${addedEnrollment.id}`, undefined, a, "DELETE");
+    expect(delRes.status).toBe(200);
+    const delJson = await delRes.json();
+    expect(delJson.ok).toBe(true);
+    expect(existsSync(mayaOutput.storagePath)).toBe(false);
+    expect(getDb().get("enrollments", addedEnrollment.id)).toBeUndefined();
+    expect((await gw("/prompt", prompt, gMaya)).status).toBe(401);
+
+    // Maya's global account and her enrollment in class 2 remain intact!
+    expect(getDb().userByEmail("manual1@example.edu")?.status).toBe("ACTIVE");
+    const gMayaC2 = await workspace(maya, c2.id);
+    expect((await gw("/templates/class_video_minimax_h3.json", undefined, gMayaC2)).status).toBe(200);
   });
 });

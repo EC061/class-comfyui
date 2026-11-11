@@ -152,10 +152,34 @@ export async function archive(job: Job, worker: Worker, entry: Record<string, an
     );
   }
 }
+export type InputImageFile = { filename: string; storagePath: string; mimeType: string };
+export function ownInputImages(db = getDb(), userId: string, classId: string): Map<string, InputImageFile> {
+  const files = new Map<string, InputImageFile>();
+  for (const u of db.list("uploads", "user_id=? AND class_id=?", [userId, classId])) {
+    files.set(u.filename, { filename: u.filename, storagePath: u.storagePath, mimeType: u.mimeType });
+  }
+  const completedIds = (
+    db.sql
+      .prepare(
+        "SELECT id FROM jobs WHERE user_id=? AND class_id=? AND status='COMPLETED' AND json_extract(data,'$.archiveStatus')='COMPLETE' ORDER BY submitted_at DESC LIMIT 50"
+      )
+      .all(userId, classId) as Array<{ id: string }>
+  ).map((r) => r.id);
+  if (completedIds.length > 0) {
+    const placeholders = completedIds.map(() => "?").join(",");
+    for (const o of db.list("outputs", `job_id IN (${placeholders})`, completedIds)) {
+      if (!o.mimeType.startsWith("image/") || files.has(o.fileName)) continue;
+      if (fs.existsSync(o.storagePath)) {
+        files.set(o.fileName, { filename: o.fileName, storagePath: o.storagePath, mimeType: o.mimeType });
+      }
+    }
+  }
+  return files;
+}
 export async function stageUploads(job: Job, worker: Worker) {
   // Inputs use unique platform filenames. They are replicated to whichever GPU
   // wins scheduling; browser-controlled subfolders and worker paths are forbidden.
-  const own = getDb().list("uploads", "user_id=? AND class_id=?", [job.userId, job.classId]);
+  const own = Array.from(ownInputImages(getDb(), job.userId, job.classId).values());
   const prompt = JSON.stringify(job.promptJson);
   for (const file of own.filter((u) => prompt.includes(u.filename))) {
     const form = new FormData();

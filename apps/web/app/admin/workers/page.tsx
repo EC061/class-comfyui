@@ -79,9 +79,13 @@ export default function Workers() {
                     {w.gpuName}
                     <p>{w.tags.join(", ")}</p>
                   </td>
-                  <td>{w.vramMb} MB</td>
                   <td>
-                    {w.healthStatus}
+                    {typeof w.vramUsedMb === "number" ? `${w.vramUsedMb} / ${w.vramMb} MB` : `${w.vramMb} MB`}
+                    {typeof w.vramFreeMb === "number" && <p className="text-xs">{w.vramFreeMb} MB free</p>}
+                  </td>
+                  <td>
+                    {w.externalBusy ? "EXTERNAL BUSY (Protected)" : w.healthStatus}
+                    {w.externalBusyReason && <p className="text-xs text-amber-700">{w.externalBusyReason}</p>}
                     <p className="text-xs">{w.lastHealthCheck}</p>
                   </td>
                   <td>{w.maxConcurrentJobs}</td>

@@ -2,7 +2,7 @@ import express from "express";
 import multer from "multer";
 import { createServer, type IncomingMessage } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -10,10 +10,19 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { z } from "zod";
 import { getEnv, validateStartup, isAllowedBrowserOrigin } from "@class-comfyui/config";
-import { getDb, activeMembership, audit, type Job, type Session, type Worker } from "@class-comfyui/database";
+import {
+  getDb,
+  activeMembership,
+  audit,
+  fairQueuedJobs,
+  activeJobCountsBySession,
+  type Job,
+  type Session,
+  type Worker,
+} from "@class-comfyui/database";
 import { verifyWorkspaceToken, hashSessionToken, newSessionToken } from "@class-comfyui/auth";
 import { Scheduler } from "./scheduler";
-import { workerFetch } from "./storage";
+import { workerFetch, ownInputImages } from "./storage";
 import { installUserData, saveUserData } from "./userdata";
 import { seedStarters } from "./starters";
 import { installTemplates } from "./templates";
@@ -50,8 +59,87 @@ function sameOrigin(req: IncomingMessage) {
     referer: req.headers.referer,
   });
 }
+type LiveProgress = {
+  nodeId: string | null;
+  nodeTitle: string | null;
+  step: number | null;
+  maxSteps: number | null;
+  updatedAt: number;
+};
+const liveJobProgress = new Map<string, LiveProgress>();
+function resolveNodeTitle(job: Job, nodeId: string | null): string | null {
+  if (!nodeId) return null;
+  const node = (job.promptJson as Record<string, any> | undefined)?.[nodeId];
+  if (!node || typeof node !== "object") return `Node #${nodeId}`;
+  const metaTitle = typeof node._meta?.title === "string" ? node._meta.title.trim() : "";
+  return metaTitle || (typeof node.class_type === "string" ? node.class_type : `Node #${nodeId}`);
+}
+function recordLiveProgress(job: Job, event: Record<string, any>) {
+  const now = Date.now();
+  if (liveJobProgress.size > 256) {
+    for (const [k, v] of liveJobProgress) if (now - v.updatedAt > 3600_000) liveJobProgress.delete(k);
+  }
+  if (event.type === "execution_start") {
+    liveJobProgress.set(job.id, {
+      nodeId: null,
+      nodeTitle: "Starting on GPU",
+      step: null,
+      maxSteps: null,
+      updatedAt: now,
+    });
+    return;
+  }
+  if (event.type === "executing") {
+    if (event.data?.node === null || event.data?.node === undefined) {
+      liveJobProgress.delete(job.id);
+      return;
+    }
+    const nodeId = String(event.data.node);
+    liveJobProgress.set(job.id, {
+      nodeId,
+      nodeTitle: resolveNodeTitle(job, nodeId),
+      step: null,
+      maxSteps: null,
+      updatedAt: now,
+    });
+    return;
+  }
+  if (event.type === "progress") {
+    const prev = liveJobProgress.get(job.id);
+    const nodeId =
+      event.data?.node !== undefined && event.data?.node !== null ? String(event.data.node) : (prev?.nodeId ?? null);
+    liveJobProgress.set(job.id, {
+      nodeId,
+      nodeTitle: nodeId ? resolveNodeTitle(job, nodeId) : (prev?.nodeTitle ?? "Sampling"),
+      step: typeof event.data?.value === "number" ? Math.round(event.data.value) : (prev?.step ?? null),
+      maxSteps: typeof event.data?.max === "number" ? Math.round(event.data.max) : (prev?.maxSteps ?? null),
+      updatedAt: now,
+    });
+    return;
+  }
+  if (event.type === "progress_state" && event.data?.nodes && typeof event.data.nodes === "object") {
+    const runningEntry = Object.entries(event.data.nodes as Record<string, any>).find(
+      ([, v]) => v && typeof v === "object" && v.state === "running"
+    );
+    if (runningEntry) {
+      const [nid, v] = runningEntry;
+      liveJobProgress.set(job.id, {
+        nodeId: nid,
+        nodeTitle: resolveNodeTitle(job, nid),
+        step: typeof v.value === "number" ? Math.round(v.value) : null,
+        maxSteps: typeof v.max === "number" ? Math.round(v.max) : null,
+        updatedAt: now,
+      });
+    }
+    return;
+  }
+  if (["execution_success", "execution_error", "execution_interrupted"].includes(event.type)) {
+    liveJobProgress.delete(job.id);
+  }
+}
 const clients = new Map<WebSocket, Session>();
 function notify(job: Job, event: Record<string, any>) {
+  recordLiveProgress(job, event);
   for (const [client, s] of clients) {
     if (s.userId !== job.userId || s.classId !== job.classId) continue;
     if (client.readyState === WebSocket.OPEN && activeMembership(getDb(), s.userId, s.classId!, s.enrollmentId))
@@ -115,12 +203,11 @@ const coreNodes = [
   // graphs). A dimension holder like EmptyLatentImage: no files, no network.
   "EmptyHunyuanLatentVideo",
   "SaveAnimatedWEBP",
-  // MiniMax-H3 video+audio, running on the lab's own weights. Two exclusions are
-  // deliberate. The ComfyCloud*/Minimax*Node variants carry near-identical names
-  // but POST student prompts and images to a paid third-party API. The Ref2VA and
-  // Fun-ControlNet nodes work only against checkpoints this lab has not
-  // downloaded, and a node that can only fail is worse than an absent one.
+  // MiniMax-H3 video+audio, running on the lab's own weights. The ComfyCloud*
+  // and Minimax*Node variants carry near-identical names but POST student
+  // prompts and images to a paid third-party API, so they remain excluded.
   "MiniMaxH3ImageToVideo",
+  "MiniMaxH3ReferenceToVideo",
   "MiniMaxH3AddGuide",
   "MiniMaxH3SigmaShift",
   "EmptyMiniMaxH3LatentAV",
@@ -135,7 +222,7 @@ const coreNodes = [
   "CreateVideo",
   "SaveVideo",
   "SaveAudio",
-  // Utility nodes the stock H3 templates wire in.
+  // Utility nodes the stock H3 and Qwen Image 2.1 templates wire in.
   "ResolutionSelector",
   "GetImageSize",
   "ImageScaleToTotalPixels",
@@ -146,6 +233,18 @@ const coreNodes = [
   "PrimitiveBoolean",
   "PrimitiveString",
   "PrimitiveStringMultiline",
+  // Qwen Image 2.1 text/vision conditioning, KV-cache control, local Qwen 3.5
+  // prompt enhancer, and Turbo custom-sigma sampling/output nodes.
+  "TextEncodeQwenImage21",
+  "QwenImage21Cache",
+  "TextGenerate",
+  "TextGenerateV2",
+  "PreviewAny",
+  "ManualSigmas",
+  "CFGGuider",
+  "SaveImageAdvanced",
+  "BatchImagesNode",
+  "ImageCompare",
 ];
 function approvedNodes() {
   return new Set(
@@ -155,44 +254,397 @@ function approvedNodes() {
       .filter(Boolean)
   );
 }
+const objectInfoCache = new Map<string, { filtered: Record<string, any>; fetchedAt: number; persistedAt: number }>();
+function filterApprovedNodeInfo(rawInfo: Record<string, any>): Record<string, any> {
+  const allowed = approvedNodes();
+  const out: Record<string, any> = {};
+  for (const [name, def] of Object.entries(rawInfo)) {
+    if (!allowed.has(name)) continue;
+    out[name] = def;
+  }
+  if (out.LoadImage?.input?.required?.image) {
+    out.LoadImage = {
+      ...out.LoadImage,
+      input: {
+        ...out.LoadImage.input,
+        required: {
+          ...out.LoadImage.input.required,
+          image: [[], { image_upload: true }],
+        },
+      },
+    };
+  }
+  return out;
+}
 function metadataWorker(): Worker | undefined {
+  const isReachable = (w: Worker) => w.healthStatus === "ONLINE" || w.healthStatus === "BUSY";
   return getDb()
     .list("workers")
-    .filter((w) => w.enabled && (["ONLINE", "BUSY"].includes(w.healthStatus) || w.nodeDefinitions))
+    .filter((w) => w.enabled && (isReachable(w) || w.nodeDefinitions))
     .sort(
-      (a, b) => Number(b.healthStatus === "ONLINE") - Number(a.healthStatus === "ONLINE") || a.id.localeCompare(b.id)
+      (a, b) =>
+        Number(isReachable(b)) - Number(isReachable(a)) ||
+        Number(!b.externalBusy) - Number(!a.externalBusy) ||
+        Number(b.healthStatus === "ONLINE") - Number(a.healthStatus === "ONLINE") ||
+        a.id.localeCompare(b.id)
     )[0];
 }
 async function objectInfo(worker: Worker, s: Session) {
-  let info: Record<string, any>;
-  try {
-    const r = await workerFetch(worker, "/object_info", {}, 3000);
-    if (!r.ok) throw new Error("Worker metadata unavailable");
-    info = (await r.json()) as Record<string, any>;
-    getDb().transaction(() => {
-      const current = getDb().get("workers", worker.id);
-      if (current) {
-        current.nodeDefinitions = info;
-        getDb().put("workers", current);
-      }
+  const cacheKey = `${worker.id}:${worker.baseUrl}`;
+  const now = Date.now();
+  const cached = objectInfoCache.get(cacheKey);
+  let filtered: Record<string, any> | undefined;
+  if (cached && now - cached.fetchedAt < 30_000 && worker.nodeDefinitions) {
+    filtered = cached.filtered;
+  } else if (worker.externalBusy && worker.nodeDefinitions) {
+    filtered = cached?.filtered ?? filterApprovedNodeInfo(worker.nodeDefinitions);
+    objectInfoCache.set(cacheKey, {
+      filtered,
+      fetchedAt: now,
+      persistedAt: cached?.persistedAt || now,
     });
-  } catch {
-    if (!worker.nodeDefinitions) throw new Error("Worker metadata unavailable");
-    info = structuredClone(worker.nodeDefinitions);
+  } else {
+    try {
+      const r = await workerFetch(worker, "/object_info", {}, 3000);
+      if (!r.ok) throw new Error("Worker metadata unavailable");
+      const rawInfo = (await r.json()) as Record<string, any>;
+      filtered = filterApprovedNodeInfo(rawInfo);
+      const shouldPersist = !worker.nodeDefinitions || !cached || now - cached.persistedAt > 300_000;
+      let persistedAt = cached?.persistedAt || 0;
+      if (shouldPersist) {
+        getDb().transaction(() => {
+          const current = getDb().get("workers", worker.id);
+          if (current) {
+            current.nodeDefinitions = filtered;
+            getDb().put("workers", current);
+          }
+        });
+        persistedAt = now;
+      }
+      objectInfoCache.set(cacheKey, { filtered, fetchedAt: now, persistedAt });
+    } catch {
+      if (!worker.nodeDefinitions) throw new Error("Worker metadata unavailable");
+      filtered = cached?.filtered ?? filterApprovedNodeInfo(worker.nodeDefinitions);
+    }
   }
-  const allowed = approvedNodes();
-  for (const name of Object.keys(info)) if (!allowed.has(name)) delete info[name];
-  const inputs = getDb()
-    .list("uploads", "user_id=? AND class_id=?", [s.userId, s.classId!])
-    .map((u) => u.filename);
-  if (info.LoadImage?.input?.required?.image) info.LoadImage.input.required.image = [inputs, { image_upload: true }];
-  return info;
+  const inputs = Array.from(ownInputImages(getDb(), s.userId, s.classId!).keys());
+  if (!filtered.LoadImage?.input?.required?.image) return filtered;
+  return {
+    ...filtered,
+    LoadImage: {
+      ...filtered.LoadImage,
+      input: {
+        ...filtered.LoadImage.input,
+        required: {
+          ...filtered.LoadImage.input.required,
+          image: [inputs, { image_upload: true }],
+        },
+      },
+    },
+  };
 }
-function ownJobs(s: Session) {
-  return getDb().list("jobs", "user_id=? AND class_id=?", [s.userId, s.classId!]);
+type PromptNode = { class_type: string; inputs: Record<string, unknown>; _meta?: unknown };
+type PromptGraph = Record<string, PromptNode>;
+function isLinkValue(v: unknown): v is [string, number] {
+  return Array.isArray(v) && v.length === 2 && typeof v[0] === "string" && typeof v[1] === "number";
+}
+function unwrapPreviewLinks(prompt: PromptGraph) {
+  const resolveImageSource = (nodeId: string, slot: number): [string, number] => {
+    let curId = nodeId;
+    let curSlot = slot;
+    const seen = new Set<string>();
+    while (
+      curSlot === 0 &&
+      !seen.has(curId) &&
+      prompt[curId] &&
+      ["PreviewImage", "SaveImage", "SaveImageAdvanced"].includes(prompt[curId].class_type)
+    ) {
+      seen.add(curId);
+      const upstream = prompt[curId].inputs?.images;
+      if (!isLinkValue(upstream) || !prompt[upstream[0]]) break;
+      curId = upstream[0];
+      curSlot = upstream[1];
+    }
+    return [curId, curSlot];
+  };
+  for (const node of Object.values(prompt)) {
+    for (const [k, v] of Object.entries(node.inputs || {})) {
+      if (isLinkValue(v) && v[1] === 0 && prompt[v[0]]) {
+        const [nextId, nextSlot] = resolveImageSource(v[0], v[1]);
+        if (nextId !== v[0] || nextSlot !== v[1]) {
+          node.inputs[k] = [nextId, nextSlot];
+        }
+      }
+    }
+  }
+}
+function coneSignature(prompt: PromptGraph, rootId: string, memo = new Map<string, string>()): string {
+  const visit = (nodeId: string, path: Set<string>): { digest: string; hadCycle: boolean } => {
+    if (memo.has(nodeId)) return { digest: memo.get(nodeId)!, hadCycle: false };
+    const node = prompt[nodeId];
+    if (!node || path.has(nodeId)) {
+      return {
+        digest: createHash("sha256")
+          .update(JSON.stringify({ $ref: nodeId }))
+          .digest("hex"),
+        hadCycle: true,
+      };
+    }
+    path.add(nodeId);
+    let hadCycle = false;
+    const rawSwitch = node.class_type === "ComfySwitchNode" ? node.inputs?.switch : undefined;
+    const switchVal =
+      isLinkValue(rawSwitch) && prompt[rawSwitch[0]]?.class_type === "PrimitiveBoolean"
+        ? prompt[rawSwitch[0]]?.inputs?.value
+        : rawSwitch;
+    const entries: [string, unknown][] = [];
+    for (const key of Object.keys(node.inputs || {}).sort()) {
+      if (key === "filename_prefix") continue;
+      if (node.class_type === "ComfySwitchNode") {
+        if (switchVal === false && key === "on_true") continue;
+        if (switchVal === true && key === "on_false") continue;
+      }
+      const val = node.inputs[key];
+      if (isLinkValue(val)) {
+        const sub = visit(val[0], path);
+        if (sub.hadCycle) hadCycle = true;
+        entries.push([key, { $link: sub.digest, slot: val[1] }]);
+      } else {
+        entries.push([key, val]);
+      }
+    }
+    path.delete(nodeId);
+    const digest = createHash("sha256")
+      .update(JSON.stringify({ class_type: node.class_type, inputs: entries }))
+      .digest("hex");
+    if (!hadCycle) memo.set(nodeId, digest);
+    return { digest, hadCycle };
+  };
+  return visit(rootId, new Set()).digest;
+}
+function dependsOnNode(prompt: PromptGraph, startId: string, targetId: string): boolean {
+  const seen = new Set<string>();
+  const stack = [startId];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (cur === targetId) return true;
+    if (seen.has(cur) || !prompt[cur]) continue;
+    seen.add(cur);
+    for (const v of Object.values(prompt[cur].inputs || {})) {
+      if (isLinkValue(v) && prompt[v[0]] && !seen.has(v[0])) stack.push(v[0]);
+    }
+  }
+  return false;
+}
+function resolveSwitchValue(prompt: PromptGraph, node: PromptNode): unknown {
+  if (node.class_type !== "ComfySwitchNode") return undefined;
+  const rawSwitch = node.inputs?.switch;
+  return isLinkValue(rawSwitch) && prompt[rawSwitch[0]]?.class_type === "PrimitiveBoolean"
+    ? prompt[rawSwitch[0]]?.inputs?.value
+    : rawSwitch;
+}
+function cleanDanglingSwitchLinks(prompt: PromptGraph) {
+  for (const node of Object.values(prompt)) {
+    if (node.class_type !== "ComfySwitchNode" || !node.inputs) continue;
+    const switchVal = resolveSwitchValue(prompt, node);
+    if (switchVal === false && isLinkValue(node.inputs.on_true) && !prompt[node.inputs.on_true[0]]) {
+      delete node.inputs.on_true;
+    }
+    if (switchVal === true && isLinkValue(node.inputs.on_false) && !prompt[node.inputs.on_false[0]]) {
+      delete node.inputs.on_false;
+    }
+  }
+}
+function pruneUnreachableNodes(prompt: PromptGraph, info: Record<string, any>, partialTargets?: string[]) {
+  cleanDanglingSwitchLinks(prompt);
+  let removed = true;
+  while (removed) {
+    removed = false;
+    for (const [id, node] of Object.entries(prompt)) {
+      const switchVal = resolveSwitchValue(prompt, node);
+      for (const [k, v] of Object.entries(node.inputs || {})) {
+        if (node.class_type === "ComfySwitchNode") {
+          if (switchVal === false && k === "on_true") continue;
+          if (switchVal === true && k === "on_false") continue;
+        }
+        if (isLinkValue(v) && !prompt[v[0]]) {
+          delete prompt[id];
+          removed = true;
+          break;
+        }
+      }
+    }
+  }
+  const explicitTargets = (partialTargets || []).filter((id) => Boolean(prompt[id]));
+  const primaryOutputs = Object.keys(prompt).filter(
+    (id) => info[prompt[id].class_type]?.output_node === true && prompt[id].class_type !== "PreviewAny"
+  );
+  const defaultRoots =
+    primaryOutputs.length > 0
+      ? primaryOutputs
+      : Object.keys(prompt).filter((id) => info[prompt[id].class_type]?.output_node === true);
+  const roots = Array.from(new Set([...defaultRoots, ...explicitTargets]));
+  if (roots.length === 0) {
+    cleanDanglingSwitchLinks(prompt);
+    return;
+  }
+  const reachable = new Set<string>();
+  const stack = [...roots];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (reachable.has(cur) || !prompt[cur]) continue;
+    reachable.add(cur);
+    const node = prompt[cur];
+    const switchVal = resolveSwitchValue(prompt, node);
+    for (const [k, v] of Object.entries(node.inputs || {})) {
+      if (node.class_type === "ComfySwitchNode") {
+        if (switchVal === false && k === "on_true") continue;
+        if (switchVal === true && k === "on_false") continue;
+      }
+      if (isLinkValue(v) && prompt[v[0]] && !reachable.has(v[0])) {
+        stack.push(v[0]);
+      }
+    }
+  }
+  for (const id of Object.keys(prompt)) {
+    if (!reachable.has(id)) delete prompt[id];
+  }
+  cleanDanglingSwitchLinks(prompt);
+}
+function optimizeMultiStagePrompt(
+  prompt: PromptGraph,
+  submittedPrompt: PromptGraph,
+  s: Session,
+  info: Record<string, any>,
+  availableImages: Set<string>,
+  partialTargets?: string[]
+) {
+  const fallback = structuredClone(prompt);
+  // Normalize any links wired from a PreviewImage/SaveImage output pin directly
+  // to that preview node's upstream image producer so stock ComfyUI workers
+  // (where PreviewImage has RETURN_TYPES = ()) execute them cleanly.
+  unwrapPreviewLinks(prompt);
+  unwrapPreviewLinks(submittedPrompt);
+  const explicitTargetSet = new Set(partialTargets || []);
+  // 1. If a MiniMaxH3ReferenceToVideo node has no reference inputs connected yet
+  // while the graph also has independent image preview/save nodes, skip the video
+  // branch so clicking Run only generates candidate images until references are wired.
+  const imageOutputIds = Object.keys(prompt).filter((id) =>
+    ["PreviewImage", "SaveImage", "SaveImageAdvanced"].includes(prompt[id].class_type)
+  );
+  if (imageOutputIds.length > 0) {
+    let prunedVideo = false;
+    for (const [id, node] of Object.entries(prompt)) {
+      if (node.class_type !== "MiniMaxH3ReferenceToVideo") continue;
+      const explicitlyTargeted = Array.from(explicitTargetSet).some(
+        (targetId) => prompt[targetId] && dependsOnNode(prompt, targetId, id)
+      );
+      if (explicitlyTargeted) continue;
+      const hasIndependentImageOutput = imageOutputIds.some((imgId) => !dependsOnNode(prompt, imgId, id));
+      if (!hasIndependentImageOutput) continue;
+      const hasRefs = Object.entries(node.inputs || {}).some(
+        ([k, v]) =>
+          (k.startsWith("ref_images.") || k.startsWith("ref_videos.") || k.startsWith("ref_audios.")) &&
+          isLinkValue(v) &&
+          Boolean(prompt[v[0]])
+      );
+      if (!hasRefs) {
+        delete prompt[id];
+        prunedVideo = true;
+      }
+    }
+    if (prunedVideo) pruneUnreachableNodes(prompt, info, partialTargets);
+  }
+  // 2. Cross-job image branch caching: if the student already generated an identical
+  // upstream image branch in a completed job in this class, reuse its archived PNG via
+  // LoadImage so regenerating one bad image or running MiniMax H3 never re-runs
+  // unchanged Qwen Image generators.
+  const producerIds = new Set<string>();
+  for (const node of Object.values(prompt)) {
+    if (["PreviewImage", "SaveImage", "SaveImageAdvanced"].includes(node.class_type)) {
+      const src = node.inputs?.images;
+      if (isLinkValue(src) && src[1] === 0 && prompt[src[0]] && prompt[src[0]].class_type !== "LoadImage") {
+        producerIds.add(src[0]);
+      }
+    } else if (node.class_type === "MiniMaxH3ReferenceToVideo") {
+      for (const [k, v] of Object.entries(node.inputs || {})) {
+        if (k.startsWith("ref_images.") && isLinkValue(v) && v[1] === 0 && prompt[v[0]]) {
+          if (prompt[v[0]].class_type !== "LoadImage") {
+            producerIds.add(v[0]);
+          }
+        }
+      }
+    }
+  }
+  const hasActiveVideoBranch = Object.values(prompt).some((n) =>
+    ["MiniMaxH3ReferenceToVideo", "MiniMaxH3ImageToVideo", "SaveVideo"].includes(n.class_type)
+  );
+  if (producerIds.size > 0 && (producerIds.size > 1 || hasActiveVideoBranch)) {
+    const cachedBySig = new Map<string, string>();
+    const completedJobs = getDb()
+      .list("jobs", "user_id=? AND class_id=? AND status='COMPLETED' ORDER BY submitted_at DESC LIMIT 20", [
+        s.userId,
+        s.classId!,
+      ])
+      .reverse()
+      .filter((j) => j.archiveStatus === "COMPLETE" && j.history?.outputs);
+    for (const j of completedJobs) {
+      const origRaw = (j.submittedPromptJson || j.promptJson) as PromptGraph | undefined;
+      if (!origRaw) continue;
+      const orig = structuredClone(origRaw);
+      unwrapPreviewLinks(orig);
+      const origMemo = new Map<string, string>();
+      for (const [outId, outVal] of Object.entries((j.history?.outputs || {}) as Record<string, any>)) {
+        const imgs = outVal?.images;
+        if (!Array.isArray(imgs) || imgs.length !== 1) continue;
+        const fname = imgs[0]?.filename;
+        if (typeof fname !== "string" || !availableImages.has(fname)) continue;
+        const outNode = orig[outId];
+        if (!outNode || !["PreviewImage", "SaveImage", "SaveImageAdvanced"].includes(outNode.class_type)) continue;
+        const src = outNode.inputs?.images;
+        if (isLinkValue(src) && src[1] === 0 && orig[src[0]] && orig[src[0]].class_type !== "LoadImage") {
+          cachedBySig.set(coneSignature(orig, src[0], origMemo), fname);
+        }
+      }
+    }
+    if (cachedBySig.size > 0) {
+      const submittedMemo = new Map<string, string>();
+      let substituted = false;
+      for (const pid of producerIds) {
+        const hasNonZeroSlotConsumer = Object.values(prompt).some((n) =>
+          Object.values(n.inputs || {}).some((v) => isLinkValue(v) && v[0] === pid && v[1] !== 0)
+        );
+        if (hasNonZeroSlotConsumer) continue;
+        const sig = coneSignature(submittedPrompt, pid, submittedMemo);
+        const cachedFile = cachedBySig.get(sig);
+        if (cachedFile) {
+          prompt[pid] = { class_type: "LoadImage", inputs: { image: cachedFile } };
+          substituted = true;
+        }
+      }
+      if (substituted) pruneUnreachableNodes(prompt, info, partialTargets);
+    }
+  }
+  cleanDanglingSwitchLinks(prompt);
+  if (Object.keys(prompt).length === 0) {
+    Object.assign(prompt, fallback);
+    cleanDanglingSwitchLinks(prompt);
+  }
+}
+function ownActiveCount(s: Session, db = getDb()): number {
+  const row = db.sql
+    .prepare(
+      "SELECT COUNT(*) AS cnt FROM jobs WHERE user_id=? AND class_id=? AND status IN ('QUEUED','DISPATCHING','RUNNING')"
+    )
+    .get(s.userId, s.classId!) as { cnt: number };
+  return Number(row?.cnt || 0);
 }
 function queue(s: Session) {
-  const jobs = ownJobs(s),
+  const jobs = getDb().list(
+      "jobs",
+      "user_id=? AND class_id=? AND status IN ('QUEUED','DISPATCHING','RUNNING') ORDER BY submitted_at ASC",
+      [s.userId, s.classId!]
+    ),
     shape = (j: Job) => [Date.parse(j.submittedAt), j.id, j.promptJson, {}, []];
   return {
     queue_running: jobs.filter((j) => ["DISPATCHING", "RUNNING"].includes(j.status)).map(shape),
@@ -220,6 +672,88 @@ async function proxyWorkerFile(req: express.Request, res: express.Response) {
   }
   await pipeline(Readable.fromWeb(response.body as any), res);
 }
+async function proxyWorkerHtmlWithStatusWidget(req: express.Request, res: express.Response) {
+  const worker = metadataWorker();
+  if (!worker) {
+    res.status(503).send("No healthy worker available");
+    return;
+  }
+  const response = await workerFetch(worker, req.path);
+  res.status(response.status);
+  const ct = response.headers.get("content-type") || "text/html; charset=utf-8";
+  res.setHeader("Content-Type", ct);
+  const html = await response.text();
+  if (!ct.includes("text/html")) {
+    res.send(html);
+    return;
+  }
+  const tag = '<script src="/lab/status-widget.js" defer></script>';
+  res.send(html.includes("</body>") ? html.replace("</body>", `${tag}</body>`) : `${html}\n${tag}`);
+}
+const STATUS_WIDGET_JS = `(function(){
+  if (window.__classComfyStatusMounted) return;
+  window.__classComfyStatusMounted = true;
+  var root = document.createElement("div");
+  root.id = "class-comfy-status-pill";
+  root.style.cssText = "position:fixed;bottom:14px;left:14px;z-index:99999;display:flex;align-items:center;gap:8px;padding:7px 12px;border-radius:999px;background:rgba(15,23,42,0.92);border:1px solid rgba(148,163,184,0.28);color:#f8fafc;font:500 12px/1.35 system-ui,-apple-system,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,0.38);backdrop-filter:blur(8px);max-width:min(520px,calc(100vw - 28px));pointer-events:auto;user-select:none;";
+  var dot = document.createElement("span");
+  dot.style.cssText = "width:8px;height:8px;border-radius:50%;flex:0 0 8px;background:#10b981;box-shadow:0 0 8px rgba(16,185,129,0.7);";
+  var label = document.createElement("span");
+  label.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+  label.textContent = "Class GPU queue ready";
+  root.appendChild(dot);
+  root.appendChild(label);
+  function mount(){ if (document.body && !document.getElementById(root.id)) document.body.appendChild(root); }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", mount); else mount();
+  function fmtSec(iso){
+    var ms = Date.now() - Date.parse(iso || "");
+    if (!isFinite(ms) || ms < 0) return "0s";
+    var s = Math.floor(ms / 1000);
+    return s < 60 ? s + "s" : Math.floor(s / 60) + "m " + (s % 60) + "s";
+  }
+  async function poll(){
+    if (document.hidden) return;
+    mount();
+    try {
+      var r = await fetch("/lab/status", { credentials: "same-origin", cache: "no-store" });
+      if (!r.ok) return;
+      var d = await r.json();
+      var own = Array.isArray(d.activeJobs) ? d.activeJobs : [];
+      var running = own.find(function(j){ return j.status === "RUNNING" || j.status === "DISPATCHING"; });
+      var queued = own.find(function(j){ return j.status === "QUEUED"; });
+      if (running) {
+        dot.style.background = "#38bdf8";
+        dot.style.boxShadow = "0 0 10px rgba(56,189,248,0.85)";
+        var stg = running.progress && running.progress.nodeTitle ? running.progress.nodeTitle : (running.status === "DISPATCHING" ? "Staging inputs on GPU" : "Executing on GPU");
+        var stepTxt = running.progress && typeof running.progress.step === "number" && typeof running.progress.maxSteps === "number" && running.progress.maxSteps > 0
+          ? " (" + running.progress.step + "/" + running.progress.maxSteps + ")"
+          : "";
+        label.textContent = "Generating: " + stg + stepTxt + " • " + fmtSec(running.startedAt || running.submittedAt) + (own.length > 1 ? " (+" + (own.length - 1) + " queued)" : "");
+        return;
+      }
+      if (queued) {
+        dot.style.background = "#f59e0b";
+        dot.style.boxShadow = "0 0 10px rgba(245,158,11,0.85)";
+        var pos = queued.queuePosition ? "#" + queued.queuePosition + " of " + d.totalQueued : "in queue";
+        var gpuNote = d.availableWorkers > 0 ? d.availableWorkers + " class GPU" + (d.availableWorkers === 1 ? "" : "s") + " active" : "waiting for an available class GPU";
+        label.textContent = "Queued (" + pos + ") • " + gpuNote + " • waited " + fmtSec(queued.submittedAt);
+        return;
+      }
+      if (d.recentFinished && d.recentFinished.status === "FAILED") {
+        dot.style.background = "#f87171";
+        dot.style.boxShadow = "0 0 8px rgba(248,113,113,0.8)";
+        label.textContent = "Last run failed: " + (d.recentFinished.error || "check node inputs");
+        return;
+      }
+      dot.style.background = d.availableWorkers > 0 ? "#10b981" : "#94a3b8";
+      dot.style.boxShadow = d.availableWorkers > 0 ? "0 0 8px rgba(16,185,129,0.7)" : "none";
+      label.textContent = "Class GPUs: " + d.availableWorkers + " ready • Queue: " + d.totalQueued + " waiting" + (d.totalRunning > 0 ? " (" + d.totalRunning + " running)" : "");
+    } catch (_e) {}
+  }
+  poll();
+  setInterval(poll, 2500);
+  document.addEventListener("visibilitychange", function(){ if (!document.hidden) poll(); });
+})();`;
 // Static frontend files the browser fetches without credentials, which the
 // session gate below would answer with 401 or a JSON error body. The PWA
 // manifest is fetched by <link rel="manifest">, which omits cookies; the
@@ -288,6 +822,7 @@ export function createApp() {
         enrollmentId: claims.enrollmentId,
         expiresAt: Date.now() + env.SESSION_TTL_HOURS * 3600000,
       });
+      audit("WORKSPACE_EXCHANGED", { actorId: claims.sub, classId: claims.classId, targetId: claims.enrollmentId }, db);
       return raw;
     });
     if (!raw) {
@@ -327,6 +862,59 @@ export function createApp() {
         !req.url?.startsWith("/userdata/") && !String(req.headers["content-type"] || "").startsWith("multipart/"),
     })
   );
+  app.get("/lab/status-widget.js", (_req, res) => {
+    res.type("application/javascript").send(STATUS_WIDGET_JS);
+  });
+  app.get("/lab/status", (_req, res) => {
+    const s = res.locals.session as Session,
+      db = getDb();
+    const availableWorkers = db
+      .list("workers")
+      .filter((w) => w.enabled && ["ONLINE", "BUSY"].includes(w.healthStatus) && !w.externalBusy).length;
+    const fairQueue = fairQueuedJobs(db, getEnv().MAX_ACTIVE_JOBS_PER_USER);
+    const totalRunning = Number(
+      (
+        db.sql.prepare("SELECT COUNT(*) AS cnt FROM jobs WHERE status IN ('DISPATCHING','RUNNING')").get() as {
+          cnt: number;
+        }
+      )?.cnt || 0
+    );
+    const ownActive = db
+      .list(
+        "jobs",
+        "user_id=? AND class_id=? AND status IN ('QUEUED','DISPATCHING','RUNNING') ORDER BY submitted_at ASC",
+        [s.userId, s.classId!]
+      )
+      .map((j) => {
+        const pos = j.status === "QUEUED" ? fairQueue.findIndex((q) => q.id === j.id) + 1 : 0;
+        const prog = liveJobProgress.get(j.id);
+        return {
+          id: j.id,
+          status: j.status,
+          submittedAt: j.submittedAt,
+          startedAt: j.startedAt,
+          queuePosition: pos > 0 ? pos : null,
+          progress: prog ? { nodeTitle: prog.nodeTitle, step: prog.step, maxSteps: prog.maxSteps } : null,
+        };
+      });
+    const recentCutoff = new Date(Date.now() - 45_000).toISOString();
+    const recentRow = db
+      .list(
+        "jobs",
+        "user_id=? AND class_id=? AND status IN ('FAILED','COMPLETED') ORDER BY submitted_at DESC LIMIT 5",
+        [s.userId, s.classId!]
+      )
+      .find((j) => j.completedAt && j.completedAt >= recentCutoff);
+    res.json({
+      availableWorkers,
+      totalQueued: fairQueue.length,
+      totalRunning,
+      activeJobs: ownActive,
+      recentFinished: recentRow
+        ? { id: recentRow.id, status: recentRow.status, error: recentRow.error, completedAt: recentRow.completedAt }
+        : null,
+    });
+  });
   app.post("/prompt", async (req, res, next) => {
     try {
       const s = res.locals.session as Session,
@@ -350,6 +938,7 @@ export function createApp() {
             .refine((v) => Object.keys(v).length > 0 && Object.keys(v).length <= 1000),
           extra_data: z.record(z.string(), z.unknown()).default({}),
           required_tags: z.array(z.string().max(50)).max(20).default([]),
+          partial_execution_targets: z.array(z.string().max(100)).max(1000).optional(),
         })
         .parse(req.body);
       const worker = metadataWorker();
@@ -360,12 +949,20 @@ export function createApp() {
       const info = await objectInfo(worker, s),
         allowed = approvedNodes(),
         jobId = randomUUID(),
-        uploads = new Set(
-          db.list("uploads", "user_id=? AND class_id=?", [s.userId, s.classId!]).map((u) => u.filename)
-        );
+        uploads = new Set(ownInputImages(db, s.userId, s.classId!).keys());
+      for (const node of Object.values(input.prompt)) {
+        if (node.class_type === "LoadImage" && typeof node.inputs.image === "string") {
+          node.inputs.image = node.inputs.image.replace(/\s+\[(output|temp|input)\]$/, "");
+        }
+      }
       const submittedPromptJson = structuredClone(input.prompt);
       for (const node of Object.values(input.prompt)) {
         if (!allowed.has(node.class_type) || !info[node.class_type]) {
+          audit("PROMPT_REJECTED", {
+            actorId: s.userId,
+            classId: s.classId!,
+            metadata: { reason: "disallowed_node", nodeType: node.class_type },
+          });
           res.status(400).json({ error: `Node ${node.class_type} is not approved or available` });
           return;
         }
@@ -373,26 +970,56 @@ export function createApp() {
           node.class_type === "LoadImage" &&
           (typeof node.inputs.image !== "string" || !uploads.has(node.inputs.image))
         ) {
+          audit("PROMPT_REJECTED", {
+            actorId: s.userId,
+            classId: s.classId!,
+            metadata: { reason: "foreign_or_missing_upload", nodeType: "LoadImage" },
+          });
           res.status(403).json({ error: "Use an image uploaded in this workspace" });
           return;
         }
         if ("filename_prefix" in node.inputs || node.class_type.startsWith("Save"))
           node.inputs.filename_prefix = `lab/${jobId}/output`;
-        // Model selectors must use worker-advertised choices, not arbitrary paths.
+        // Model and dropdown selectors (required, optional, and V3 COMBO) must use worker-advertised choices.
         const required = info[node.class_type]?.input?.required || {};
+        const optional = info[node.class_type]?.input?.optional || {};
         for (const [key, value] of Object.entries(node.inputs)) {
-          const options = required[key]?.[0];
-          if (Array.isArray(options) && typeof value === "string" && !options.includes(value)) {
+          const spec = required[key] ?? optional[key];
+          const options = Array.isArray(spec?.[0])
+            ? spec[0]
+            : spec?.[0] === "COMBO" && Array.isArray(spec?.[1]?.options)
+              ? spec[1].options
+              : undefined;
+          if (
+            Array.isArray(options) &&
+            !isLinkValue(value) &&
+            value !== undefined &&
+            value !== null &&
+            !options.includes(value)
+          ) {
+            audit("PROMPT_REJECTED", {
+              actorId: s.userId,
+              classId: s.classId!,
+              metadata: { reason: "invalid_option", nodeType: node.class_type, input: key },
+            });
             res.status(400).json({ error: `Invalid selection for ${node.class_type}.${key}` });
             return;
           }
         }
       }
-      const job = db.transaction(() => {
+      optimizeMultiStagePrompt(input.prompt, submittedPromptJson, s, info, uploads, input.partial_execution_targets);
+      const effectivePartialTargets = input.partial_execution_targets?.filter((id) => Boolean(input.prompt[id]));
+      const outcome = db.transaction(() => {
         const member = activeMembership(db, s.userId, s.classId!, s.enrollmentId);
-        if (!member) return null;
-        if (db.list("jobs", "user_id=? AND status='QUEUED'", [s.userId]).length >= env.MAX_QUEUED_JOBS_PER_USER)
-          return null;
+        if (!member) return { kind: "revoked" as const };
+        const queuedCnt = Number(
+          (
+            db.sql.prepare("SELECT COUNT(*) AS cnt FROM jobs WHERE user_id=? AND status='QUEUED'").get(s.userId) as {
+              cnt: number;
+            }
+          )?.cnt || 0
+        );
+        if (queuedCnt >= env.MAX_QUEUED_JOBS_PER_USER) return { kind: "queue_full" as const };
         const j: Job = {
           id: jobId,
           userId: s.userId,
@@ -410,7 +1037,7 @@ export function createApp() {
           promptJson: input.prompt,
           submittedPromptJson,
           workflowJson: (input.extra_data.extra_pnginfo as any)?.workflow ?? null,
-          extraData: {},
+          extraData: effectivePartialTargets?.length ? { partialExecutionTargets: effectivePartialTargets } : {},
           requiredTags: input.required_tags,
           error: null,
           archiveError: null,
@@ -419,59 +1046,93 @@ export function createApp() {
           leaseOwner: null,
         };
         db.put("jobs", j);
-        audit("JOB_QUEUED", { actorId: s.userId, classId: s.classId!, targetId: j.id });
-        return j;
+        audit("JOB_QUEUED", { actorId: s.userId, classId: s.classId!, targetId: j.id }, db);
+        return { kind: "ok" as const, job: j };
       });
-      if (!job) {
-        res.status(429).json({ error: "Queue full or enrollment revoked" });
+      if (outcome.kind === "revoked") {
+        res.status(403).json({ error: "Class access paused or enrollment revoked" });
         return;
       }
-      res.json({ prompt_id: job.id, number: Date.parse(job.submittedAt), node_errors: {} });
+      if (outcome.kind === "queue_full") {
+        res.status(429).json({
+          error: `Queue limit reached (${env.MAX_QUEUED_JOBS_PER_USER} waiting jobs). Wait for your running job or cancel a queued item.`,
+        });
+        return;
+      }
+      res.json({ prompt_id: outcome.job.id, number: Date.parse(outcome.job.submittedAt), node_errors: {} });
     } catch (e) {
       next(e);
     }
   });
   app.get("/prompt", (_req, res) => {
     const s = res.locals.session as Session;
-    res.json({ exec_info: { queue_remaining: queue(s).queue_pending.length + queue(s).queue_running.length } });
+    res.json({ exec_info: { queue_remaining: ownActiveCount(s) } });
   });
   app.get("/queue", (_req, res) => res.json(queue(res.locals.session)));
   app.post("/queue", (req, res) => {
     const s = res.locals.session as Session;
     getDb().transaction(() => {
-      for (const j of ownJobs(s)) {
-        if (j.status !== "QUEUED") continue;
+      const db = getDb();
+      for (const j of db.list("jobs", "user_id=? AND class_id=? AND status='QUEUED'", [s.userId, s.classId!])) {
         if (req.body.clear === true || (Array.isArray(req.body.delete) && req.body.delete.includes(j.id))) {
           j.status = "CANCELLED";
           j.completedAt = new Date().toISOString();
-          getDb().put("jobs", j);
+          db.put("jobs", j);
+          audit(
+            "JOB_CANCELLED",
+            {
+              actorId: s.userId,
+              classId: s.classId!,
+              targetId: j.id,
+              metadata: { status: "CANCELLED", source: "comfy_queue" },
+            },
+            db
+          );
         }
       }
     });
     res.json({ ok: true });
   });
   app.post("/interrupt", (_req, res) => {
+    const s = res.locals.session as Session;
     getDb().transaction(() => {
-      for (const j of ownJobs(res.locals.session)) {
-        if (["RUNNING", "DISPATCHING"].includes(j.status)) {
+      const db = getDb();
+      for (const j of db.list("jobs", "user_id=? AND class_id=? AND status IN ('RUNNING','DISPATCHING')", [
+        s.userId,
+        s.classId!,
+      ])) {
+        if (!j.cancelRequested) {
           j.cancelRequested = true;
-          getDb().put("jobs", j);
+          db.put("jobs", j);
+          audit(
+            "JOB_CANCEL_REQUESTED",
+            { actorId: s.userId, classId: s.classId!, targetId: j.id, metadata: { source: "comfy_interrupt" } },
+            db
+          );
         }
       }
     });
     res.json({ ok: true });
   });
   app.get(["/history", "/history/:id"], (req, res) => {
-    let jobs = ownJobs(res.locals.session).filter((j) => j.history && j.archiveStatus === "COMPLETE");
-    if (req.params.id) jobs = jobs.filter((j) => j.id === req.params.id);
-    res.json(
-      Object.fromEntries(
-        jobs
-          .sort((a, b) => b.submittedAt.localeCompare(a.submittedAt))
-          .slice(0, 200)
-          .map((j) => [j.id, j.history])
-      )
-    );
+    const s = res.locals.session as Session,
+      db = getDb();
+    if (req.params.id) {
+      const j = db.get("jobs", req.params.id);
+      if (j && j.userId === s.userId && j.classId === s.classId && j.history && j.archiveStatus === "COMPLETE") {
+        res.json({ [j.id]: j.history });
+        return;
+      }
+      res.json({});
+      return;
+    }
+    const jobs = db
+      .list("jobs", "user_id=? AND class_id=? AND status='COMPLETED' ORDER BY submitted_at DESC LIMIT 200", [
+        s.userId,
+        s.classId!,
+      ])
+      .filter((j) => j.history && j.archiveStatus === "COMPLETE");
+    res.json(Object.fromEntries(jobs.map((j) => [j.id, j.history])));
   });
   app.get("/view", (req, res) => {
     const s = res.locals.session as Session,
@@ -548,6 +1209,16 @@ export function createApp() {
           mimeType: mime,
           createdAt: new Date().toISOString(),
         });
+        audit(
+          "UPLOAD_CREATED",
+          {
+            actorId: s.userId,
+            classId: s.classId!,
+            targetId: id,
+            metadata: { filename, mimeType: mime, sizeBytes: req.file!.size },
+          },
+          db
+        );
         return true;
       });
       if (!accepted) {
@@ -588,21 +1259,27 @@ export function createApp() {
     });
   });
   app.get("/users", (_req, res) => res.json({ storage: "server", migrated: true }));
+  const defaultSettings: Record<string, unknown> = {
+    "Comfy.Queue.QPOV2": true,
+    "Comfy.Queue.ShowRunProgressBar": true,
+  };
   app.get("/settings", (_req, res) => {
     const s = res.locals.session as Session;
-    res.json(
-      JSON.parse(
-        getDb().list("user_data", "user_id=? AND class_id=? AND path=?", [s.userId, s.classId!, "__settings__"])[0]
-          ?.content || "{}"
-      )
-    );
-  });
-  app.get("/settings/:id", (req, res) => {
-    const s = res.locals.session as Session;
-    const all = JSON.parse(
+    const stored = JSON.parse(
       getDb().list("user_data", "user_id=? AND class_id=? AND path=?", [s.userId, s.classId!, "__settings__"])[0]
         ?.content || "{}"
     );
+    res.json({ ...defaultSettings, ...stored });
+  });
+  app.get("/settings/:id", (req, res) => {
+    const s = res.locals.session as Session;
+    const all = {
+      ...defaultSettings,
+      ...JSON.parse(
+        getDb().list("user_data", "user_id=? AND class_id=? AND path=?", [s.userId, s.classId!, "__settings__"])[0]
+          ?.content || "{}"
+      ),
+    };
     res.json(Object.hasOwn(all, req.params.id) ? all[req.params.id] : null);
   });
   app.post("/settings", (req, res) => {
@@ -629,9 +1306,9 @@ export function createApp() {
   // are deliberately not proxied. Add vetted APIs explicitly with owner checks.
   app.get("*", async (req, res, next) => {
     try {
+      const isRootHtml = req.path === "/" || req.path === "/index.html";
       const asset =
-        req.path === "/" ||
-        req.path === "/index.html" ||
+        isRootHtml ||
         /^\/(assets|scripts|extensions|locales|i18n)\/[a-zA-Z0-9_./@-]+\.(js|css|json|svg|png|woff2?|ttf|ico)$/.test(
           req.path
         ) ||
@@ -641,6 +1318,10 @@ export function createApp() {
         /^\/models\/[a-zA-Z0-9_-]+$/.test(req.path);
       if ((!asset && !catalog) || req.path.split("/").includes("..")) {
         res.status(404).json({ error: "Unsupported or private worker endpoint" });
+        return;
+      }
+      if (isRootHtml) {
+        await proxyWorkerHtmlWithStatusWidget(req, res);
         return;
       }
       await proxyWorkerFile(req, res);
@@ -686,6 +1367,25 @@ export function attachWs(server: ReturnType<typeof createServer>) {
       clients.set(client, s);
       client.on("error", () => {});
       client.on("close", () => clients.delete(client));
+      client.on("message", (raw, isBinary) => {
+        if (isBinary) return;
+        try {
+          const msg = JSON.parse(raw.toString("utf8"));
+          if (msg?.type === "feature_flags" && client.readyState === WebSocket.OPEN) {
+            client.send(
+              JSON.stringify({
+                type: "feature_flags",
+                data: {
+                  supports_preview_metadata: false,
+                  max_upload_size: getEnv().MAX_UPLOAD_MB * 1024 * 1024,
+                },
+              })
+            );
+          }
+        } catch {
+          /* Ignore malformed client frames. */
+        }
+      });
       client.send(
         JSON.stringify({
           type: "status",
@@ -693,8 +1393,7 @@ export function attachWs(server: ReturnType<typeof createServer>) {
             sid: randomUUID(),
             status: {
               exec_info: {
-                queue_remaining: ownJobs(s).filter((j) => ["QUEUED", "RUNNING", "DISPATCHING"].includes(j.status))
-                  .length,
+                queue_remaining: ownActiveCount(s),
               },
             },
           },
@@ -703,11 +1402,14 @@ export function attachWs(server: ReturnType<typeof createServer>) {
     });
   });
   const timer = setInterval(() => {
+    if (!clients.size) return;
+    const db = getDb();
+    const counts = activeJobCountsBySession(db);
     for (const [client, s] of clients) {
       if (
         s.expiresAt <= Date.now() ||
-        !getDb().get("gateway_sessions", s.id) ||
-        !activeMembership(getDb(), s.userId, s.classId!, s.enrollmentId)
+        !db.get("gateway_sessions", s.id) ||
+        !activeMembership(db, s.userId, s.classId!, s.enrollmentId)
       ) {
         client.close(1008, "Session expired or access revoked");
         clients.delete(client);
@@ -718,8 +1420,7 @@ export function attachWs(server: ReturnType<typeof createServer>) {
             data: {
               status: {
                 exec_info: {
-                  queue_remaining: ownJobs(s).filter((j) => ["QUEUED", "RUNNING", "DISPATCHING"].includes(j.status))
-                    .length,
+                  queue_remaining: counts.get(`${s.userId}:${s.classId}`) ?? 0,
                 },
               },
             },
