@@ -58,12 +58,75 @@ function extractRuntimeErrorDetail(entry: Record<string, any>): {
   }
   return { message: fallback, nodeId: "", nodeType: "" };
 }
+const MODEL_FILE = /\.(safetensors|sft|ckpt|pt|pth|bin|gguf)$/i;
+const OUTPUT_NODE = /^(Save|Preview)/;
+const isLink = (v: unknown): v is [string, number] =>
+  Array.isArray(v) && v.length === 2 && typeof v[0] === "string" && typeof v[1] === "number";
+/**
+ * Model files a prompt will load: string inputs naming a weights file, on nodes that
+ * can execute. That is every ancestor of an output node, following only the selected
+ * branch of a ComfySwitchNode whose switch is a literal, so a loader left disconnected
+ * on the canvas or behind a switched-off branch is not counted. A prompt with no
+ * recognisable output node counts every node.
+ */
+export function jobModels(promptJson: Record<string, any> | null | undefined): string[] {
+  const nodes = (promptJson || {}) as Record<string, any>;
+  const roots = Object.keys(nodes).filter((id) => OUTPUT_NODE.test(String(nodes[id]?.class_type || "")));
+  const reachable = new Set<string>();
+  const stack = roots.length ? [...roots] : Object.keys(nodes);
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (reachable.has(id) || !nodes[id]) continue;
+    reachable.add(id);
+    const node = nodes[id];
+    const inputs = (node.inputs || {}) as Record<string, unknown>;
+    let keys = Object.keys(inputs);
+    if (node.class_type === "ComfySwitchNode" && typeof inputs.switch === "boolean")
+      keys = keys.filter((k) => k !== (inputs.switch ? "on_false" : "on_true"));
+    for (const k of keys) if (isLink(inputs[k])) stack.push(inputs[k][0]);
+  }
+  const found = new Set<string>();
+  for (const id of reachable) {
+    for (const v of Object.values(nodes[id]?.inputs || {})) {
+      if (typeof v === "string" && MODEL_FILE.test(v)) found.add(v);
+    }
+  }
+  return [...found].sort();
+}
+/** Whether the platform currently treats this worker's VRAM as holding its own models. */
+function isWarm(w: Pick<Worker, "residentUsedAt" | "residentModels"> | undefined | null) {
+  return w?.residentUsedAt !== null && w?.residentUsedAt !== undefined && Boolean(w?.residentModels?.length);
+}
+// A worker warm this long without a break is unloaded at its next idle moment, so a
+// steady queue cannot postpone the cold external-VRAM check indefinitely.
+const MAX_CONTINUOUS_WARM_MS = 30 * 60 * 1000;
+// After /free returns, ComfyUI unloads on its own worker thread; wait this long for
+// VRAM to actually drop before treating the card as cold.
+const UNLOAD_SETTLE_MS = 5000;
+const RELEASE_RETRY_MS = 15000;
+function residentOf(w: Worker) {
+  return isWarm(w) ? (w.residentModels ?? []) : [];
+}
+/**
+ * Routing preference for a job on a worker, higher is better: every model already
+ * loaded (3), some overlap (2), nothing loaded (1), only other models loaded (0, the
+ * worker would have to evict them). A job naming no model files prefers a cold
+ * worker, leaving warm ones for jobs that can reuse them.
+ */
+function warmth(models: string[], w: Worker) {
+  const resident = residentOf(w);
+  if (!models.length) return resident.length ? 0 : 1;
+  if (!resident.length) return 1;
+  const hits = models.filter((m) => resident.includes(m)).length;
+  return hits === models.length ? 3 : hits > 0 ? 2 : 0;
+}
 function evaluateWorkerTelemetry(
   statsBody: any,
   queueBody: any,
   managedPromptIds: Set<string | null>,
   managedCount: number,
-  isReleasing: boolean
+  isReleasing: boolean,
+  warm = false
 ) {
   const sys = statsBody?.system;
   const dev = Array.isArray(statsBody?.devices) ? statsBody.devices[0] : undefined;
@@ -95,11 +158,19 @@ function evaluateWorkerTelemetry(
   const work = [...(queueBody?.queue_running || []), ...(queueBody?.queue_pending || [])];
   const unmanagedQueue = work.some((v: any) => !managedPromptIds.has(v[1]));
   const thresholdBytes = getEnv().WORKER_EXTERNAL_VRAM_THRESHOLD_MB * 1024 * 1024;
+  // While a platform job runs here, the scheduler is unloading the worker, or a
+  // completed job's models are kept warm, VRAM outside PyTorch's caching pool is
+  // ComfyUI's own (CUDA context, workspaces, weights held outside the allocator):
+  // in production it reached several GB seconds into every job and flagged each
+  // worker as occupied by itself. It cannot be told apart from another process, so
+  // external VRAM is judged only on a cold worker. Unmanaged queue items are always
+  // detected.
+  const ownsVram = managedCount > 0 || isReleasing || warm;
   const externalVramBusy =
     nonComfyVramBytes !== null &&
-    (hasTorchVram
-      ? nonComfyVramBytes > thresholdBytes
-      : managedCount === 0 && work.length === 0 && !isReleasing && nonComfyVramBytes > thresholdBytes);
+    !ownsVram &&
+    (hasTorchVram || work.length === 0) &&
+    nonComfyVramBytes > thresholdBytes;
   const externalBusy = unmanagedQueue || externalVramBusy;
   const nonComfyMb = nonComfyVramBytes !== null ? Math.round(nonComfyVramBytes / (1024 * 1024)) : vramUsedMb;
   const externalBusyReason = unmanagedQueue
@@ -125,6 +196,8 @@ export class Scheduler {
   private heartbeat: ReturnType<typeof setInterval> | undefined;
   private monitors = new Set<string>();
   private releasingWorkers = new Set<string>();
+  // Workers whose unload failed or was skipped, with the earliest time to retry.
+  private pendingRelease = new Map<string, number>();
   private stopping = false;
   private leader = false;
   constructor(private notify: Notify = () => {}) {}
@@ -190,6 +263,8 @@ export class Scheduler {
           void this.recoverArchive(job).finally(() => this.monitors.delete(job.id));
         }
       }
+      // Expired workers start unloading (and leave routing) before any job is claimed.
+      this.expireWarm();
       for (let i = 0; i < 64; i++) {
         const job = this.claim();
         if (!job) break;
@@ -216,6 +291,12 @@ export class Scheduler {
             versions: { comfy?: string; python?: string } = {};
           if (w.enabled)
             try {
+              // Ownership is judged over the whole sample: a poll that starts while a job
+              // runs or models are warm must not be read as cold because a release finished
+              // while it was in flight.
+              const busyJobs = () =>
+                getDb().list("jobs", "worker_id=? AND status IN ('DISPATCHING','RUNNING')", [w.id]).length;
+              const ownedBefore = busyJobs() > 0 || this.releasingWorkers.has(w.id) || isWarm(w);
               const [stats, queue] = await Promise.all([
                 workerFetch(w, "/system_stats", {}, 3000),
                 workerFetch(w, "/queue", {}, 3000),
@@ -230,7 +311,8 @@ export class Scheduler {
                 queueBody,
                 ids,
                 managed.length,
-                this.releasingWorkers.has(w.id)
+                this.releasingWorkers.has(w.id),
+                ownedBefore || isWarm(getDb().get("workers", w.id))
               );
               versions = evalResult.versions;
               vramUsedMb = evalResult.vramUsedMb;
@@ -256,15 +338,23 @@ export class Scheduler {
             if (versions.comfy) current.comfyVersion = versions.comfy;
             if (versions.python) current.pythonVersion = versions.python;
             current.lastHealthCheck = new Date().toISOString();
+            // An unreachable worker was stopped or restarted, which empties its VRAM.
+            if (state === "OFFLINE" && current.residentUsedAt != null) {
+              current.residentModels = null;
+              current.residentUsedAt = null;
+              current.residentSince = null;
+            }
             db.put("workers", current);
-            if (current.enabled && state !== "OFFLINE" && prevExternal !== current.externalBusy) {
+            // An unreachable worker drops its flag too; record that, or the audit log
+            // shows a worker flagged forever.
+            if (current.enabled && (state !== "OFFLINE" || prevExternal) && prevExternal !== current.externalBusy) {
               audit(
                 current.externalBusy ? "WORKER_EXTERNAL_BUSY" : "WORKER_EXTERNAL_CLEAR",
                 {
                   targetId: current.id,
                   metadata: {
                     name: current.name,
-                    reason: current.externalBusyReason,
+                    reason: state === "OFFLINE" ? "Worker offline" : current.externalBusyReason,
                     vramUsedMb: current.vramUsedMb,
                     vramFreeMb: current.vramFreeMb,
                   },
@@ -304,6 +394,7 @@ export class Scheduler {
           continue;
         }
         if (active.filter((a) => a.userId === j.userId).length >= env.MAX_ACTIVE_JOBS_PER_USER) continue;
+        const models = jobModels(j.promptJson);
         const eligible = workers
           .filter(
             (w) =>
@@ -317,11 +408,14 @@ export class Scheduler {
           .sort(
             (a, b) =>
               active.filter((x) => x.workerId === a.id).length - active.filter((x) => x.workerId === b.id).length ||
+              warmth(models, b) - warmth(models, a) ||
               a.lastAssignedAt - b.lastAssignedAt ||
               a.id.localeCompare(b.id)
           );
         const w = eligible[0];
         if (!w) continue;
+        j.models = models;
+        j.warmStart = models.length > 0 && warmth(models, w) === 3;
         j.workerId = w.id;
         j.status = "DISPATCHING";
         j.startedAt = new Date().toISOString();
@@ -340,6 +434,7 @@ export class Scheduler {
     curJob.workerId = null;
     curJob.startedAt = null;
     curJob.leaseOwner = null;
+    delete curJob.warmStart;
     db.put("jobs", curJob);
     audit(
       "JOB_REQUEUED",
@@ -376,7 +471,8 @@ export class Scheduler {
         queueBody,
         ids,
         otherManaged.length,
-        this.releasingWorkers.has(worker.id)
+        this.releasingWorkers.has(worker.id),
+        isWarm(db.get("workers", worker.id))
       );
       if (!evalResult.externalBusy) return true;
       db.transaction(() => {
@@ -470,6 +566,13 @@ export class Scheduler {
         type: "execution_start",
         data: { prompt_id: job.id, timestamp: job.startedAt ? Date.parse(job.startedAt) : Date.now() },
       });
+      const wasWarm = isWarm(db.get("workers", worker.id));
+      await this.evictForSwitch(job);
+      // An eviction turned a warm worker cold: judge it now that its models are gone.
+      if (wasWarm && !isWarm(db.get("workers", worker.id)) && !(await this.verifyClearBeforeDispatch(job, worker))) {
+        abortOfflineOrExternal();
+        return;
+      }
       await stageUploads(job, worker);
       if (this.stopping || !this.leader) {
         db.transaction(() => this.requeueBeforeSend(job.id, "scheduler_stopped_or_lease_lost", db));
@@ -533,8 +636,8 @@ export class Scheduler {
       if (!response.ok) {
         const errPayload = await response.json().catch(() => null);
         const detail = extractPromptRejectionReason(response.status, errPayload);
+        // A rejected prompt never ran, so whatever is loaded stays warm.
         this.finish(job.id, "FAILED", detail.message, detail.nodeId, detail.nodeType);
-        await this.freeIfIdle(job.workerId!);
         return;
       }
       const result = (await response.json()) as { prompt_id?: string };
@@ -559,83 +662,176 @@ export class Scheduler {
         sending ? "LOST" : "FAILED",
         sending ? "Dispatch outcome unknown; job was not retried automatically" : "Input staging failed"
       );
-      // A LOST dispatch may already be executing on the worker; freeing then
-      // would evict a running job's models, so only free the certain failure.
-      if (!sending && job.workerId) await this.freeIfIdle(job.workerId);
+      // A LOST dispatch may already be executing on the worker, and an input
+      // staging failure loaded nothing, so neither touches the worker's models.
     } finally {
       upstream?.close();
     }
   }
   /**
-   * Best-effort immediate VRAM release. ComfyUI keeps model weights in VRAM
-   * after a job finishes; POST /free unloads them so the card drops back to
-   * its ~300MiB CUDA context instead of holding tens of GB until the next
-   * job. Skipped while any platform job still needs the worker, or if a fresh
-   * telemetry check shows external GPU work (e.g. vLLM started mid-job).
+   * POST /free, then wait until the card has actually dropped what ComfyUI held:
+   * /free only sets flags that ComfyUI's worker thread acts on afterwards. Resolves
+   * true once telemetry shows a cold, clean card. False means the call failed, or
+   * memory outside ComfyUI's pool remained after UNLOAD_SETTLE_MS (another process).
    */
-  private async freeIfIdle(workerId: string) {
+  private async unloadAndSettle(worker: Worker): Promise<boolean> {
+    const freed = await workerFetch(
+      worker,
+      "/free",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ unload_models: true, free_memory: true }),
+      },
+      10000
+    );
+    if (!freed.ok) return false;
+    const until = Date.now() + UNLOAD_SETTLE_MS;
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 250));
+      try {
+        const [stats, queue] = await Promise.all([
+          workerFetch(worker, "/system_stats", {}, 3000),
+          workerFetch(worker, "/queue", {}, 3000),
+        ]);
+        if (stats.ok && queue.ok) {
+          const t = evaluateWorkerTelemetry(await stats.json(), await queue.json(), new Set(), 0, false, false);
+          if (!t.externalBusy) return true;
+        }
+      } catch {
+        /* Keep waiting until the deadline. */
+      }
+      if (Date.now() >= until) return false;
+    }
+  }
+  /**
+   * Unloads a worker's models and waits for the card to drop them. Platform models are
+   * always ours to unload, so neither the external-VRAM flag nor a disabled worker
+   * prevents it (/free never touches another process). Skipped while a platform job
+   * still needs the worker, or while anything sits on its own queue (an administrator's
+   * direct prompt would lose its models mid-run); then retried later, with a backoff.
+   */
+  private async release(workerId: string) {
     if (this.releasingWorkers.has(workerId)) return;
     const db = getDb();
     const worker = db.get("workers", workerId);
-    if (!worker || !worker.enabled || worker.externalBusy) return;
-    if (db.list("jobs", "worker_id=? AND status IN ('DISPATCHING','RUNNING')", [workerId]).length) return;
+    if (!worker) {
+      this.pendingRelease.delete(workerId);
+      return;
+    }
+    const busy = () => db.list("jobs", "worker_id=? AND status IN ('DISPATCHING','RUNNING')", [workerId]).length > 0;
+    // A job holds the worker: it will leave its own state when it ends.
+    if (busy()) {
+      this.pendingRelease.delete(workerId);
+      return;
+    }
     this.releasingWorkers.add(workerId);
+    let done = false;
     try {
-      const [stats, queue] = await Promise.all([
-        workerFetch(worker, "/system_stats", {}, 3000),
-        workerFetch(worker, "/queue", {}, 3000),
-      ]);
-      if (!stats.ok || !queue.ok) return;
-      const statsBody = await stats.json();
-      const queueBody = await queue.json();
-      if (db.list("jobs", "worker_id=? AND status IN ('DISPATCHING','RUNNING')", [workerId]).length) return;
-      const evalResult = evaluateWorkerTelemetry(statsBody, queueBody, new Set(), 0, true);
-      if (evalResult.externalBusy || evalResult.workLength > 0) {
-        if (evalResult.externalBusy) {
-          db.transaction(() => {
-            const cur = db.get("workers", workerId);
-            if (!cur) return;
-            const prev = Boolean(cur.externalBusy);
-            cur.externalBusy = true;
-            cur.externalBusyReason = evalResult.externalBusyReason;
-            cur.healthStatus = cur.enabled ? "BUSY" : "DISABLED";
-            if (evalResult.vramUsedMb !== null) cur.vramUsedMb = evalResult.vramUsedMb;
-            if (evalResult.vramFreeMb !== null) cur.vramFreeMb = evalResult.vramFreeMb;
-            cur.lastHealthCheck = new Date().toISOString();
-            db.put("workers", cur);
-            if (!prev) {
-              audit(
-                "WORKER_EXTERNAL_BUSY",
-                {
-                  targetId: cur.id,
-                  metadata: {
-                    name: cur.name,
-                    reason: evalResult.externalBusyReason,
-                    vramUsedMb: evalResult.vramUsedMb,
-                    vramFreeMb: evalResult.vramFreeMb,
-                  },
-                },
-                db
-              );
-            }
-          });
-        }
-        return;
-      }
-      await workerFetch(
-        worker,
-        "/free",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ unload_models: true, free_memory: true }),
-        },
-        10000
-      );
+      const queue = await workerFetch(worker, "/queue", {}, 3000);
+      if (!queue.ok) return;
+      const body = (await queue.json()) as any;
+      if ((body?.queue_running?.length || 0) + (body?.queue_pending?.length || 0) > 0) return;
+      if (busy() || this.stopping || !this.leader) return;
+      // Settled or not, our models are gone: residency is cleared either way, and if
+      // memory remains the next health poll judges the now-cold worker and flags it.
+      await this.unloadAndSettle(worker);
+      this.setResident(workerId, null);
+      done = true;
     } catch {
-      /* VRAM release is hygiene, never a job failure. The idle reaper repeats it. */
+      /* VRAM release is hygiene, never a job failure. Retried below; the idle reaper backs it up. */
     } finally {
+      if (done) this.pendingRelease.delete(workerId);
+      else this.pendingRelease.set(workerId, Date.now() + RELEASE_RETRY_MS);
       this.releasingWorkers.delete(workerId);
+    }
+  }
+  private setResident(workerId: string, models: string[] | null) {
+    getDb().transaction(() => {
+      const db = getDb();
+      const cur = db.get("workers", workerId);
+      if (!cur) return;
+      const now = Date.now();
+      if (models === null) {
+        // Never wipe the record of a job that took the worker meanwhile.
+        if (db.list("jobs", "worker_id=? AND status IN ('DISPATCHING','RUNNING')", [workerId]).length) return;
+        cur.residentModels = null;
+        cur.residentUsedAt = null;
+        cur.residentSince = null;
+      } else {
+        // A job naming no model files loaded nothing new: a cold worker stays cold, a
+        // warm one keeps what it had, refreshed.
+        const next = models.length ? models : (cur.residentModels ?? []);
+        if (!next.length) return;
+        if (!isWarm(cur)) cur.residentSince = now;
+        cur.residentModels = next;
+        cur.residentUsedAt = now;
+      }
+      db.put("workers", cur);
+    });
+  }
+  /** After a successful job, keep its models loaded for the next job that can reuse them. */
+  private async keepWarm(workerId: string, job: Job) {
+    if (getEnv().WORKER_KEEP_WARM_SECONDS === 0) {
+      await this.release(workerId);
+      return;
+    }
+    this.setResident(workerId, job.models ?? jobModels(job.promptJson));
+  }
+  /**
+   * Starts unloading workers whose kept-warm models went unused for
+   * WORKER_KEEP_WARM_SECONDS, that stayed warm past MAX_CONTINUOUS_WARM_MS, or whose
+   * earlier unload is due for a retry. release() reserves the worker synchronously, so
+   * a job claimed in the same tick cannot land on it.
+   */
+  private expireWarm() {
+    const keepMs = getEnv().WORKER_KEEP_WARM_SECONDS * 1000;
+    const now = Date.now();
+    for (const w of getDb().list("workers")) {
+      if (this.releasingWorkers.has(w.id)) continue;
+      // An unreachable worker was stopped or restarted: its VRAM is already empty.
+      if (w.healthStatus === "OFFLINE" && !isWarm(w)) this.pendingRelease.delete(w.id);
+      const retryAt = this.pendingRelease.get(w.id);
+      if (retryAt !== undefined && now < retryAt) continue;
+      const expired =
+        isWarm(w) &&
+        (now - w.residentUsedAt! >= keepMs ||
+          (w.residentSince != null && now - w.residentSince >= MAX_CONTINUOUS_WARM_MS));
+      if (expired || retryAt !== undefined) void this.release(w.id);
+    }
+  }
+  /**
+   * A job sent to a worker holding only other models would make ComfyUI evict them
+   * piecemeal while loading, or partially offload to system RAM. Unload first and wait
+   * for the card to drop them, so the new family loads cleanly and the pre-send check
+   * that follows judges a really cold card. Never while another platform job uses it.
+   */
+  private async evictForSwitch(job: Job) {
+    const db = getDb();
+    const w = db.get("workers", job.workerId!);
+    const models = job.models ?? [];
+    if (!w || !models.length || this.releasingWorkers.has(w.id)) return;
+    const resident = residentOf(w);
+    if (!resident.length || resident.some((m) => models.includes(m))) return;
+    const others = db
+      .list("jobs", "worker_id=? AND status IN ('DISPATCHING','RUNNING')", [w.id])
+      .filter((j) => j.id !== job.id);
+    if (others.length) return;
+    this.releasingWorkers.add(w.id);
+    try {
+      await this.unloadAndSettle(w);
+      getDb().transaction(() => {
+        const cur = getDb().get("workers", w.id);
+        if (!cur) return;
+        cur.residentModels = null;
+        cur.residentUsedAt = null;
+        cur.residentSince = null;
+        getDb().put("workers", cur);
+      });
+    } catch {
+      /* ComfyUI still evicts on its own when loading; this only makes it cleaner. */
+    } finally {
+      this.releasingWorkers.delete(w.id);
     }
   }
   private finish(id: string, status: Job["status"], error: string | null = null, nodeId = "", nodeType = "") {
@@ -724,15 +920,16 @@ export class Scheduler {
                 ? { message: "Job cancelled", nodeId: "", nodeType: "" }
                 : extractRuntimeErrorDetail(entry);
               this.finish(id, cancelled ? "CANCELLED" : "FAILED", detail.message, detail.nodeId, detail.nodeType);
-              await this.freeIfIdle(job.workerId!);
+              // A runtime failure may be out-of-memory; start the next job from a clean card.
+              await this.release(job.workerId!);
               return;
             }
             if (entry.status?.completed === true || entry.status?.status_str === "success") {
               const complete = this.finish(id, "COMPLETED");
               if (!complete) return;
-              // Free before archival: outputs download over HTTP and need no
-              // models, so VRAM is released cleanly before the worker is eligible again.
-              await this.freeIfIdle(worker.id);
+              // Keep the models warm for the next job using the same weights; they are
+              // unloaded after WORKER_KEEP_WARM_SECONDS unused, or right away when 0.
+              await this.keepWarm(worker.id, complete);
               if (!db.get("jobs", id)) return;
               try {
                 await archive(complete, worker, entry);
@@ -761,7 +958,7 @@ export class Scheduler {
             q = (await r.json()) as any;
           if (![...(q.queue_running || []), ...(q.queue_pending || [])].some((v: any) => v[1] === job.comfyPromptId)) {
             this.finish(id, "CANCELLED", timedOut ? "Job timed out" : "Job cancelled");
-            await this.freeIfIdle(job.workerId!);
+            await this.release(job.workerId!);
             return;
           }
         }
@@ -770,7 +967,7 @@ export class Scheduler {
       }
       if (timedOut && Date.now() - Date.parse(job.startedAt!) > (getEnv().JOB_TIMEOUT_SECONDS + 60) * 1000) {
         this.finish(id, "LOST", "Worker did not confirm completion before timeout");
-        if (job.workerId) await this.freeIfIdle(job.workerId);
+        if (job.workerId) await this.release(job.workerId);
         return;
       }
       await new Promise((resolve) => setTimeout(resolve, 500));

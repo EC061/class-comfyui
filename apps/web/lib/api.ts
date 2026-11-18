@@ -54,6 +54,9 @@ import {
 } from "./mailer";
 import { generateSignupUrl, validateSignupToken, setSignupEnabled } from "./signup";
 import { purgeClass, purgeEnrollment, ActiveJobsError } from "./purge";
+
+// Internal rows sharing the user_data table with student files; never listed or served.
+const USER_DATA_RESERVED = ["__settings__", "__starters__", GRANTS_PATH];
 class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -880,6 +883,57 @@ export async function handleApi(req: Request): Promise<Response> {
           return json({ ok: true });
         });
     }
+    // A student's own saved ComfyUI files (workflows, subgraphs). Like outputs, they
+    // stay downloadable here while a class's ComfyUI access is paused, since the
+    // workspace that normally serves them is closed then.
+    if (p === "/api/workflows" && method === "GET") {
+      const classNames = new Map<string, string>();
+      // Metadata only: file contents (up to 50 MB per class) are read on download, not to list.
+      const rows = db.sql
+        .prepare(
+          `SELECT id, class_id AS classId, path, json_extract(data,'$.modified') AS modified,
+             length(CAST(json_extract(data,'$.content') AS BLOB)) AS size
+           FROM user_data WHERE user_id=? AND path NOT IN (${USER_DATA_RESERVED.map(() => "?").join(",")})
+           ORDER BY json_extract(data,'$.modified') DESC`
+        )
+        .all(user.id, ...USER_DATA_RESERVED) as Array<{
+        id: string;
+        classId: string;
+        path: string;
+        modified: number;
+        size: number;
+      }>;
+      const files = rows.map((v) => {
+        if (!classNames.has(v.classId)) {
+          const c = db.get("classes", v.classId);
+          classNames.set(v.classId, c ? (c.system ? c.name : `${c.courseCode} — ${c.term}`) : "Unknown class");
+        }
+        return {
+          id: v.id,
+          classId: v.classId,
+          className: classNames.get(v.classId),
+          path: v.path,
+          size: Number(v.size) || 0,
+          modified: new Date(Number(v.modified)).toISOString(),
+          url: `/api/workflows/${v.id}`,
+        };
+      });
+      return json({ files });
+    }
+    const workflowMatch = p.match(/^\/api\/workflows\/([^/]+)$/);
+    if (workflowMatch && method === "GET") {
+      const v = db.get("user_data", workflowMatch[1]);
+      if (!v || v.userId !== user.id || USER_DATA_RESERVED.includes(v.path)) fail(404, "File not found");
+      const name = (v.path.split("/").at(-1) || "workflow.json").replace(/[^a-zA-Z0-9._-]/g, "_");
+      return new Response(v.content, {
+        headers: {
+          "Content-Type": name.endsWith(".json") ? "application/json" : "application/octet-stream",
+          "Content-Disposition": `attachment; filename="${name}"`,
+          "Cache-Control": "private, no-store",
+          "X-Content-Type-Options": "nosniff",
+        },
+      });
+    }
     const outputMatch = p.match(/^\/api\/outputs\/([^/]+)$/);
     if (outputMatch && method === "GET") {
       const o = db.get("outputs", outputMatch[1]),
@@ -1475,6 +1529,12 @@ function adminRoute(user: User, p: string, method: string, b: Record<string, any
     if ("baseUrl" in input && input.baseUrl) input.baseUrl = workerUrl(input.baseUrl);
     if (db.list("jobs", "worker_id=? AND status IN ('RUNNING','DISPATCHING')", [w.id]).length && "baseUrl" in input)
       fail(409, "Wait for active jobs before changing worker URL");
+    // A new endpoint is a different ComfyUI process: what was loaded on the old one is not there.
+    if ("baseUrl" in input && input.baseUrl && input.baseUrl !== w.baseUrl) {
+      w.residentModels = null;
+      w.residentUsedAt = null;
+      w.residentSince = null;
+    }
     Object.assign(w, input);
     if (!w.enabled) w.healthStatus = "DISABLED";
     db.put("workers", w);

@@ -74,6 +74,10 @@ const summary = db.transaction(() => {
       lastAssignedAt: prior?.lastAssignedAt ?? 0,
       externalBusy: prior?.externalBusy ?? false,
       ...(prior?.nodeDefinitions ? { nodeDefinitions: prior.nodeDefinitions } : {}),
+      // Models the gateway keeps warm on this worker; a manifest re-run must not orphan them.
+      ...(prior?.residentModels ? { residentModels: prior.residentModels } : {}),
+      ...(prior?.residentUsedAt ? { residentUsedAt: prior.residentUsedAt } : {}),
+      ...(prior?.residentSince ? { residentSince: prior.residentSince } : {}),
       name: e.name,
       baseUrl: e.baseUrl,
       enabled: e.enabled ?? true,

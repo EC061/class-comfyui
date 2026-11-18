@@ -57,6 +57,8 @@ services:
       MAX_QUEUED_JOBS_PER_USER: "3"
       JOB_TIMEOUT_SECONDS: "7200"
       WORKER_REQUEST_TIMEOUT_MS: "30000"
+      # Seconds a completed job's models stay loaded for reuse; "0" unloads after every job.
+      WORKER_KEEP_WARM_SECONDS: "300"
       MAX_UPLOAD_MB: "100"
       MAX_USER_STORAGE_MB: "2048"
       MAX_ARCHIVE_MB: "20480"

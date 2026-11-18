@@ -20,6 +20,8 @@ export async function mockComfy(port = 0) {
   let maxRunning = 0;
   const submissions: any[] = [];
   const frees: any[] = [];
+  // Order of /free and /prompt calls, to prove an unload happened before a submission.
+  const events: string[] = [];
   const uploads: string[] = [];
   const timers = new Set<ReturnType<typeof setTimeout>>();
   app.use((_req, res, next) => {
@@ -63,6 +65,10 @@ export async function mockComfy(port = 0) {
         output: ["IMAGE"],
       },
       EmptyLatentImage: { input: { required: {} }, output: ["LATENT"] },
+      UNETLoader: {
+        input: { required: { unet_name: [["qwen.safetensors", "h3.safetensors"]] } },
+        output: ["MODEL"],
+      },
       VAEDecode: { input: { required: { samples: ["LATENT"] } }, output: ["IMAGE"] },
       MiniMaxH3ReferenceToVideo: {
         input: {
@@ -141,6 +147,7 @@ export async function mockComfy(port = 0) {
     const id = randomUUID(),
       job = { id, prompt: req.body.prompt };
     submissions.push(req.body);
+    events.push("prompt");
     running.set(id, job);
     maxRunning = Math.max(maxRunning, running.size);
     for (const client of wss.clients) {
@@ -207,6 +214,7 @@ export async function mockComfy(port = 0) {
   app.post("/queue", (_req, res) => res.json({}));
   app.post("/free", (req, res) => {
     frees.push(req.body);
+    events.push("free");
     res.json({});
   });
   app.get("/private", (_req, res) => res.json({ secret: "must never be proxied" }));
@@ -220,6 +228,7 @@ export async function mockComfy(port = 0) {
     url: `http://127.0.0.1:${address.port}`,
     submissions,
     frees,
+    events,
     uploads,
     get maxRunning() {
       return maxRunning;

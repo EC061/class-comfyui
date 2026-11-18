@@ -238,7 +238,10 @@ The set includes three image starters and three video starters, with the Flux im
 Revoking the grant hides the H3 templates and their graphs again but never deletes a placed workspace file; the student
 keeps whatever they already received. Teachers can also add or delete individual students directly with buttons on the
 class **Roster** tab, and disable or re-enable student ComfyUI access per class (**Disable class access** / **Enable
-class access**).
+class access**). Disabling closes ComfyUI for the class's students at once (open workspaces and live
+connections end, and **Open ComfyUI** is refused), while jobs already queued or running finish. Students can still
+sign in, see their jobs, and download their generated images and videos and their saved workflow files from the
+dashboard. Administrators are unaffected.
 
 Hand-building an H3 graph is genuinely fiddly — it samples through `SamplerCustomAdvanced` rather than `KSampler` —
 so keep this note where students can find it: H3 constrains video length to the model's block grid, so valid frame
@@ -393,16 +396,36 @@ Workers can equally be added through **Admin → Workers**; the manifest path ex
 freshly imaged GPU host needs no clicking. Health is polled every second, so a correctly
 registered instance turns `ONLINE` almost immediately.
 
-### Releasing VRAM: immediate unload and idle scale-to-zero
+### Releasing VRAM: keep-warm, model-aware routing and idle scale-to-zero
 
-ComfyUI keeps model weights in VRAM after a job finishes. Two mechanisms, on two hosts, return it:
+ComfyUI keeps model weights in VRAM after a job finishes, and reuses them when the next prompt names the same
+model files: only sampling reruns, so a student changing the prompt, seed or steps skips the load. The scheduler
+builds on that, and two mechanisms, on two hosts, return VRAM:
 
-1. **Immediate unload (management host, automatic).** The scheduler POSTs
-   `/free` (`unload_models` + `free_memory`) to the worker the moment a platform job reaches a terminal
-   state — completed jobs free before archival even starts, since output downloads need no models. The call is
-   best-effort and never fails the job; it is skipped while another platform job still needs the worker or while
-   the worker reports external work. Expect a card to drop from tens of GB to its ~300MiB CUDA context right after
-   each job, and expect the next job on that card to pay a model-reload of tens of seconds.
+1. **Keep-warm and routing (management host, automatic).** When a job completes, the worker keeps its models
+   loaded for `WORKER_KEEP_WARM_SECONDS` (default 300) and the scheduler records them on the worker (Admin →
+   Workers shows "Warm"). Each queued job is routed, among free eligible workers, to one already holding all of its
+   model files, then one holding some, then an empty one, and only last to one holding a different model family; the
+   fair queue order and per-student limits are unchanged, and a job never waits for a busy warm worker while another
+   is free. A job sent to a worker holding only other models unloads them first. A warm worker unused for the grace
+   period is unloaded with `/free` (`unload_models` + `free_memory`), as is a worker after a failed, cancelled or
+   lost job (it may have run out of memory). The call is skipped while a platform job still needs the worker or
+   while anything sits on its own queue; it is never blocked by the external-VRAM flag, because `/free` only touches
+   ComfyUI's own models. Set `WORKER_KEEP_WARM_SECONDS=0` to unload right after every job, for example when the cards
+   are shared with other work outside class hours. Each job records `models` and `warmStart` for comparing runtimes.
+
+   External-VRAM protection judges only a _cold_ worker. While a platform job runs, the worker is unloading, or a
+   completed job's models are kept warm, memory outside PyTorch's caching pool is ComfyUI's own (CUDA context,
+   workspaces, weights held outside the allocator); in production it reached several GB seconds into every job and
+   flagged each worker as occupied by itself, which pushed every next job to another card and blocked the unload.
+   Unmanaged queue items are always detected. A process that grabs a warm card is detected once the card is unloaded:
+   expired cards are unloaded before the next job is assigned, and a card warm for 30 minutes without a break is
+   unloaded at its next idle moment so a steady queue cannot postpone that check. `/free` only sets flags that
+   ComfyUI's worker thread acts on, so after each unload the scheduler keeps the card out of routing for up to five
+   seconds until its memory actually drops; if it does not, the card is judged cold and flagged. A failed unload is
+   retried every 15 seconds. Model files are read from the nodes that can run: ancestors of a Save/Preview node,
+   following only the selected branch of a `ComfySwitchNode`, so a loader left disconnected on the canvas is ignored.
+
 2. **Idle scale-to-zero (GPU host, opt-in).** That ~300MiB is the CUDA context plus PyTorch's allocator: it exists
    from process start with no model loaded, and no flag or `/free` call removes it — only stopping the process
    reaches zero. `scripts/comfyui-idle-reaper.sh` does that: it polls each installed `comfyui@*` unit's `/queue`,
@@ -547,9 +570,10 @@ Replace the example worker IP. Then repeat both checks through the public hostna
 - **Class deletion reports paths it could not remove:** the rows are already gone. Fix the filesystem permission or lock and delete the named paths by hand; nothing re-creates them.
 - **No metadata worker:** register a healthy backend at least once; workflows cannot be validated against a worker that has never supplied node metadata. Previously cached metadata permits queueing while that worker reconnects.
 - **Queued jobs:** inspect worker health, external work, tags and active quotas. Capability tags do not install models.
-- **VRAM still held after a job:** the scheduler frees unconditionally on terminal state, so a stuck allocation means
-  the worker did not get the call (stopped unit, firewall) or a non-platform process holds it — `nvidia-smi` names the
-  PID. A manual `python main.py` alongside the systemd units is the usual suspect; stop it, do not add more workers
+- **VRAM still held after a job:** completed jobs keep their models warm for `WORKER_KEEP_WARM_SECONDS` on purpose
+  (Admin → Workers shows "Warm"). Past that, or after a failed job, a stuck allocation means the worker did not get the
+  call (stopped unit, firewall) or a non-platform process holds it — `nvidia-smi` names the PID. Do not kill ComfyUI
+  units by hand to free memory: the next job then pays a cold start. A manual `python main.py` alongside the systemd units is the usual suspect; stop it, do not add more workers
   around it.
 - **Idle workers hold ~300MiB each:** that is the CUDA context, present with no model loaded. Run
   `scripts/comfyui-idle-reaper.sh` on the GPU host to stop idle units entirely, or accept it on cards dedicated

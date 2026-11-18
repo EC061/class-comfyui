@@ -3,6 +3,7 @@ import { sessionUser } from "@/lib/guards";
 import { AdminOverview } from "@/components/admin-overview";
 import { MyClasses } from "@/components/my-classes";
 import { Jobs } from "@/components/jobs";
+import { SavedWorkflows } from "@/components/saved-workflows";
 
 /**
  * The single entry point. One address serves both roles: what it renders is
@@ -45,6 +46,7 @@ export default async function Home() {
       {isAdmin && <AdminOverview />}
       <MyClasses hideWhenEmpty={isAdmin} />
       <Jobs />
+      <SavedWorkflows />
     </div>
   );
 }

@@ -35,6 +35,9 @@ const EnvSchema = z.object({
   JOB_TIMEOUT_SECONDS: positive(7200),
   WORKER_REQUEST_TIMEOUT_MS: positive(30000),
   WORKER_EXTERNAL_VRAM_THRESHOLD_MB: positive(1536),
+  // Seconds a worker keeps a completed job's models loaded for the next job that
+  // uses the same weights. 0 restores the old immediate unload after every job.
+  WORKER_KEEP_WARM_SECONDS: z.coerce.number().int().min(0).max(86400).default(300),
   MAX_UPLOAD_MB: positive(100),
   MAX_ARCHIVE_MB: positive(20480),
   MAX_USER_STORAGE_MB: positive(2048),

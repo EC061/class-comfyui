@@ -33,7 +33,7 @@ export function MyClasses({ hideWhenEmpty = false }: { hideWhenEmpty?: boolean }
   async function open(e: Enrollment) {
     setMsg(null);
     if (e.classPaused) {
-      const text = `Access to ComfyUI for ${e.courseCode} — ${e.term} is currently paused by your instructor. You can still view your past jobs and outputs below.`;
+      const text = `Access to ComfyUI for ${e.courseCode} — ${e.term} is currently paused by your instructor. You can still view your past jobs, download your outputs and saved workflows below.`;
       setPausedModal(text);
       setMsg(text);
       return;
@@ -80,8 +80,8 @@ export function MyClasses({ hideWhenEmpty = false }: { hideWhenEmpty?: boolean }
               <div className="text-sm text-slate-600">{e.className}</div>
               {e.classPaused && (
                 <div className="mt-1 text-xs font-medium text-amber-800">
-                  Access to ComfyUI is currently paused by your instructor. Your past jobs and outputs remain available
-                  below.
+                  Access to ComfyUI is currently paused by your instructor. Your past jobs, outputs and saved workflows
+                  remain available below.
                 </div>
               )}
             </div>

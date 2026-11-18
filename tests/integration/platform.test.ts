@@ -122,6 +122,16 @@ const prompt = {
   },
   extra_data: { extra_pnginfo: { workflow: { id: "wf-integration", nodes: [{ id: 1 }] } } },
 };
+/** The base prompt plus a model loader wired into the output, so the job names a model file. */
+const withModel = (unet: string) => ({
+  ...prompt,
+  prompt: {
+    "1": { class_type: "SaveImage", inputs: { filename_prefix: "out", images: ["2", 0] } },
+    "2": { class_type: "VAEDecode", inputs: { samples: ["4", 0], model: ["3", 0] } },
+    "3": { class_type: "UNETLoader", inputs: { unet_name: unet } },
+    "4": { class_type: "EmptyLatentImage", inputs: {} },
+  },
+});
 async function waitFor<T>(fn: () => T | Promise<T>, check: (v: T) => boolean, ms = 15000) {
   const until = Date.now() + ms;
   while (Date.now() < until) {
@@ -883,10 +893,15 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
         (n) => n === 2
       );
       expect(mock.maxRunning).toBe(1);
-      // Terminal jobs release VRAM immediately: the scheduler POSTs /free once
-      // no platform job still needs the worker.
-      expect(mock.frees.length).toBeGreaterThan(0);
-      expect(mock.frees.every((v) => v.unload_models === true && v.free_memory === true)).toBe(true);
+      // Completed jobs no longer unload at once. These jobs name no model file, so
+      // nothing was loaded: neither worker is marked warm, and nothing was freed.
+      expect(mock.frees).toHaveLength(0);
+      expect(other.frees).toHaveLength(0);
+      expect(
+        getDb()
+          .list("workers")
+          .every((w) => w.residentUsedAt == null)
+      ).toBe(true);
       expect(other.maxRunning).toBe(1);
     } finally {
       await scheduler?.stop();
@@ -1295,6 +1310,11 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
       (v) => v === "COMPLETE"
     );
 
+    // Save a workflow and a setting in ComfyUI before access is paused.
+    const savedWf = JSON.stringify({ nodes: [{ id: 1 }], note: "paused-download" });
+    expect((await gw("/userdata/workflows%2Fmine.json", JSON.parse(savedWf), g)).status).toBe(200);
+    expect((await gw("/settings", { "Comfy.Test": 1 }, g)).status).toBe(200);
+
     // Submit a slower job, then pause access while it is in flight (M5): workspace access
     // is blocked immediately, while the already-admitted job finishes cleanly.
     mock.delay = 350;
@@ -1338,12 +1358,163 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
     const outRes = await api(`/outputs/${jobsJson.jobs[0].outputs[0].id}`, undefined, s);
     expect(outRes.status).toBe(200);
 
+    // Saved workflows stay downloadable from the management app while ComfyUI is paused;
+    // internal rows (settings, grants) are never listed, and nobody else can fetch them.
+    expect((await gw("/userdata/workflows%2Fmine.json", undefined, g)).status).toBe(401);
+    const wfList = await (await api("/workflows", undefined, s)).json();
+    const mine = wfList.files.find((f: any) => f.path === "workflows/mine.json");
+    expect(mine).toBeTruthy();
+    expect(wfList.files.some((f: any) => f.path.startsWith("__"))).toBe(false);
+    const wfRes = await api(`/workflows/${mine.id}`, undefined, s);
+    expect(wfRes.status).toBe(200);
+    expect(wfRes.headers.get("content-disposition")).toContain('filename="mine.json"');
+    expect(JSON.parse(await wfRes.text()).note).toBe("paused-download");
+    expect((await api(`/workflows/${mine.id}`, undefined, a)).status).toBe(404);
+    const reserved = getDb()
+      .list("user_data", "user_id=?", [mine ? getDb().get("user_data", mine.id)!.userId : ""])
+      .filter((v) => v.path.startsWith("__"));
+    expect(reserved.length).toBeGreaterThan(0);
+    for (const r of reserved) expect((await api(`/workflows/${r.id}`, undefined, s)).status).toBe(404);
+    // A fresh password sign-in still works while the class is paused.
+    expect((await login("student1@example.edu")).status).toBe(200);
+
     // Resume access on the class: student can open ComfyUI again.
     const resumedRes = await api(`/admin/classes/${c.id}`, { paused: false }, a, "PATCH");
     expect(resumedRes.status).toBe(200);
     expect((await resumedRes.json()).class.paused).toBe(false);
     const g2 = await workspace(s, c.id);
     expect((await gw("/prompt", prompt, g2)).status).toBe(200);
+  });
+  it("keeps models warm, routes same-model jobs to the warm GPU, unloads on a family switch and after the grace period, and never flags a worker for its own VRAM", async () => {
+    const other = await mockComfy();
+    try {
+      const a = await admin(),
+        c = await createClass(a);
+      await roster(a, c.id);
+      const url = await signup(a, c),
+        s = await student(c, url);
+      const idA = (await (await api("/workers", { name: "GPU-A", baseUrl: mock.url }, a)).json()).worker.id as string;
+      const idB = (await (await api("/workers", { name: "GPU-B", baseUrl: other.url }, a)).json()).worker.id as string;
+      const mockOf = (id: string | null) => (id === idA ? mock : other);
+      const g = await workspace(s, c.id);
+      const submit = async (body: unknown) => {
+        const r = await gw("/prompt", body, g);
+        expect(r.status).toBe(200);
+        return (await r.json()).prompt_id as string;
+      };
+      const done = (id: string) =>
+        waitFor(
+          () => getDb().get("jobs", id),
+          (j) => j?.archiveStatus === "COMPLETE"
+        );
+      scheduler = new Scheduler();
+      scheduler.start();
+      await waitFor(
+        () => getDb().list("workers"),
+        (ws) => ws.every((w) => w.healthStatus === "ONLINE")
+      );
+
+      // First Qwen job: cold start. While it runs, ComfyUI holds ~4 GiB outside PyTorch's
+      // pool, as production workers did seconds into every job.
+      mock.delay = 700;
+      other.delay = 700;
+      const j1 = await submit(withModel("qwen.safetensors"));
+      const running = await waitFor(
+        () => getDb().get("jobs", j1),
+        (j) => j?.status === "RUNNING"
+      );
+      const warmId = running!.workerId!,
+        coldId = warmId === idA ? idB : idA;
+      const warmMock = mockOf(warmId);
+      warmMock.vramFree = (48640 - 4096) * 1024 * 1024;
+      // Judge telemetry while the job is certainly running, not only on the 1 s timer.
+      await (scheduler as any).health();
+      expect(getDb().get("jobs", j1)!.status).toBe("RUNNING");
+      expect(getDb().get("workers", warmId)!.externalBusy).toBe(false);
+      const first = (await done(j1))!;
+      // Still ~4 GiB outside PyTorch's pool, now with the models kept warm.
+      await (scheduler as any).health();
+      expect(getDb().get("workers", warmId)!.externalBusy).toBe(false);
+      expect(first.models).toEqual(["qwen.safetensors"]);
+      expect(first.warmStart).toBe(false);
+      let warm = getDb().get("workers", warmId)!;
+      expect(warm.externalBusy).toBe(false);
+      expect(warm.residentModels).toEqual(["qwen.safetensors"]);
+      expect(warmMock.frees).toHaveLength(0);
+      expect(
+        getDb()
+          .list("audits")
+          .some((e) => e.type === "WORKER_EXTERNAL_BUSY")
+      ).toBe(false);
+      warmMock.vramFree = 48640 * 1024 * 1024;
+      mock.delay = 150;
+      other.delay = 150;
+
+      // Same model again: routed to the warm worker although the other was assigned longer ago.
+      const second = (await done(await submit(withModel("qwen.safetensors"))))!;
+      expect(second.workerId).toBe(warmId);
+      expect(second.warmStart).toBe(true);
+
+      // A different model family prefers the cold worker, leaving the Qwen card warm.
+      const third = (await done(await submit(withModel("h3.safetensors"))))!;
+      expect(third.workerId).toBe(coldId);
+      expect(third.warmStart).toBe(false);
+      expect(getDb().get("workers", coldId)!.residentModels).toEqual(["h3.safetensors"]);
+
+      // With only the Qwen card available, an H3 job unloads Qwen before it is sent.
+      const cold = getDb().get("workers", coldId)!;
+      cold.enabled = false;
+      getDb().put("workers", cold);
+      const freesBefore = warmMock.frees.length;
+      const eventsBefore = warmMock.events.length;
+      const fourth = (await done(await submit(withModel("h3.safetensors"))))!;
+      expect(fourth.workerId).toBe(warmId);
+      expect(warmMock.frees.length).toBe(freesBefore + 1);
+      // The unload reached the worker before the H3 prompt did.
+      expect(warmMock.events.slice(eventsBefore)).toEqual(["free", "prompt"]);
+      expect(getDb().get("workers", warmId)!.residentModels).toEqual(["h3.safetensors"]);
+
+      // Unused past the grace period: the scheduler unloads the warm card.
+      process.env.WORKER_KEEP_WARM_SECONDS = "1";
+      try {
+        await waitFor(
+          () => getDb().get("workers", warmId),
+          (w) => w?.residentUsedAt === null
+        );
+      } finally {
+        delete process.env.WORKER_KEEP_WARM_SECONDS;
+      }
+      expect(warmMock.frees.length).toBe(freesBefore + 2);
+      expect(warmMock.frees.every((v) => v.unload_models === true && v.free_memory === true)).toBe(true);
+
+      // Going offline clears the residency (a restart empties VRAM) and records the flag reset.
+      // Polled by hand with the timer stopped, so no in-flight poll can clear the flag first.
+      await scheduler.stop();
+      warmMock.online = false;
+      warm = getDb().get("workers", warmId)!;
+      warm.healthStatus = "ONLINE";
+      warm.externalBusy = true;
+      warm.externalBusyReason = "test";
+      warm.residentModels = ["h3.safetensors"];
+      warm.residentUsedAt = Date.now();
+      getDb().put("workers", warm);
+      await (scheduler as any).health();
+      warm = getDb().get("workers", warmId)!;
+      expect(warm.healthStatus).toBe("OFFLINE");
+      expect(warm.residentUsedAt).toBeNull();
+      expect(warm.externalBusy).toBe(false);
+      expect(
+        getDb()
+          .list("audits")
+          .some(
+            (e) =>
+              e.type === "WORKER_EXTERNAL_CLEAR" && e.targetId === warmId && e.metadata?.reason === "Worker offline"
+          )
+      ).toBe(true);
+    } finally {
+      await scheduler?.stop();
+      await other.close();
+    }
   });
   it("never dispatches, uploads, or calls /free on GPUs occupied by external VRAM processes and distinguishes ComfyUI PyTorch models", async () => {
     const externalGpu = await mockComfy();
@@ -1445,11 +1616,15 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
       expect(externalGpu.frees).toHaveLength(0);
       expect(mock.submissions).toHaveLength(3);
 
-      // H2 regression: suppose VLLM::EngineCore starts MID-JOB on mock while a job is RUNNING.
-      // When that job finishes, freeIfIdle must detect the external VRAM and NEVER call POST /free!
+      // H2 (revised): VRAM outside PyTorch's pool appearing while our own job runs, or while
+      // its models stay warm, cannot be told from ComfyUI's own (in production it flagged
+      // every worker against itself), so the worker is not flagged then. When the warm
+      // period expires, the scheduler unloads its own models even with the spike present
+      // (/free never touches another process); the cold worker is then judged, and the
+      // external process is detected and protected.
       const freesBeforeMidJobSpike = mock.frees.length;
       mock.delay = 350;
-      const subMid = await gw("/prompt", prompt, ga);
+      const subMid = await gw("/prompt", withModel("qwen.safetensors"), ga);
       const midJobId = (await subMid.json()).prompt_id as string;
       const midScheduler = new Scheduler();
       (midScheduler as any).renew();
@@ -1466,9 +1641,30 @@ describe("real API, SQLite WAL, SMTP and gateway", () => {
         () => getDb().get("jobs", midJobId)?.archiveStatus,
         (v) => v === "COMPLETE"
       );
-      await midScheduler.stop();
+      await midScheduler.tick();
       expect(mock.frees.length).toBe(freesBeforeMidJobSpike);
-      expect(getDb().get("workers", cleanWorkerId)?.externalBusy).toBe(true);
+      expect(getDb().get("workers", cleanWorkerId)?.externalBusy).toBe(false);
+      expect(typeof getDb().get("workers", cleanWorkerId)?.residentUsedAt).toBe("number");
+      process.env.WORKER_KEEP_WARM_SECONDS = "1";
+      try {
+        await waitFor(
+          async () => {
+            await midScheduler.tick();
+            return mock.frees.length;
+          },
+          (n) => n > freesBeforeMidJobSpike
+        );
+        await waitFor(
+          async () => {
+            await midScheduler.tick();
+            return getDb().get("workers", cleanWorkerId);
+          },
+          (w) => w?.externalBusy === true && w.residentUsedAt === null
+        );
+      } finally {
+        delete process.env.WORKER_KEEP_WARM_SECONDS;
+      }
+      await midScheduler.stop();
 
       // Reset mock back to clean, then mark it OFFLINE to test M2 (reachable externalBusy beats stopped OFFLINE for UI)
       // and pre-dispatch race + M1 lease-loss re-queue.

@@ -86,6 +86,11 @@ export default function Workers() {
                   <td>
                     {w.externalBusy ? "EXTERNAL BUSY (Protected)" : w.healthStatus}
                     {w.externalBusyReason && <p className="text-xs text-amber-700">{w.externalBusyReason}</p>}
+                    {w.residentUsedAt != null && (
+                      <p className="text-xs text-emerald-700" title={(w.residentModels || []).join("\n")}>
+                        Warm: {(w.residentModels || []).length} model file(s) loaded
+                      </p>
+                    )}
                     <p className="text-xs">{w.lastHealthCheck}</p>
                   </td>
                   <td>{w.maxConcurrentJobs}</td>

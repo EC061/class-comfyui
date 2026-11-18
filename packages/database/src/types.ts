@@ -102,6 +102,14 @@ export interface Worker {
   // workspace so its frontend can version-check nodes instead of guessing.
   comfyVersion?: string;
   pythonVersion?: string;
+  // Model files left loaded by the last platform job that completed here, kept warm
+  // so the next job using the same weights skips the reload. Cleared once the
+  // scheduler unloads the worker or sees it go offline (a restart empties VRAM).
+  residentModels?: string[] | null;
+  residentUsedAt?: number | null;
+  // When the worker last went from cold to warm; bounds how long it can stay warm
+  // under a steady queue before it gets a cold external-VRAM check.
+  residentSince?: number | null;
 }
 export type JobStatus = "QUEUED" | "DISPATCHING" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED" | "LOST";
 export interface Job {
@@ -128,6 +136,10 @@ export interface Job {
   history: Record<string, any> | null;
   cancelRequested: boolean;
   leaseOwner: string | null;
+  // Model files the prompt references, and whether the worker it was assigned to
+  // already had all of them loaded. Recorded at assignment for routing and timing.
+  models?: string[];
+  warmStart?: boolean;
 }
 export interface Output {
   id: string;
